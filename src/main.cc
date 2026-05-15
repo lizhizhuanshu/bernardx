@@ -8,6 +8,7 @@
 #include <iostream>
 
 #include "bt_library.h"
+#include "http_library.h"
 #include "code_provider.h"
 #include "lua_runtime.h"
 
@@ -63,15 +64,17 @@ int main(int argc, char* argv[]) {
 
     auto code_provider = std::make_shared<FileSystemCodeProvider>(dir);
     auto bt_lib = std::make_shared<BehaviorTreeLibrary>();
+    auto http_lib = std::make_shared<HttpLibrary>();
 
     async_simple::executors::SimpleExecutor executor(1);
     auto rt = LuaRuntime::Builder()
                   .WithCodeProvider(code_provider)
                   .WithExecutor(executor)
                   .RegisterLibrary(bt_lib)
+                  .RegisterLibrary(http_lib)
                   .Create();
 
-    std::string main_lua = std::filesystem::absolute(dir).string() + "/main.lua";
+    std::string main_lua = std::filesystem::absolute(dir).string() + "/src/main.lua";
     auto result = async_simple::coro::syncAwait(rt->RunFile(main_lua));
 
     if (result.status != 0) {
