@@ -1,0 +1,316 @@
+#include "tree_parser.h"
+
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <string>
+
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
+
+#include "blackboard_condition.h"
+#include "composite.h"
+#include "decorator.h"
+#include "force_success.h"
+#include "inverter.h"
+#include "leaf.h"
+#include "node.h"
+#include "parallel.h"
+#include "script_node.h"
+#include "selector.h"
+#include "sequence.h"
+#include "subtree_node.h"
+
+namespace {
+AbortMode ParseAbortMode(const std::string& s) {
+    if (s == "Self") return AbortMode::kSelf;
+    if (s == "LowerPriority") return AbortMode::kLowerPriority;
+    if (s == "Both") return AbortMode::kBoth;
+    return AbortMode::kNone;
+}
+
+std::optional<LuaValue> ParseLuaValue(const nlohmann::json& j) {
+    if (j.is_null()) return std::nullopt;
+    if (j.is_boolean()) return LuaValue(j.get<bool>());
+    if (j.is_number_integer()) return LuaValue(static_cast<int64_t>(j.get<int64_t>()));
+    if (j.is_number_float()) return LuaValue(j.get<double>());
+    if (j.is_string()) return LuaValue(j.get<std::string>());
+    spdlog::warn("TreeParser: unsupported value type for blackboard condition");
+    return std::nullopt;
+}
+
+Parallel::Policy ParseParallelPolicy(const std::string& s) {
+    if (s == "RequireOne") return Parallel::Policy::kRequireOne;
+    return Parallel::Policy::kRequireAll;
+}
+}  // namespace
+
+std::string TreeParser::LoadTreeFromDirectory(const std::string& dir_path) {
+    namespace fs = std::filesystem;
+
+    fs::path dir(dir_path);
+    if (!fs::is_directory(dir)) {
+        spdlog::error("TreeParser: '{}' is not a directory", dir_path);
+        return {};
+    }
+
+    // Read root.json
+    auto root_file = dir / "root.json";
+    if (!fs::exists(root_file)) {
+        spdlog::error("TreeParser: '{}' not found", root_file.string());
+        return {};
+    }
+
+    std::ifstream rf(root_file);
+    if (!rf.is_open()) {
+        spdlog::error("TreeParser: failed to open '{}'", root_file.string());
+        return {};
+    }
+
+    nlohmann::json root_j;
+    try {
+        rf >> root_j;
+    } catch (const nlohmann::json::parse_error& e) {
+        spdlog::error("TreeParser: failed to parse '{}': {}", root_file.string(), e.what());
+        return {};
+    }
+
+    // Scan for subtree .json files (excluding root.json)
+    nlohmann::json subtrees_j = nlohmann::json::object();
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        auto path = entry.path();
+        if (path.extension() != ".json") continue;
+        if (path.filename() == "root.json") continue;
+
+        auto name = path.stem().string();
+        std::ifstream sf(path);
+        if (!sf.is_open()) {
+            spdlog::error("TreeParser: failed to open '{}'", path.string());
+            return {};
+        }
+
+        try {
+            sf >> subtrees_j[name];
+        } catch (const nlohmann::json::parse_error& e) {
+            spdlog::error("TreeParser: failed to parse '{}': {}", path.string(), e.what());
+            return {};
+        }
+    }
+
+    // Combine into {"root": ..., "subtrees": {...}}
+    nlohmann::json combined;
+    combined["root"] = std::move(root_j);
+    if (!subtrees_j.empty()) {
+        combined["subtrees"] = std::move(subtrees_j);
+    }
+    return combined.dump();
+}
+
+std::unique_ptr<Node> TreeParser::Parse(const std::string& json_str) {
+    try {
+        auto j = nlohmann::json::parse(json_str);
+        if (!j.contains("root")) {
+            spdlog::error("TreeParser: JSON must have 'root' field");
+            return nullptr;
+        }
+
+        // Parse top-level "subtrees" definitions
+        SubtreeRegistry subtrees;
+        if (j.contains("subtrees") && j["subtrees"].is_object()) {
+            for (auto it = j["subtrees"].begin(); it != j["subtrees"].end(); ++it) {
+                subtrees[it.key()] = it.value();
+            }
+        }
+
+        uint32_t next_id = 1;
+        std::set<std::string> resolving;
+        return ParseNode(j["root"], next_id, subtrees, resolving);
+    } catch (const nlohmann::json::parse_error& e) {
+        spdlog::error("TreeParser: JSON parse error: {}", e.what());
+        return nullptr;
+    } catch (const std::exception& e) {
+        spdlog::error("TreeParser: error: {}", e.what());
+        return nullptr;
+    }
+}
+
+std::unique_ptr<Node> TreeParser::ParseNode(const nlohmann::json& j, uint32_t& next_id,
+                                            const SubtreeRegistry& subtrees,
+                                            std::set<std::string>& resolving) {
+    if (!j.contains("type")) {
+        spdlog::error("TreeParser: node missing 'type' field");
+        return nullptr;
+    }
+
+    std::string type = j["type"].get<std::string>();
+    std::string name = j.value("name", type);
+
+    if (type == "Selector" || type == "Sequence" || type == "Parallel") {
+        return ParseComposite(j, next_id, subtrees, resolving);
+    }
+    if (type == "Script") {
+        return ParseScriptLeaf(j, next_id);
+    }
+    if (type == "Subtree") {
+        return ParseSubtree(j, next_id, subtrees, resolving);
+    }
+
+    spdlog::error("TreeParser: unknown node type '{}'", type);
+    return nullptr;
+}
+
+std::vector<std::unique_ptr<Node>> TreeParser::ParseChildren(const nlohmann::json& j, uint32_t& next_id,
+                                                             const SubtreeRegistry& subtrees,
+                                                             std::set<std::string>& resolving) {
+    std::vector<std::unique_ptr<Node>> children;
+    if (j.contains("children") && j["children"].is_array()) {
+        for (const auto& child_j : j["children"]) {
+            auto child = ParseNode(child_j, next_id, subtrees, resolving);
+            if (child) {
+                children.push_back(std::move(child));
+            }
+        }
+    }
+    return children;
+}
+
+std::unique_ptr<Node> TreeParser::ParseComposite(const nlohmann::json& j, uint32_t& next_id,
+                                                 const SubtreeRegistry& subtrees,
+                                                 std::set<std::string>& resolving) {
+    std::string type = j["type"].get<std::string>();
+    std::string name = j.value("name", type);
+    uint32_t id = next_id++;
+
+    std::unique_ptr<Node> node;
+    if (type == "Selector") {
+        node = std::make_unique<Selector>(id, std::move(name));
+    } else if (type == "Sequence") {
+        node = std::make_unique<Sequence>(id, std::move(name));
+    } else if (type == "Parallel") {
+        auto success_policy = j.value("success_policy", "RequireAll");
+        auto failure_policy = j.value("failure_policy", "RequireOne");
+        node = std::make_unique<Parallel>(id, std::move(name),
+                                          ParseParallelPolicy(success_policy),
+                                          ParseParallelPolicy(failure_policy));
+    }
+
+    auto* composite = static_cast<Composite*>(node.get());
+    for (auto& child : ParseChildren(j, next_id, subtrees, resolving)) {
+        composite->AddChild(std::move(child));
+    }
+
+    ApplyDecorators(j, node.get());
+    ApplySensors(j, node.get());
+    return node;
+}
+
+std::unique_ptr<Node> TreeParser::ParseScriptLeaf(const nlohmann::json& j, uint32_t& next_id) {
+    if (!j.contains("path")) {
+        spdlog::error("TreeParser: Script node missing 'path' field");
+        return nullptr;
+    }
+
+    std::string path = j["path"].get<std::string>();
+    std::string name = j.value("name", path);
+    uint32_t id = next_id++;
+
+    auto node = std::make_unique<ScriptNode>(id, std::move(name), std::move(path));
+    ApplyDecorators(j, node.get());
+    ApplySensors(j, node.get());
+    return node;
+}
+
+std::unique_ptr<Node> TreeParser::ParseSubtree(const nlohmann::json& j, uint32_t& next_id,
+                                               const SubtreeRegistry& subtrees,
+                                               std::set<std::string>& resolving) {
+    if (!j.contains("subtree")) {
+        spdlog::error("TreeParser: Subtree node missing 'subtree' field");
+        return nullptr;
+    }
+
+    auto subtree_name = j["subtree"].get<std::string>();
+
+    // Cycle detection
+    if (resolving.count(subtree_name)) {
+        spdlog::error("TreeParser: circular subtree reference '{}'", subtree_name);
+        return nullptr;
+    }
+
+    auto it = subtrees.find(subtree_name);
+    if (it == subtrees.end()) {
+        spdlog::error("TreeParser: unknown subtree '{}'", subtree_name);
+        return nullptr;
+    }
+
+    // Reserve an ID for the SubtreeNode wrapper
+    uint32_t subtree_id = next_id++;
+    resolving.insert(subtree_name);
+    auto subtree_root = ParseNode(it->second, next_id, subtrees, resolving);
+    resolving.erase(subtree_name);
+    if (!subtree_root) {
+        spdlog::error("TreeParser: failed to parse subtree '{}'", subtree_name);
+        return nullptr;
+    }
+
+    auto name = j.value("name", subtree_name);
+    auto node = std::make_unique<SubtreeNode>(subtree_id, std::move(name),
+                                               std::move(subtree_name),
+                                               std::move(subtree_root));
+    ApplyDecorators(j, node.get());
+    ApplySensors(j, node.get());
+    return node;
+}
+
+void TreeParser::ApplyDecorators(const nlohmann::json& j, Node* node) {
+    if (!j.contains("decorators") || !j["decorators"].is_array()) return;
+
+    for (const auto& dec_j : j["decorators"]) {
+        if (!dec_j.contains("type")) continue;
+
+        std::string dec_type = dec_j["type"].get<std::string>();
+        auto abort = ParseAbortMode(dec_j.value("abort", "None"));
+
+        if (dec_type == "BlackboardCondition") {
+            if (!dec_j.contains("key")) {
+                spdlog::error("TreeParser: BlackboardCondition missing 'key'");
+                continue;
+            }
+            auto key = dec_j["key"].get<std::string>();
+            auto op = dec_j.value("operator", "is_set");
+            std::optional<LuaValue> expected;
+            if (dec_j.contains("value")) {
+                expected = ParseLuaValue(dec_j["value"]);
+            }
+            auto dec = std::make_unique<BlackboardCondition>(
+                std::move(key), std::move(op), std::move(expected), abort);
+            node->AddDecorator(std::move(dec));
+        } else if (dec_type == "Inverter") {
+            auto dec = std::make_unique<Inverter>(abort);
+            node->AddDecorator(std::move(dec));
+        } else if (dec_type == "ForceSuccess") {
+            auto dec = std::make_unique<ForceSuccess>(abort);
+            node->AddDecorator(std::move(dec));
+        } else {
+            spdlog::warn("TreeParser: unknown decorator type '{}'", dec_type);
+        }
+    }
+}
+
+void TreeParser::ApplySensors(const nlohmann::json& j, Node* node) {
+    if (!j.contains("sensors") || !j["sensors"].is_array()) return;
+
+    for (const auto& sen_j : j["sensors"]) {
+        if (!sen_j.contains("name") || !sen_j.contains("path")) {
+            spdlog::error("TreeParser: sensor missing 'name' or 'path'");
+            continue;
+        }
+
+        SensorSpec spec;
+        spec.name = sen_j["name"].get<std::string>();
+        spec.script_path = sen_j["path"].get<std::string>();
+        spec.interval_ms = sen_j.value("interval", 100);
+
+        node->AddSensorSpec(std::move(spec));
+    }
+}
