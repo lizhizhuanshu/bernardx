@@ -71,7 +71,21 @@ struct ResumeRequest {
 
 using ReleaseRequest = std::vector<int>;  // LUA_REGISTRYINDEX refs to release
 
-using WorkItem = std::variant<TaskRequest, ResumeRequest, ReleaseRequest>;  // int refs to release
+// Run a loaded module chunk in a fresh coroutine via lua_resume (avoids C-call boundary)
+struct RequireRun {
+    std::string source;
+    std::string module_name;
+    AsyncHandle caller_handle;  // handle to resume the caller coroutine with the result
+};
+
+// Compile source in a fresh coroutine via lua_resume and return the chunk function (loadfile semantics)
+struct LoadFileRun {
+    std::string source;
+    std::string filename;
+    AsyncHandle caller_handle;
+};
+
+using WorkItem = std::variant<TaskRequest, ResumeRequest, ReleaseRequest, RequireRun, LoadFileRun>;
 
 // --- LuaContext: coroutine scheduler, builtins, and custom require ---
 
@@ -110,6 +124,8 @@ public:
     void PushTask(TaskRequest task);
     void PushResume(AsyncHandle handle, std::vector<LuaValue> args = {});
     void PushRelease(std::vector<int> refs);
+    void PushRequireRun(AsyncHandle handle, std::string source, std::string module_name);
+    void PushLoadFileRun(AsyncHandle handle, std::string source, std::string filename);
     void CallLuaFunction(int fn_ref, std::vector<LuaValue> args);
 
     // --- Event loop processing (event loop thread only) ---

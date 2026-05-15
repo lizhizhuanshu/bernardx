@@ -373,7 +373,62 @@ TEST_F(LuaRuntimeWithProviderTest, RequireModuleNotFound) {
         require("nonexistent_module")
     )"));
     EXPECT_NE(r.status, LUA_OK);
-    EXPECT_FALSE(r.error.empty());
+    EXPECT_TRUE(r.error.find("not found") != std::string::npos)
+        << "expected 'not found', got: " << r.error;
+}
+
+TEST_F(LuaRuntimeWithProviderTest, RequireModuleSyntaxError) {
+    provider->set_module("bad_syntax", "local x = ");
+    auto r = AWAIT(rt->RunScript(R"(
+        require("bad_syntax")
+    )"));
+    EXPECT_NE(r.status, LUA_OK);
+    EXPECT_TRUE(r.error.find("error loading module") != std::string::npos)
+        << "expected 'error loading module', got: " << r.error;
+}
+
+TEST_F(LuaRuntimeWithProviderTest, RequireModuleRuntimeError) {
+    provider->set_module("bad_runtime", R"(
+        error("something went wrong inside module")
+    )");
+    auto r = AWAIT(rt->RunScript(R"(
+        require("bad_runtime")
+    )"));
+    EXPECT_NE(r.status, LUA_OK);
+    EXPECT_TRUE(r.error.find("error loading module") != std::string::npos)
+        << "expected 'error loading module', got: " << r.error;
+    EXPECT_TRUE(r.error.find("something went wrong") != std::string::npos)
+        << "expected error detail, got: " << r.error;
+}
+
+TEST_F(LuaRuntimeWithProviderTest, NestedRequireFiveLevelsDeep) {
+    // Level 5 (leaf): no further require
+    provider->set_module("level5", "return { value = 5 }");
+    // Level 4: requires level5
+    provider->set_module("level4", R"(
+        local l5 = require("level5")
+        return { value = 4 + l5.value }
+    )");
+    // Level 3: requires level4
+    provider->set_module("level3", R"(
+        local l4 = require("level4")
+        return { value = 3 + l4.value }
+    )");
+    // Level 2: requires level3
+    provider->set_module("level2", R"(
+        local l3 = require("level3")
+        return { value = 2 + l3.value }
+    )");
+    // Level 1: requires level2
+    provider->set_module("level1", R"(
+        local l2 = require("level2")
+        return { value = 1 + l2.value }
+    )");
+
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local l1 = require("level1")
+        assert(l1.value == 15, "expected 15 got " .. tostring(l1.value))
+    )")).status, LUA_OK);
 }
 
 TEST_F(LuaRuntimeWithProviderTest, RequireCaching) {
@@ -398,6 +453,37 @@ TEST_F(LuaRuntimeWithProviderTest, LoadfileRelativePath) {
         assert(type(fn) == "function")
         local result = fn()
         assert(result == 43)
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeWithProviderTest, LoadfileNestedRequire) {
+    // loadfile loads a chunk that calls require, which loads another module
+    provider->set_module("helper", "return { add = function(a, b) return a + b end }");
+    provider->set_file("calc.lua", R"(
+        local h = require("helper")
+        return h.add(10, 20)
+    )");
+
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local fn = loadfile("calc.lua")
+        assert(type(fn) == "function")
+        local result = fn()
+        assert(result == 30, "expected 30 got " .. tostring(result))
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeWithProviderTest, LoadfileNestedLoadfile) {
+    // loadfile loads a chunk that itself calls loadfile
+    provider->set_file("inner.lua", "return 100");
+    provider->set_file("outer.lua", R"(
+        local fn = loadfile("inner.lua")
+        return fn()
+    )");
+
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local fn = loadfile("outer.lua")
+        local result = fn()
+        assert(result == 100, "expected 100 got " .. tostring(result))
     )")).status, LUA_OK);
 }
 

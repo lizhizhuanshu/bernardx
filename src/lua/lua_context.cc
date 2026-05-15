@@ -25,8 +25,10 @@ async_simple::coro::Lazy<void> ResumeModuleLoad(
     std::string module_name) {
     auto source = co_await ctx->code_provider()->LoadModule(module_name);
     if (source.has_value()) {
-        ctx->PushResume(handle, {std::move(*source)});
+        // Push a RequireRun task: compile + run chunk in a fresh coroutine via lua_resume
+        ctx->PushRequireRun(handle, std::move(*source), std::move(module_name));
     } else {
+        // Module not found, resume caller with nil
         ctx->PushResume(handle, {LuaValue{nullptr}});
     }
 }
@@ -37,7 +39,7 @@ async_simple::coro::Lazy<void> ResumeFileLoad(
     std::string file_path) {
     auto source = co_await ctx->code_provider()->LoadFile(file_path);
     if (source.has_value()) {
-        ctx->PushResume(handle, {std::move(*source)});
+        ctx->PushLoadFileRun(handle, std::move(*source), std::move(file_path));
     } else {
         ctx->PushResume(handle, {LuaValue{nullptr}});
     }
@@ -56,66 +58,46 @@ void CacheModuleResult(lua_State* L, const char* name, int result_idx) {
     lua_pop(L, 1);
 }
 
-// --- custom_require continuation (called after yield resumes) ---
+// Cache a LuaValue vector into package.loaded[name] on the given state
+void CacheModuleValues(lua_State* L, const char* name, std::vector<LuaValue>& values) {
+    if (values.empty()) values.push_back(nullptr);
+    lua_getfield(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+    if (std::holds_alternative<std::nullptr_t>(values[0])) {
+        lua_pushboolean(L, 1);
+    } else {
+        LuaContext::PushValues(L, values);
+    }
+    lua_setfield(L, -2, name);
+    lua_pop(L, 1);
+}
 
-// Stack when called: [name] [source_string_or_nil]
+// --- custom_require continuation (called after RequireRun completes) ---
+
+// Stack when called: [name] [result_or_nil] [error_or_nil]
 int require_continuation(lua_State* L, int status, lua_KContext ctx) {
     const char* name = lua_tostring(L, 1);
 
     if (lua_isnil(L, 2)) {
-        return luaL_error(L, "module '%s' not found via CodeProvider", name);
+        if (lua_isstring(L, 3)) {
+            return luaL_error(L, "error loading module '%s':\n\t%s",
+                              name, lua_tostring(L, 3));
+        }
+        return luaL_error(L, "module '%s' not found", name);
     }
 
-    size_t len;
-    const char* source = lua_tolstring(L, 2, &len);
-    std::string chunkname = "@" + std::string(name);
-
-    // Replace source with compiled chunk: [name] [chunk]
-    lua_pop(L, 1);  // remove source_string
-    int load_status = luaL_loadbuffer(L, source, len, chunkname.c_str());
-    if (load_status != LUA_OK) {
-        return lua_error(L);
-    }
-
-    // Call chunk(name), expect 1 return: [name] [module]
-    lua_pushvalue(L, 1);  // push name as arg
-    int call_status = lua_pcall(L, 1, 1, 0);
-    if (call_status == LUA_YIELD) {
-        return luaL_error(L, "module '%s' attempted to yield during loading", name);
-    }
-    if (call_status != LUA_OK) {
-        return lua_error(L);  // error message already on stack
-    }
-
-    CacheModuleResult(L, name, 2);
     lua_remove(L, 1);  // remove name, leaving [result]
     return 1;
 }
 
-// --- custom_loadfile continuation ---
+// --- custom_loadfile continuation (called after LoadFileRun completes) ---
 
-// Stack when called: [filename] [source_string_or_nil]
+// Stack when called: [filename] [chunk_or_nil]
 int loadfile_continuation(lua_State* L, int status, lua_KContext ctx) {
-    const char* filename = lua_tostring(L, 1);
-
     if (lua_isnil(L, 2)) {
+        const char* filename = lua_tostring(L, 1);
         lua_pop(L, 1);  // remove nil
         lua_pushnil(L);
         lua_pushfstring(L, "cannot find file '%s' via CodeProvider", filename);
-        lua_remove(L, 1);  // remove filename
-        return 2;
-    }
-
-    size_t len;
-    const char* source = lua_tolstring(L, 2, &len);
-    std::string chunkname = "@" + std::string(filename);
-
-    lua_pop(L, 1);  // remove source_string
-    int load_status = luaL_loadbuffer(L, source, len, chunkname.c_str());
-    if (load_status != LUA_OK) {
-        lua_pushnil(L);
-        lua_insert(L, -2);
-        lua_remove(L, 1);  // remove filename
         return 2;
     }
     lua_remove(L, 1);  // remove filename, leaving [chunk]
@@ -390,6 +372,34 @@ void LuaContext::PushRelease(std::vector<int> refs) {
     }
 }
 
+void LuaContext::PushRequireRun(AsyncHandle handle, std::string source, std::string module_name) {
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!shutting_down_) {
+            work_queue_.push(RequireRun{std::move(source), std::move(module_name), handle});
+            queued = true;
+        }
+    }
+    if (queued) {
+        cv_.notify_one();
+    }
+}
+
+void LuaContext::PushLoadFileRun(AsyncHandle handle, std::string source, std::string filename) {
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!shutting_down_) {
+            work_queue_.push(LoadFileRun{std::move(source), std::move(filename), handle});
+            queued = true;
+        }
+    }
+    if (queued) {
+        cv_.notify_one();
+    }
+}
+
 void LuaContext::CallLuaFunction(int fn_ref, std::vector<LuaValue> args) {
     async_simple::Promise<ScriptResult> promise;
     PushTask({CallRef{fn_ref, std::move(args), false}, std::move(promise)});
@@ -517,6 +527,87 @@ bool LuaContext::DrainOneWork() {
                                   MaybeRecycleCo(co, status, nresults);
                               }
                               return true;
+                          },
+                          [&](RequireRun& req) {
+                              lua_State* co = AcquireCo();
+
+                              std::string chunkname = "@" + req.module_name;
+                              int load_status = luaL_loadbuffer(co, req.source.c_str(),
+                                                               req.source.size(), chunkname.c_str());
+                              if (load_status != LUA_OK) {
+                                  const char* err = lua_tostring(co, -1);
+                                  std::string errmsg = err ? err : "unknown error";
+                                  spdlog::error("RequireRun: {}", errmsg);
+                                  lua_pop(co, 1);
+                                  ReleaseCo(co);
+                                  PushResume(req.caller_handle, {LuaValue{nullptr}, LuaValue{std::move(errmsg)}});
+                                  return true;
+                              }
+
+                              lua_pushstring(co, req.module_name.c_str());  // arg for chunk
+                              int nresults = 0;
+                              int status = lua_resume(co, main_L_, 1, &nresults);
+
+                              if (status == LUA_OK) {
+                                  // Chunk completed synchronously
+                                  auto values = PeekValues(co, nresults);
+                                  CacheModuleValues(main_L_, req.module_name.c_str(), values);
+
+                                  PushResume(req.caller_handle, std::move(values));
+                                  ReleaseCo(co);
+                              } else if (status == LUA_YIELD) {
+                                  // Chunk yielded (nested require) — set callback for when it finishes
+                                  auto handle = req.caller_handle;
+                                  auto mod_name = req.module_name;
+                                  auto self = shared_from_this();
+                                  SetCoCompleteCallback(co,
+                                      [self, handle, mod_name](ScriptResult result) {
+                                          if (result.status == LUA_OK) {
+                                              auto& vals = result.values;
+                                              CacheModuleValues(self->main_state(),
+                                                                mod_name.c_str(), vals);
+                                              self->PushResume(handle, std::move(vals));
+                                          } else {
+                                              auto err = result.error.empty()
+                                                  ? "unknown error" : std::move(result.error);
+                                              self->PushResume(handle,
+                                                  {LuaValue{nullptr}, LuaValue{std::move(err)}});
+                                          }
+                                      });
+                              } else {
+                                  // Error
+                                  const char* err = lua_tostring(co, -1);
+                                  std::string errmsg = err ? err : "unknown error";
+                                  spdlog::error("RequireRun: {}", errmsg);
+                                  lua_pop(co, 1);
+                                  PushResume(req.caller_handle,
+                                      {LuaValue{nullptr}, LuaValue{std::move(errmsg)}});
+                                  ReleaseCo(co);
+                              }
+                              return true;
+                          },
+                          [&](LoadFileRun& req) {
+                              lua_State* co = AcquireCo();
+
+                              std::string chunkname = "@" + req.filename;
+                              int load_status = luaL_loadbuffer(co, req.source.c_str(),
+                                                               req.source.size(), chunkname.c_str());
+                              if (load_status != LUA_OK) {
+                                  const char* err = lua_tostring(co, -1);
+                                  spdlog::error("LoadFileRun: {}", err ? err : "unknown error");
+                                  lua_pop(co, 1);
+                                  ReleaseCo(co);
+                                  PushResume(req.caller_handle, {LuaValue{nullptr}});
+                                  return true;
+                              }
+
+                              // Chunk loaded successfully — return it to caller as LuaRef
+                              lua_pushvalue(co, -1);  // copy chunk to keep ref after pop
+                              int ref = luaL_ref(co, LUA_REGISTRYINDEX);
+                              int type = lua_type(co, -1);
+                              PushResume(req.caller_handle, {LuaRef{ref, type}});
+                              ReleaseCo(co);
+                              return true;
                           }},
                       *item);
 }
@@ -616,7 +707,7 @@ void LuaContext::PushValues(lua_State* L, const std::vector<LuaValue>& values) {
                 } else if constexpr (std::is_same_v<T, double>) {
                     lua_pushnumber(L, static_cast<lua_Number>(val));
                 } else if constexpr (std::is_same_v<T, std::string>) {
-                    lua_pushstring(L, val.c_str());
+                    lua_pushlstring(L, val.c_str(), val.size());
                 } else if constexpr (std::is_same_v<T, LuaRef>) {
                     lua_rawgeti(L, LUA_REGISTRYINDEX, val.ref);
                 }
@@ -663,6 +754,12 @@ void LuaContext::Shutdown() {
                            for (int ref : refs) {
                                luaL_unref(main_L_, LUA_REGISTRYINDEX, ref);
                            }
+                       },
+                       [&](RequireRun& req) {
+                           PushResume(req.caller_handle, {LuaValue{nullptr}});
+                       },
+                       [&](LoadFileRun& req) {
+                           PushResume(req.caller_handle, {LuaValue{nullptr}});
                        }},
                    *item);
     }

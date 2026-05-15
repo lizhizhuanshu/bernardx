@@ -3,6 +3,7 @@
 #include <async_simple/coro/SyncAwait.h>
 #include <async_simple/executors/SimpleExecutor.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -27,8 +28,20 @@ public:
         };
     }
 
+    static std::string ModuleToPath(const std::string& module_name) {
+        std::string path = module_name;
+        std::replace(path.begin(), path.end(), '.', '/');
+        return path;
+    }
+
     async_simple::coro::Lazy<std::optional<std::string>> LoadModule(const std::string& module_name) override {
-        co_return TryLoad(module_name + ".lua");
+        auto path = ModuleToPath(module_name);
+        // Try: path.lua
+        if (auto result = TryLoad(path + ".lua")) {
+            co_return result;
+        }
+        // Fallback: path/init.lua
+        co_return TryLoad(path + "/init.lua");
     }
 
     async_simple::coro::Lazy<std::optional<std::string>> LoadFile(const std::string& path) override {
