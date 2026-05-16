@@ -173,3 +173,11 @@ target_include_directories(bernardx_test SYSTEM PRIVATE ${cinatra_SOURCE_DIR}/in
 cinatra_use_third_party_headers(bernardx_test)
 include(GoogleTest)
 gtest_discover_tests(bernardx_test)
+
+# ── Install ───────────────────────────────────────────────────────────────
+
+include(GNUInstallDirs)
+
+install(TARGETS bernardx
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
