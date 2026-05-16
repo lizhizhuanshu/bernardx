@@ -24,7 +24,7 @@ JSON 必须包含 `"root"` 字段，所有节点必须包含 `"type"` 字段。�
 
 ### 目录模式
 
-通过 `bt.run(directory_path)` 从目录加载树定义：
+通过 `bt.run(directory_path)` 从目录加载树定义。如果设置了项目路径（`bt.set_project_path`），路径相对于项目根目录解析：
 
 ```
 tree_dir/
@@ -38,7 +38,13 @@ tree_dir/
 
 ```lua
 local bt = require('bt')
+
+-- 不使用项目路径（相对当前工作目录）
 local status = bt.run("trees/ai_main")
+
+-- 使用项目路径（推荐）
+bt.set_project_path("/path/to/bt_project")
+local status = bt.run("trees/ai_main")  -- 解析为 /path/to/bt_project/trees/ai_main
 ```
 
 ---

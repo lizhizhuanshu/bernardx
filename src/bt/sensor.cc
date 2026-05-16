@@ -1,5 +1,6 @@
 #include "sensor.h"
 
+#include <filesystem>
 #include <spdlog/spdlog.h>
 
 #include "blackboard.h"
@@ -21,11 +22,16 @@ ActiveSensor::~ActiveSensor() {
     }
 }
 
-void ActiveSensor::Init(lua_State* L, LuaContext* ctx) {
+void ActiveSensor::Init(lua_State* L, LuaContext* ctx, const std::string& base_path) {
     main_L_ = L;
     lua_context_ = ctx;
 
-    if (luaL_loadfile(L, spec_.script_path.c_str()) != LUA_OK) {
+    std::string full_path = spec_.script_path;
+    if (!base_path.empty() && !std::filesystem::path(spec_.script_path).is_absolute()) {
+        full_path = std::filesystem::absolute(base_path + "/" + spec_.script_path).string();
+    }
+
+    if (luaL_loadfile(L, full_path.c_str()) != LUA_OK) {
         const char* err = lua_tostring(L, -1);
         spdlog::error("ActiveSensor::Init: failed to load '{}': {}",
                        spec_.script_path, err ? err : "unknown");

@@ -1,5 +1,6 @@
 #include "script_node.h"
 
+#include <filesystem>
 #include <spdlog/spdlog.h>
 
 #include "blackboard.h"
@@ -10,26 +11,31 @@ ScriptNode::ScriptNode(uint32_t id, std::string name, std::string script_path)
     : Leaf(id, "Script", std::move(name)),
       script_path_(std::move(script_path)) {}
 
-void ScriptNode::Init(lua_State* L, LuaContext* ctx) {
+void ScriptNode::Init(lua_State* L, LuaContext* ctx, const std::string& base_path) {
     main_L_ = L;
     lua_context_ = ctx;
 
-    if (luaL_loadfile(L, script_path_.c_str()) != LUA_OK) {
+    std::string full_path = script_path_;
+    if (!base_path.empty() && !std::filesystem::path(script_path_).is_absolute()) {
+        full_path = std::filesystem::absolute(base_path + "/" + script_path_).string();
+    }
+
+    if (luaL_loadfile(L, full_path.c_str()) != LUA_OK) {
         const char* err = lua_tostring(L, -1);
-        spdlog::error("ScriptNode::Init: failed to load '{}': {}", script_path_, err ? err : "unknown");
+        spdlog::error("ScriptNode::Init: failed to load '{}': {}", full_path, err ? err : "unknown");
         lua_pop(L, 1);
         return;
     }
 
     if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
         const char* err = lua_tostring(L, -1);
-        spdlog::error("ScriptNode::Init: failed to execute '{}': {}", script_path_, err ? err : "unknown");
+        spdlog::error("ScriptNode::Init: failed to execute '{}': {}", full_path, err ? err : "unknown");
         lua_pop(L, 1);
         return;
     }
 
     if (!lua_istable(L, -1)) {
-        spdlog::error("ScriptNode::Init: '{}' did not return a table", script_path_);
+        spdlog::error("ScriptNode::Init: '{}' did not return a table", full_path);
         lua_pop(L, 1);
         return;
     }

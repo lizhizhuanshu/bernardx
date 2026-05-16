@@ -51,6 +51,9 @@ public:
     // Initialize script nodes with lua_State and LuaContext (called on event loop thread)
     void InitScriptNodes(lua_State* L, LuaContext* ctx);
 
+    void SetProjectPath(std::string path) { project_path_ = std::move(path); }
+    const std::string& project_path() const { return project_path_; }
+
     // Initialize sensors with lua_State and LuaContext (called on BT thread)
     void InitSensors(lua_State* L, LuaContext* ctx);
 
@@ -86,6 +89,7 @@ private:
     std::unique_ptr<Node> root_;
     Blackboard blackboard_;
     BtEventQueue event_queue_;
+    std::string project_path_;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> paused_{false};

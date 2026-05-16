@@ -92,7 +92,7 @@ void BehaviorTreeEngine::InitScriptNodes(lua_State* L, LuaContext* ctx) {
 
 void BehaviorTreeEngine::InitScriptNodesRecursive(Node* node, lua_State* L, LuaContext* ctx) {
     if (auto* script = dynamic_cast<ScriptNode*>(node)) {
-        script->Init(L, ctx);
+        script->Init(L, ctx, project_path_);
     }
     if (auto* composite = dynamic_cast<Composite*>(node)) {
         for (auto& child : composite->children()) {
@@ -243,7 +243,7 @@ void BehaviorTreeEngine::InitSensorsRecursive(Node* node, lua_State* L, LuaConte
             spdlog::warn("BehaviorTreeEngine: duplicate sensor name '{}', overwriting", spec.name);
         }
         auto sensor = std::make_unique<ActiveSensor>(spec);
-        sensor->Init(L, ctx);
+        sensor->Init(L, ctx, project_path_);
         active_sensors_[spec.name] = std::move(sensor);
     }
     if (auto* composite = dynamic_cast<Composite*>(node)) {

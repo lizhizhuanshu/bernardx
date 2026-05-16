@@ -319,6 +319,7 @@ local bt = require('bt')
 
 | 函数 | 说明 |
 |------|------|
+| `bt.set_project_path(path)` | 设置行为树项目根目录 |
 | `bt.run(json_or_path)` | 运行行为树（协程），接受 JSON 字符串或目录路径，返回 `"success"` / `"failure"` / `"stopped"` |
 | `bt.stop()` | 停止行为树 |
 | `bt.pause()` | 暂停行为树 |
@@ -329,6 +330,26 @@ local bt = require('bt')
 | `bt.notify(event, data)` | 发送事件到事件队列 |
 | `bt.get_status()` | 获取状态 (`"running"` / `"paused"` / `"stopped"`) |
 | `bt.get_current_node()` | 获取当前执行的节点名称 |
+
+### bt.set_project_path(path)
+
+设置行为树的项目根目录。设置后，`bt.run()` 中的目录路径会相对于此路径解析，Script/Sensor 节点的脚本路径也基于此路径查找。同时，BT 的 `require()` 搜索路径也会基于此路径。
+
+```lua
+bt.set_project_path("/path/to/bt_project")
+local status = bt.run("trees/ai_main")
+```
+
+**BT 代码搜索路径**（设置项目路径后）：
+
+1. `{project_path}/scripts/`
+2. `{project_path}/sensors/`
+3. `{project_path}/`
+4. `{主项目}/libs/`（主项目的共享库）
+
+**注意：** 如果未设置项目路径，`bt.run()` 的行为与之前相同——使用主运行时的 CodeProvider。
+
+---
 
 ### bt.run(json_or_path)
 
@@ -342,7 +363,13 @@ local status = bt.run('{"root": {"type": "Selector", "children": [...]}}')
 
 -- 方式2: 目录路径
 local status = bt.run("path/to/tree_dir")
+
+-- 方式3: 结合项目路径使用（推荐）
+bt.set_project_path("/path/to/bt_project")
+local status = bt.run("trees/ai_main")  -- 解析为 /path/to/bt_project/trees/ai_main
 ```
+
+设置了项目路径时，目录路径会相对于项目根目录解析；未设置时，路径相对于当前工作目录。
 
 **目录模式：** 指定一个包含行为树定义文件的目录：
 

@@ -28,7 +28,8 @@ public:
     ActiveSensor& operator=(const ActiveSensor&) = delete;
 
     // Initialize: load sensor script and extract Enter/Tick/Exit refs (BT thread only)
-    void Init(lua_State* L, LuaContext* ctx);
+    // base_path is the BT project root for resolving relative script paths
+    void Init(lua_State* L, LuaContext* ctx, const std::string& base_path);
 
     // Activate: call Enter, mark active, run first Tick
     void Activate(Blackboard& bb);

@@ -6,11 +6,13 @@ extern "C" {
 }
 
 #include <chrono>
+#include <filesystem>
 
 #include <spdlog/spdlog.h>
 #include <sol/sol.hpp>
 
 #include "blackboard.h"
+#include "file_system_code_provider.h"
 #include "lua_context.h"
 #include "tree_parser.h"
 #include "types.h"
@@ -56,6 +58,7 @@ BehaviorTreeLibrary* GetLibrary(lua_State* L) {
 
 // bt.run(json_or_path) — yields coroutine, resumes when BT tree completes
 // Accepts either a JSON string or a directory path containing root.json + subtree files
+// If project_path is set, non-JSON paths are resolved relative to project_path
 int bt_run(lua_State* L) {
     auto* engine = GetEngine(L);
     auto* lib = GetLibrary(L);
@@ -69,7 +72,12 @@ int bt_run(lua_State* L) {
     if (input[0] == '{' || input[0] == '[') {
         json_str = input;
     } else {
-        json_str = TreeParser::LoadTreeFromDirectory(input);
+        // Resolve relative to project path if set
+        std::filesystem::path tree_path(input);
+        if (!lib->project_path().empty()) {
+            tree_path = std::filesystem::path(lib->project_path()) / input;
+        }
+        json_str = TreeParser::LoadTreeFromDirectory(tree_path.string());
         if (json_str.empty()) {
             lua_pushboolean(L, 0);
             lua_pushstring(L, "failed to load tree from directory");
@@ -83,6 +91,9 @@ int bt_run(lua_State* L) {
         return 2;
     }
 
+    // Set project path on engine for script/sensor path resolution
+    engine->SetProjectPath(lib->project_path());
+
     // Get LuaRuntime's LuaContext for yield/resume
     auto rt_ctx = LuaContext::FromLuaState(L);
     if (!rt_ctx) {
@@ -93,7 +104,23 @@ int bt_run(lua_State* L) {
 
     // Yield the current coroutine
     auto handle = rt_ctx->PreYield(L);
-    auto code_provider = rt_ctx->shared_code_provider();
+
+    // Create BT-specific code provider based on project path, or fall back to main
+    std::shared_ptr<CodeProvider> code_provider;
+    if (!lib->project_path().empty()) {
+        auto pp = std::filesystem::absolute(lib->project_path());
+        std::vector<std::string> search_paths = {
+            (pp / "scripts").string(),
+            (pp / "sensors").string(),
+            pp.string(),
+        };
+        if (!lib->main_libs_path().empty()) {
+            search_paths.push_back(std::filesystem::absolute(lib->main_libs_path()).string());
+        }
+        code_provider = std::make_shared<FileSystemCodeProvider>(std::move(search_paths));
+    } else {
+        code_provider = rt_ctx->shared_code_provider();
+    }
 
     // Store pending run info so StopBtThread can resume the coroutine if needed
     lib->pending_run_handle_ = handle;
@@ -181,6 +208,14 @@ int bt_get_current_node(lua_State* L) {
     return 1;
 }
 
+// bt.set_project_path(path)
+int bt_set_project_path(lua_State* L) {
+    auto* lib = GetLibrary(L);
+    const char* path = luaL_checkstring(L, 1);
+    lib->SetProjectPath(std::string(path));
+    return 0;
+}
+
 }  // namespace
 
 BehaviorTreeLibrary::BehaviorTreeLibrary() {
@@ -208,6 +243,7 @@ void BehaviorTreeLibrary::Open(lua_State* L) {
         {"notify", bt_notify},
         {"get_status", bt_get_status},
         {"get_current_node", bt_get_current_node},
+        {"set_project_path", bt_set_project_path},
         {nullptr, nullptr}
     };
 

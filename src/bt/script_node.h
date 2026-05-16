@@ -17,7 +17,8 @@ public:
     const std::string& script_path() const { return script_path_; }
 
     // Initialize: load script file, extract function refs (called on event loop thread)
-    void Init(lua_State* L, LuaContext* ctx);
+    // base_path is the BT project root for resolving relative script paths
+    void Init(lua_State* L, LuaContext* ctx, const std::string& base_path);
 
     bool is_loaded() const { return tick_ref_ != LUA_NOREF; }
 

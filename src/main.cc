@@ -11,61 +11,10 @@
 #include "bt_library.h"
 #include "http_library.h"
 #include "json_library.h"
-#include "code_provider.h"
+#include "file_system_code_provider.h"
 #include "lua_runtime.h"
 
 DEFINE_string(dir, ".", "Working directory containing main.lua");
-
-// FileSystemCodeProvider: loads Lua modules from src/ and libs/ subdirectories.
-// LoadModule("foo") → tries base/src/foo.lua then base/libs/foo.lua
-// LoadFile("bar.lua") → tries base/src/bar.lua then base/libs/bar.lua
-class FileSystemCodeProvider : public CodeProvider {
-public:
-    explicit FileSystemCodeProvider(const std::string& base_dir)
-        : base_dir_(std::filesystem::absolute(base_dir).string()) {
-        search_paths_ = {
-            base_dir_ + "/src",
-            base_dir_ + "/libs",
-        };
-    }
-
-    static std::string ModuleToPath(const std::string& module_name) {
-        std::string path = module_name;
-        std::replace(path.begin(), path.end(), '.', '/');
-        return path;
-    }
-
-    async_simple::coro::Lazy<std::optional<std::string>> LoadModule(const std::string& module_name) override {
-        auto path = ModuleToPath(module_name);
-        // Try: path.lua
-        if (auto result = TryLoad(path + ".lua")) {
-            co_return result;
-        }
-        // Fallback: path/init.lua
-        co_return TryLoad(path + "/init.lua");
-    }
-
-    async_simple::coro::Lazy<std::optional<std::string>> LoadFile(const std::string& path) override {
-        co_return TryLoad(path);
-    }
-
-private:
-    std::optional<std::string> TryLoad(const std::string& filename) const {
-        for (const auto& dir : search_paths_) {
-            auto full = dir + "/" + filename;
-            std::ifstream ifs(full, std::ios::in | std::ios::binary);
-            if (ifs.is_open()) {
-                std::string content((std::istreambuf_iterator<char>(ifs)),
-                                    std::istreambuf_iterator<char>());
-                return content;
-            }
-        }
-        return std::nullopt;
-    }
-
-    std::string base_dir_;
-    std::vector<std::string> search_paths_;
-};
 
 int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -78,6 +27,7 @@ int main(int argc, char* argv[]) {
 
     auto code_provider = std::make_shared<FileSystemCodeProvider>(dir);
     auto bt_lib = std::make_shared<BehaviorTreeLibrary>();
+    bt_lib->SetMainLibsPath(std::filesystem::absolute(dir).string() + "/libs");
     auto http_lib = std::make_shared<HttpLibrary>();
     auto json_lib = std::make_shared<JsonLibrary>();
 
