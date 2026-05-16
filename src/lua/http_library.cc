@@ -13,11 +13,76 @@ extern "C" {
 #include <async_simple/coro/Lazy.h>
 
 #include <atomic>
+#include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unistd.h>
 
 // --- Helpers ---
+
+namespace {
+
+int kHttpStateRegistryKey = 0;
+constexpr const char* kHttpStateMetatable = "http__state";
+
+struct SharedHttpExecutorPool {
+    std::unique_ptr<coro_io::multithread_context_pool> pool;
+    coro_io::ExecutorWrapper<>* exec = nullptr;
+};
+
+SharedHttpExecutorPool* GetSharedHttpExecutorPool(int io_threads) {
+    static std::mutex mutex;
+    static pid_t pool_pid = 0;
+    static SharedHttpExecutorPool* pool = nullptr;
+
+    const pid_t current_pid = getpid();
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!pool || pool_pid != current_pid) {
+        auto* next = new SharedHttpExecutorPool();
+        next->pool = std::make_unique<coro_io::multithread_context_pool>(io_threads);
+        next->pool->run();
+        next->exec = next->pool->get_executor();
+        pool = next;
+        pool_pid = current_pid;
+    }
+    return pool;
+}
+
+int http_state_gc(lua_State* L) {
+    auto* slot = static_cast<std::shared_ptr<HttpLibraryState>*>(lua_touserdata(L, 1));
+    if (slot) {
+        slot->~shared_ptr<HttpLibraryState>();
+    }
+    return 0;
+}
+
+void EnsureHttpStateMetatable(lua_State* L) {
+    if (luaL_newmetatable(L, kHttpStateMetatable)) {
+        lua_pushcfunction(L, http_state_gc);
+        lua_setfield(L, -2, "__gc");
+    }
+    lua_pop(L, 1);
+}
+
+void SetHttpState(lua_State* L, std::shared_ptr<HttpLibraryState> state) {
+    EnsureHttpStateMetatable(L);
+    auto* slot = static_cast<std::shared_ptr<HttpLibraryState>*>(
+        lua_newuserdatauv(L, sizeof(std::shared_ptr<HttpLibraryState>), 0));
+    new (slot) std::shared_ptr<HttpLibraryState>(std::move(state));
+    luaL_setmetatable(L, kHttpStateMetatable);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, &kHttpStateRegistryKey);
+}
+
+std::shared_ptr<HttpLibraryState> GetHttpState(lua_State* L) {
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &kHttpStateRegistryKey);
+    auto* slot = static_cast<std::shared_ptr<HttpLibraryState>*>(lua_touserdata(L, -1));
+    auto state = slot ? *slot : nullptr;
+    lua_pop(L, 1);
+    return state;
+}
 
 static std::unordered_map<std::string, std::string> parse_headers(lua_State* L, int idx) {
     std::unordered_map<std::string, std::string> headers;
@@ -56,15 +121,19 @@ static int http_del(lua_State* L);
 
 template <typename F>
 static int http_request(lua_State* L, F&& make_lazy) {
-    auto* exec = static_cast<coro_io::ExecutorWrapper<>*>(lua_touserdata(L, lua_upvalueindex(1)));
+    auto state = GetHttpState(L);
+    if (!state || state->shutting_down.load() || !state->exec) {
+        return luaL_error(L, "http library is shutting down");
+    }
+    auto* exec = state->exec;
     auto rt = LuaContext::FromLuaState(L);
     auto handle = rt->PreYield(L);
 
-    asio::post(exec->context(), [exec, rt, handle, lazy_factory = std::forward<F>(make_lazy)]() mutable {
+    asio::post(exec->context(), [state, exec, rt, handle, lazy_factory = std::forward<F>(make_lazy)]() mutable {
         auto client = std::make_shared<cinatra::coro_http_client>(exec);
 
         auto lazy = lazy_factory(*client);
-        std::move(lazy).via(exec).start([rt, handle, client](async_simple::Try<cinatra::resp_data>&& result) {
+        std::move(lazy).via(exec).start([state, rt, handle, client](async_simple::Try<cinatra::resp_data>&& result) {
             if (result.hasError()) {
                 rt->PushResume(handle, {
                     LuaValue{(int64_t)0},
@@ -150,7 +219,7 @@ static const char* kWsMetatable = "http__ws";
 
 struct WsConn {
     std::shared_ptr<cinatra::coro_http_client> client;
-    coro_io::ExecutorWrapper<>* exec;
+    std::shared_ptr<HttpLibraryState> state;
     LuaContext::Ptr rt;
     std::string url;
     std::atomic<bool> closed{false};
@@ -197,12 +266,15 @@ static int ws_gc(lua_State* L) {
     if (slot && *slot) {
         auto& conn = *slot;
         conn->UnrefCallbacks(L);
-        if (conn->client && !conn->closed.exchange(true)) {
-            auto client = std::move(conn->client);
-            auto* exec = conn->exec;
-            asio::post(exec->context(), [client, exec] {
-                client->write_websocket_close("gc").via(exec).start([](auto&&) {});
-            });
+        auto client = std::move(conn->client);
+        if (client && !conn->closed.exchange(true)) {
+            auto state = conn->state;
+            if (state && !state->shutting_down.load() && state->exec) {
+                auto* exec = state->exec;
+                asio::post(exec->context(), [state, client, exec] {
+                    client->write_websocket_close("gc").via(exec).start([](auto&&) {});
+                });
+            }
         }
         slot->reset();  // release shared_ptr (WsConn lives on if async callbacks still hold refs)
     }
@@ -212,12 +284,15 @@ static int ws_gc(lua_State* L) {
 // http.ws_create(url) -> ws
 static int ws_create(lua_State* L) {
     const char* url = luaL_checkstring(L, 1);
-    auto* exec = static_cast<coro_io::ExecutorWrapper<>*>(lua_touserdata(L, lua_upvalueindex(1)));
+    auto state = GetHttpState(L);
+    if (!state || state->shutting_down.load() || !state->exec) {
+        return luaL_error(L, "http library is shutting down");
+    }
     auto rt = LuaContext::FromLuaState(L);
 
     auto* slot = static_cast<std::shared_ptr<WsConn>*>(lua_newuserdatauv(L, sizeof(std::shared_ptr<WsConn>), 0));
     auto conn = std::make_shared<WsConn>();
-    conn->exec = exec;
+    conn->state = std::move(state);
     conn->rt = rt;
     conn->url = url;
     new (slot) std::shared_ptr<WsConn>(std::move(conn));
@@ -278,10 +353,15 @@ static int ws_connect_method(lua_State* L) {
         lua_pushstring(L, "closed");
         return 2;
     }
+    if (!conn->state || conn->state->shutting_down.load() || !conn->state->exec) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "http library is shutting down");
+        return 2;
+    }
 
     auto rt = LuaContext::FromLuaState(L);
     auto handle = rt->PreYield(L);
-    auto* exec = conn->exec;
+    auto* exec = conn->state->exec;
     // Capture shared_ptr to keep WsConn alive for the duration of async ops
     auto shared_conn = ws_get_conn(L, 1);
 
@@ -293,6 +373,7 @@ static int ws_connect_method(lua_State* L) {
             if (shared_conn->closed.load()) return;
             if (result.hasError() || result.value().net_err) {
                 shared_conn->closed.store(true);
+                shared_conn->client.reset();
                 auto msg = result.hasError()
                     ? std::string("connect failed")
                     : std::string(result.value().net_err.message());
@@ -309,6 +390,7 @@ static int ws_connect_method(lua_State* L) {
                     if (shared_conn->closed.load()) return;
                     if (result.hasError() || result.value().net_err || result.value().eof || result.value().status != 200) {
                         shared_conn->closed.store(true);
+                        shared_conn->client.reset();
                         auto err_msg = result.hasError() ? std::string("read failed")
                             : result.value().net_err ? std::string(result.value().net_err.message())
                             : std::string("connection closed");
@@ -342,6 +424,11 @@ static int ws_send(lua_State* L) {
         lua_pushstring(L, "closed");
         return 2;
     }
+    if (!conn->state || conn->state->shutting_down.load() || !conn->state->exec) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "http library is shutting down");
+        return 2;
+    }
     size_t len;
     const char* msg = luaL_checklstring(L, 2, &len);
     const char* mode = lua_isstring(L, 3) ? lua_tostring(L, 3) : "text";
@@ -349,7 +436,7 @@ static int ws_send(lua_State* L) {
 
     auto rt = LuaContext::FromLuaState(L);
     auto handle = rt->PreYield(L);
-    auto* exec = conn->exec;
+    auto* exec = conn->state->exec;
     auto client = conn->client;
     auto shared_conn = ws_get_conn(L, 1);
 
@@ -358,7 +445,8 @@ static int ws_send(lua_State* L) {
             rt->PushResume(handle, {LuaValue{false}, LuaValue{std::string("closed")}});
             return;
         }
-        client->write_websocket(msg, op).via(exec).start([rt, handle](async_simple::Try<cinatra::resp_data>&& result) {
+        client->write_websocket(msg, op).via(exec).start(
+            [state = shared_conn->state, rt, handle](async_simple::Try<cinatra::resp_data>&& result) {
             if (result.hasError() || result.value().net_err) {
                 rt->PushResume(handle, {LuaValue{false}, LuaValue{std::string("send failed")}});
             } else {
@@ -377,14 +465,19 @@ static int ws_close(lua_State* L) {
         lua_pushboolean(L, 1);
         return 1;
     }
+    if (!conn->state || conn->state->shutting_down.load() || !conn->state->exec) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
 
     auto rt = LuaContext::FromLuaState(L);
     auto handle = rt->PreYield(L);
-    auto* exec = conn->exec;
+    auto* exec = conn->state->exec;
     auto client = conn->client;
+    auto state = conn->state;
 
-    asio::post(exec->context(), [exec, rt, handle, client]() mutable {
-        client->write_websocket_close("bye").via(exec).start([rt, handle](async_simple::Try<cinatra::resp_data>&&) {
+    asio::post(exec->context(), [state, exec, rt, handle, client]() mutable {
+        client->write_websocket_close("bye").via(exec).start([state, rt, handle](async_simple::Try<cinatra::resp_data>&&) {
             rt->PushResume(handle, {LuaValue{true}, LuaValue{nullptr}});
         });
     });
@@ -399,18 +492,16 @@ static const luaL_Reg ws_methods[] = {
     {nullptr, nullptr}
 };
 
+}  // namespace
+
 // --- HttpLibrary ---
 
 HttpLibrary::HttpLibrary(int io_threads) {
-    pool_ = std::make_unique<coro_io::multithread_context_pool>(io_threads);
-    pool_->run();
-    exec_ = pool_->get_executor();
+    io_threads_ = io_threads;
 }
 
 HttpLibrary::~HttpLibrary() {
-    if (pool_) {
-        pool_->stop();
-    }
+    Close(nullptr);
 }
 
 void HttpLibrary::Open(lua_State* L) {
@@ -437,8 +528,18 @@ void HttpLibrary::Open(lua_State* L) {
         {"ws_create", ws_create},
         {nullptr, nullptr}
     };
-    lua_pushlightuserdata(L, exec_);
-    luaL_setfuncs(L, funcs, 1);
+    auto state = std::make_shared<HttpLibraryState>();
+    state->exec = GetSharedHttpExecutorPool(io_threads_)->exec;
+    SetHttpState(L, state);
+    luaL_setfuncs(L, funcs, 0);
 }
 
-void HttpLibrary::Close(lua_State* L) {}
+void HttpLibrary::Close(lua_State* L) {
+    if (!L) {
+        return;
+    }
+    auto state = GetHttpState(L);
+    if (!state || state->shutting_down.exchange(true)) {
+        return;
+    }
+}

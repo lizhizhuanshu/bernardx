@@ -6,6 +6,13 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+
 #define AWAIT(lazy) async_simple::coro::syncAwait(lazy)
 
 // --- HttpLibrary ---
@@ -104,3 +111,80 @@ TEST_F(HttpLibraryTest, WsConnectToInvalidEndpoint) {
     )"));
     EXPECT_EQ(r.status, LUA_OK);
 }
+
+#ifdef __linux__
+TEST(HttpLibraryStressTest, RecreateRuntimeWithHttpLibrary100TimesWithTimeoutGuard) {
+    constexpr int kIterations = 100;
+    constexpr auto kTimeout = std::chrono::seconds(30);
+    constexpr auto kPollInterval = std::chrono::milliseconds(10);
+
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1) << "fork failed";
+
+    if (pid == 0) {
+        for (int i = 0; i < kIterations; ++i) {
+            auto runtime = LuaRuntime::Builder()
+                .RegisterLibrary(std::make_shared<HttpLibrary>())
+                .Create();
+            auto result = AWAIT(runtime->RunScript(R"(
+                local http = require("http")
+                local ws = http.ws_create("ws://127.0.0.1:1")
+                ws.onclose = function() end
+                ws.onerror = function() end
+                local ok = select(1, ws:connect())
+                assert(ok == false, "expected invalid endpoint connect to fail")
+            )"));
+            if (result.status != LUA_OK) {
+                _exit(2);
+            }
+        }
+        _exit(0);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + kTimeout;
+    int status = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t wait_result = waitpid(pid, &status, WNOHANG);
+        if (wait_result == pid) {
+            if (WIFEXITED(status)) {
+                EXPECT_EQ(WEXITSTATUS(status), 0)
+                    << "child exited with non-zero status, possible HttpLibrary teardown failure";
+            } else {
+                FAIL() << "child did not exit normally";
+            }
+            return;
+        }
+        ASSERT_NE(wait_result, -1) << "waitpid failed";
+        std::this_thread::sleep_for(kPollInterval);
+    }
+
+    const pid_t final_wait_result = waitpid(pid, &status, WNOHANG);
+    if (final_wait_result == pid) {
+        if (WIFEXITED(status)) {
+            EXPECT_EQ(WEXITSTATUS(status), 0)
+                << "child exited with non-zero status near timeout boundary";
+        } else {
+            FAIL() << "child did not exit normally near timeout boundary";
+        }
+        return;
+    }
+    ASSERT_NE(final_wait_result, -1) << "waitpid failed on final check";
+
+    const int kill_result = kill(pid, SIGKILL);
+    if (kill_result == -1) {
+        if (errno == ESRCH) {
+            ASSERT_NE(waitpid(pid, &status, 0), -1) << "waitpid failed while reaping exited child";
+            FAIL() << "child exited near timeout boundary";
+        } else {
+            FAIL() << "kill failed with errno " << errno;
+        }
+    } else {
+        ASSERT_NE(waitpid(pid, &status, 0), -1) << "waitpid failed after SIGKILL";
+        EXPECT_TRUE(WIFSIGNALED(status));
+        EXPECT_EQ(WTERMSIG(status), SIGKILL);
+    }
+
+    FAIL() << "timeout while recreating LuaRuntime with HttpLibrary " << kIterations
+           << " times (possible teardown hang)";
+}
+#endif

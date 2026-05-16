@@ -2,7 +2,15 @@
 
 #include <cinatra/ylt/coro_io/io_context_pool.hpp>
 
+#include <atomic>
+#include <memory>
+
 #include "lua_library.h"
+
+struct HttpLibraryState {
+    coro_io::ExecutorWrapper<>* exec = nullptr;
+    std::atomic<bool> shutting_down{false};
+};
 
 class HttpLibrary : public LuaLibrary {
 public:
@@ -13,9 +21,6 @@ public:
     void Open(lua_State* L) override;
     void Close(lua_State* L) override;
 
-    coro_io::ExecutorWrapper<>* executor() const { return exec_; }
-
 private:
-    std::unique_ptr<coro_io::multithread_context_pool> pool_;
-    coro_io::ExecutorWrapper<>* exec_ = nullptr;
+    int io_threads_ = 1;
 };

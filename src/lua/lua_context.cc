@@ -719,9 +719,22 @@ void LuaContext::PushValues(lua_State* L, const std::vector<LuaValue>& values) {
 // --- Shutdown ---
 
 void LuaContext::Shutdown() {
+    std::queue<WorkItem> pending_work;
+    decltype(script_promises_) pending_promises;
+    decltype(timer_queue_) pending_timers;
+    decltype(active_co_refs_) active_refs;
+    decltype(co_pool_) pooled_refs;
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         shutting_down_ = true;
+        std::swap(work_queue_, pending_work);
+        std::swap(script_promises_, pending_promises);
+        std::swap(timer_queue_, pending_timers);
+        std::swap(active_co_refs_, active_refs);
+        std::swap(co_pool_, pooled_refs);
+        pending_.clear();
+        co_complete_callbacks_.clear();
     }
 
     for (auto& ext : extensions_) {
@@ -730,15 +743,9 @@ void LuaContext::Shutdown() {
     for (auto& [name, lib] : libraries_) {
         lib->Close(main_L_);
     }
-    while (true) {
-        std::optional<WorkItem> item;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (work_queue_.empty()) break;
-            item = std::move(work_queue_.front());
-            work_queue_.pop();
-        }
-
+    while (!pending_work.empty()) {
+        auto item = std::move(pending_work.front());
+        pending_work.pop();
         std::visit(overloaded{
                        [&](TaskRequest& task) {
                            std::visit(overloaded{
@@ -758,26 +765,29 @@ void LuaContext::Shutdown() {
                        [&](RequireRun& req) {
                            PushResume(req.caller_handle, {LuaValue{nullptr}});
                        },
-                       [&](LoadFileRun& req) {
-                           PushResume(req.caller_handle, {LuaValue{nullptr}});
-                       }},
-                   *item);
+                        [&](LoadFileRun& req) {
+                            PushResume(req.caller_handle, {LuaValue{nullptr}});
+                        }},
+                    item);
     }
 
-    for (auto& [co, promise] : script_promises_) {
+    for (auto& [co, promise] : pending_promises) {
         promise.setValue(ScriptResult{LUA_ERRRUN, {}, "runtime shutdown"});
     }
-    for (auto& [deadline, entry] : timer_queue_) {
+    for (auto& [deadline, entry] : pending_timers) {
         if (entry.fn_ref != LUA_NOREF) {
             luaL_unref(main_L_, LUA_REGISTRYINDEX, entry.fn_ref);
         }
     }
-    for (auto& [co, ref] : active_co_refs_) {
+    for (auto& [co, ref] : active_refs) {
+        SetExtraspace(co, nullptr);
         luaL_unref(main_L_, LUA_REGISTRYINDEX, ref);
     }
-    for (auto& [co, ref] : co_pool_) {
+    for (auto& [co, ref] : pooled_refs) {
+        SetExtraspace(co, nullptr);
         luaL_unref(main_L_, LUA_REGISTRYINDEX, ref);
     }
+    SetExtraspace(main_L_, nullptr);
 }
 
 // --- Coroutine completion callback ---

@@ -41,7 +41,10 @@ void LuaRuntime::Start() {
 }
 
 void LuaRuntime::Stop() {
-    running_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(context_->mutex());
+        running_.store(false, std::memory_order_release);
+    }
     context_->cv().notify_all();
     if (event_loop_thread_.joinable()) {
         event_loop_thread_.join();
