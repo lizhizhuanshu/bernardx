@@ -63,7 +63,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(openssl)
 
-# cinatra (HTTP client, header-only) -- also brings asio
+# asio (header-only, needed by cinatra)
+add_definitions(-DASIO_STANDALONE)
+FetchContent_Declare(
+    asio
+    GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+    GIT_TAG        asio-1-36-0
+    GIT_SUBMODULES ""
+    GIT_SUBMODULES_RECURSE OFF
+)
+FetchContent_MakeAvailable(asio)
+
+# cinatra (HTTP client, header-only) -- reuses asio fetched above
 set(ENABLE_SSL ON CACHE BOOL "" FORCE)
 set(BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -140,6 +151,7 @@ add_executable(bernardx src/main.cc)
 target_link_libraries(bernardx PRIVATE bernardx_lib gflags)
 target_include_directories(bernardx PRIVATE ${CMAKE_SOURCE_DIR}/src/lua ${CMAKE_SOURCE_DIR}/src/bt)
 target_include_directories(bernardx SYSTEM PRIVATE ${cinatra_SOURCE_DIR}/include)
+cinatra_use_third_party_headers(bernardx)
 
 
 
@@ -158,5 +170,6 @@ add_executable(bernardx_test ${TEST_SOURCES})
 target_link_libraries(bernardx_test PRIVATE bernardx_lib GTest::gtest_main)
 target_include_directories(bernardx_test PRIVATE ${CMAKE_SOURCE_DIR}/src/lua)
 target_include_directories(bernardx_test SYSTEM PRIVATE ${cinatra_SOURCE_DIR}/include)
+cinatra_use_third_party_headers(bernardx_test)
 include(GoogleTest)
 gtest_discover_tests(bernardx_test)
