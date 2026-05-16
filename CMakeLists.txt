@@ -90,6 +90,7 @@ add_library(bernardx_lib STATIC
     src/lua/lua_context.cc
     src/lua/lua_runtime.cc
     src/lua/http_library.cc
+    src/lua/json_library.cc
     src/bt/node.cc
     src/bt/composite.cc
     src/bt/selector.cc
