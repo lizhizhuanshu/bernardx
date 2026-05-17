@@ -330,7 +330,7 @@ int lua_await(lua_State* L) {
 
     async_simple::Promise<ScriptResult> promise;
     ctx->PushTask({CallRef{fn_ref,
-        {LuaRef{resolve_ref, LUA_TFUNCTION}, LuaRef{reject_ref, LUA_TFUNCTION}},
+        {ctx->CreateRef(resolve_ref, LUA_TFUNCTION), ctx->CreateRef(reject_ref, LUA_TFUNCTION)},
         true}, std::move(promise)});
 
     // 6. Yield the caller coroutine — resumes when resolve/reject is called
@@ -343,6 +343,24 @@ int lua_await(lua_State* L) {
 LuaContext::LuaContext(lua_State* main_L) : main_L_(main_L) {}
 
 LuaContext::~LuaContext() = default;
+
+struct LuaRefImpl : public LuaRefBase {
+    ~LuaRefImpl() override {
+        auto ctx = ctx_.lock();
+        if (ctx && ref != LUA_NOREF) {
+            ctx->PushRelease({ref});
+        }
+    }
+private:
+    std::weak_ptr<LuaContext> ctx_;
+    LuaRefImpl(int r, int t, std::weak_ptr<LuaContext> ctx)
+        : LuaRefBase(r, t), ctx_(std::move(ctx)) {}
+    friend class LuaContext;
+};
+
+LuaRef LuaContext::CreateRef(int ref, int type) {
+    return LuaRef(new LuaRefImpl(ref, type, shared_from_this()));
+}
 
 // --- Extraspace ---
 
@@ -704,7 +722,7 @@ bool LuaContext::DrainOneWork() {
                               lua_pushvalue(co, -1);  // copy chunk to keep ref after pop
                               int ref = luaL_ref(co, LUA_REGISTRYINDEX);
                               int type = lua_type(co, -1);
-                              PushResume(req.caller_handle, {LuaRef{ref, type}});
+                              PushResume(req.caller_handle, {CreateRef(ref, type)});
                               ReleaseCo(co);
                               return true;
                           }},
@@ -786,7 +804,8 @@ std::vector<LuaValue> LuaContext::PeekValues(lua_State* L, int nresults) {
         } else {
             lua_pushvalue(L, i);
             int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-            result.push_back(LuaRef{ref, t});
+            auto ctx = FromLuaState(L);
+            result.push_back(ctx->CreateRef(ref, t));
         }
     }
     return result;
@@ -808,7 +827,7 @@ void LuaContext::PushValues(lua_State* L, const std::vector<LuaValue>& values) {
                 } else if constexpr (std::is_same_v<T, std::string>) {
                     lua_pushlstring(L, val.c_str(), val.size());
                 } else if constexpr (std::is_same_v<T, LuaRef>) {
-                    lua_rawgeti(L, LUA_REGISTRYINDEX, val.ref);
+                    lua_rawgeti(L, LUA_REGISTRYINDEX, val->ref);
                 }
             },
             v);

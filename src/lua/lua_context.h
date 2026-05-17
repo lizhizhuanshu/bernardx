@@ -31,10 +31,15 @@ class Executor;
 
 using AsyncHandle = int64_t;
 
-struct LuaRef {
-    int ref;   // LUA_REGISTRYINDEX ref
-    int type;  // lua_type value (LUA_TTABLE, LUA_TFUNCTION, LUA_TUSERDATA, LUA_TTHREAD)
+struct LuaRefBase {
+    const int ref;   // LUA_REGISTRYINDEX ref
+    const int type;  // lua_type value (LUA_TTABLE, LUA_TFUNCTION, LUA_TUSERDATA, LUA_TTHREAD)
+    virtual ~LuaRefBase() = default;
+protected:
+    LuaRefBase(int r, int t) : ref(r), type(t) {}
 };
+
+using LuaRef = std::shared_ptr<LuaRefBase>;
 
 using LuaValue = std::variant<std::nullptr_t, bool, int64_t, double, std::string, LuaRef>;
 
@@ -171,6 +176,10 @@ public:
 
     lua_State* AcquireCoroutine() { return AcquireCo(); }
     void ReleaseCoroutine(lua_State* co) { ReleaseCo(co); }
+
+    // --- LuaRef factory ---
+
+    LuaRef CreateRef(int ref, int type);
 
 private:
     void SetupBuiltins(lua_State* main_L);

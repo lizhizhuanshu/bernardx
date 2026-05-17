@@ -858,9 +858,8 @@ TEST_F(LuaRuntimeTest, RunScriptReturnsTableAsLuaRef) {
     ASSERT_EQ(r.values.size(), 1u);
     ASSERT_TRUE(std::holds_alternative<LuaRef>(r.values[0]));
     auto& lr = std::get<LuaRef>(r.values[0]);
-    EXPECT_EQ(lr.type, LUA_TTABLE);
-    EXPECT_NE(lr.ref, LUA_NOREF);
-    rt->context().PushRelease({lr.ref});
+    EXPECT_EQ(lr->type, LUA_TTABLE);
+    EXPECT_NE(lr->ref, LUA_NOREF);
 }
 
 TEST_F(LuaRuntimeTest, RunScriptReturnsFunctionAsLuaRef) {
@@ -869,9 +868,8 @@ TEST_F(LuaRuntimeTest, RunScriptReturnsFunctionAsLuaRef) {
     ASSERT_EQ(r.values.size(), 1u);
     ASSERT_TRUE(std::holds_alternative<LuaRef>(r.values[0]));
     auto& lr = std::get<LuaRef>(r.values[0]);
-    EXPECT_EQ(lr.type, LUA_TFUNCTION);
-    EXPECT_NE(lr.ref, LUA_NOREF);
-    rt->context().PushRelease({lr.ref});
+    EXPECT_EQ(lr->type, LUA_TFUNCTION);
+    EXPECT_NE(lr->ref, LUA_NOREF);
 }
 
 TEST_F(LuaRuntimeTest, RunScriptReturnsMixedWithLuaRef) {
@@ -880,12 +878,10 @@ TEST_F(LuaRuntimeTest, RunScriptReturnsMixedWithLuaRef) {
     ASSERT_EQ(r.values.size(), 4u);
     EXPECT_TRUE(std::holds_alternative<int64_t>(r.values[0]));
     EXPECT_TRUE(std::holds_alternative<LuaRef>(r.values[1]));
-    EXPECT_EQ(std::get<LuaRef>(r.values[1]).type, LUA_TTABLE);
+    EXPECT_EQ(std::get<LuaRef>(r.values[1])->type, LUA_TTABLE);
     EXPECT_TRUE(std::holds_alternative<std::string>(r.values[2]));
     EXPECT_TRUE(std::holds_alternative<LuaRef>(r.values[3]));
-    EXPECT_EQ(std::get<LuaRef>(r.values[3]).type, LUA_TFUNCTION);
-    rt->context().PushRelease({std::get<LuaRef>(r.values[1]).ref,
-                             std::get<LuaRef>(r.values[3]).ref});
+    EXPECT_EQ(std::get<LuaRef>(r.values[3])->type, LUA_TFUNCTION);
 }
 
 TEST_F(LuaRuntimeTest, LuaRefRoundTripViaResume) {
@@ -899,8 +895,7 @@ TEST_F(LuaRuntimeTest, LuaRefRoundTripViaResume) {
         int fn_ref = luaL_ref(L, LUA_REGISTRYINDEX);
         auto handle = ctx->PreYield(L);
         std::thread([ctx, handle, fn_ref]() {
-            ctx->PushResume(handle, {LuaValue{LuaRef{fn_ref, LUA_TTABLE}}});
-            ctx->PushRelease({fn_ref});
+            ctx->PushResume(handle, {ctx->CreateRef(fn_ref, LUA_TTABLE)});
         }).detach();
         return ctx->Yield(L);
     }, 1);
@@ -997,9 +992,8 @@ TEST_F(LuaRuntimeTest, CallFunctionReturnsTable) {
     ASSERT_EQ(r.values.size(), 1u);
     ASSERT_TRUE(std::holds_alternative<LuaRef>(r.values[0]));
     // Can't easily verify table contents from C++, just check type
-    EXPECT_EQ(std::get<LuaRef>(r.values[0]).type, LUA_TTABLE);
+    EXPECT_EQ(std::get<LuaRef>(r.values[0])->type, LUA_TTABLE);
     rt->context().PushRelease({fn_ref});
-    rt->context().PushRelease({std::get<LuaRef>(r.values[0]).ref});
 }
 
 TEST_F(LuaRuntimeTest, CallFunctionReturnsError) {
