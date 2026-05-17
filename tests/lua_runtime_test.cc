@@ -503,14 +503,38 @@ TEST_F(LuaRuntimeTest, AwaitSequentialCalls) {
     )")).status, LUA_OK);
 }
 
-TEST_F(LuaRuntimeTest, AwaitAutoRejectOnError) {
-    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+TEST_F(LuaRuntimeTest, AwaitFnErrorKillsTask) {
+    // fn errors are not auto-caught; fn should use pcall to handle errors
+    auto result = AWAIT(rt->RunScript(R"(
         local result, err = await(function(resolve, reject)
-            error("boom")
+            local ok, e = pcall(function() error("boom") end)
+            if not ok then reject(e) end
         end)
         assert(result == nil, "expected nil result")
         assert(err ~= nil, "expected error message")
         assert(string.find(err, "boom"), "error should contain 'boom', got: " .. tostring(err))
+    )"));
+    EXPECT_EQ(result.status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeTest, AwaitWithYieldInsideFn) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local value = await(function(resolve)
+            sleep(50)
+            resolve(99)
+        end)
+        assert(value == 99, "expected 99, got " .. tostring(value))
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeTest, AwaitWithMultipleYieldsInsideFn) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local value = await(function(resolve)
+            sleep(30)
+            sleep(30)
+            resolve("delayed")
+        end)
+        assert(value == "delayed", "expected 'delayed', got " .. tostring(value))
     )")).status, LUA_OK);
 }
 

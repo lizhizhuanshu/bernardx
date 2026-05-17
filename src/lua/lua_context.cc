@@ -317,31 +317,23 @@ int lua_await(lua_State* L) {
     lua_pushcclosure(L, lua_await_reject, 3);
     // Stack: [fn(1), done_table(2), resolve(3), reject(4)]
 
-    // 5. Call fn(resolve, reject)
+    // 5. Submit fn(resolve, reject) as a scheduled task
+    //    fn runs in its own coroutine via lua_resume, so it can yield freely
     lua_pushvalue(L, 1);   // fn
+    int fn_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
     lua_pushvalue(L, 3);   // resolve
+    int resolve_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
     lua_pushvalue(L, 4);   // reject
-    int status = lua_pcall(L, 2, 0, 0);
+    int reject_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
-    if (status != LUA_OK) {
-        // fn threw — auto-reject if not already resolved
-        lua_rawgeti(L, 2, 1);
-        bool done = lua_toboolean(L, -1);
-        lua_pop(L, 1);
+    async_simple::Promise<ScriptResult> promise;
+    ctx->PushTask({CallRef{fn_ref,
+        {LuaRef{resolve_ref, LUA_TFUNCTION}, LuaRef{reject_ref, LUA_TFUNCTION}},
+        true}, std::move(promise)});
 
-        if (!done) {
-            lua_pushboolean(L, 1);
-            lua_rawseti(L, 2, 1);
-
-            const char* err = lua_tostring(L, -1);
-            ctx->PushResume(handle, {
-                LuaValue{nullptr},
-                LuaValue{err ? std::string(err) : std::string("unknown error in await callback")}
-            });
-        }
-        lua_pop(L, 1);  // pop error
-    }
-
+    // 6. Yield the caller coroutine — resumes when resolve/reject is called
     return LuaContext::Yield(L);
 }
 }  // namespace
