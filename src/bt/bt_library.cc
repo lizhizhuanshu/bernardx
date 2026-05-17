@@ -259,8 +259,7 @@ void BehaviorTreeLibrary::StartBtThread(std::shared_ptr<CodeProvider> code_provi
                                          CompletionCallback on_complete) {
     // Create BT's own Lua state and LuaContext
     bt_lua_ = std::make_unique<sol::state>();
-    bt_lua_->open_libraries(sol::lib::base, sol::lib::string, sol::lib::table,
-                            sol::lib::math, sol::lib::package);
+    bt_lua_->open_libraries();
 
     bt_context_ = std::make_shared<LuaContext>(bt_lua_->lua_state());
     LuaContext::SetExtraspace(bt_lua_->lua_state(), bt_context_.get());

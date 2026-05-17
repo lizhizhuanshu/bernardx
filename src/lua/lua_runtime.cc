@@ -15,8 +15,7 @@ int64_t NowMs() {
 LuaRuntime::LuaRuntime() : lua_(std::make_unique<sol::state>()) {
     context_ = std::make_shared<LuaContext>(lua_->lua_state());
     LuaContext::SetExtraspace(lua_->lua_state(), context_.get());
-    lua_->open_libraries(sol::lib::base, sol::lib::string, sol::lib::table,
-                         sol::lib::math, sol::lib::package);
+    lua_->open_libraries();
 }
 
 void LuaRuntime::Setup(sol::state& lua, const std::shared_ptr<CodeProvider>& code_provider,
