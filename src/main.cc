@@ -14,7 +14,8 @@
 #include "file_system_code_provider.h"
 #include "lua_runtime.h"
 
-DEFINE_string(dir, ".", "Working directory containing main.lua");
+DEFINE_string(dir, ".", "Working directory containing src/ and libs/");
+DEFINE_string(entry, "", "Entry Lua file relative to --dir (default: src/main.lua)");
 
 int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -40,11 +41,17 @@ int main(int argc, char* argv[]) {
                   .RegisterLibrary(json_lib)
                   .Create();
 
-    std::string main_lua = std::filesystem::absolute(dir).string() + "/src/main.lua";
-    auto result = async_simple::coro::syncAwait(rt->RunFile(main_lua));
+    std::string entry = FLAGS_entry.empty() ? "src/main.lua" : FLAGS_entry;
+    std::string entry_path = std::filesystem::absolute(dir / std::filesystem::path(entry)).string();
+    if (!std::filesystem::exists(entry_path)) {
+        std::cerr << "Error: entry file not found: " << entry_path << std::endl;
+        return 1;
+    }
+
+    auto result = async_simple::coro::syncAwait(rt->RunFile(entry_path));
 
     if (result.status != 0) {
-        std::cerr << "main.lua failed: " << result.error << std::endl;
+        std::cerr << entry << " failed: " << result.error << std::endl;
         return 1;
     }
 
