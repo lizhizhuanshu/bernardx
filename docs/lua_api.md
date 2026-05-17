@@ -4,7 +4,7 @@
 
 | 模块 | 加载方式 | 说明 |
 |------|---------|------|
-| 全局内建 | 无需 require | `now` / `sleep` / `setTimeout` / `clearTimeout` |
+| 全局内建 | 无需 require | `now` / `sleep` / `setTimeout` / `clearTimeout` / `await` |
 | `http` | `require('http')` | HTTP 客户端 + WebSocket |
 | `bt` | `require('bt')` | 行为树（见 [bt_node_config.md](bt_node_config.md)） |
 
@@ -72,6 +72,71 @@ clearTimeout(handle)  -- 取消，回调不会执行
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | handle | integer | `setTimeout` 返回的句柄 |
+
+---
+
+### await(fn)
+
+将回调式异步转为协程同步等待。类似 JavaScript 的 `Promise`。
+
+调用后当前协程挂起，直到 `resolve` 或 `reject` 被调用时自动恢复。
+
+```lua
+local value = await(function(resolve)
+    setTimeout(100, function()
+        resolve(42)
+    end)
+end)
+print(value)  -- 42
+```
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| fn | function | 接收 `resolve` 和 `reject` 两个回调的函数 |
+
+**fn 参数：**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| resolve | function | 成功回调，参数作为 `await` 的返回值 |
+| reject | function | 失败回调，参数作为错误信息 |
+
+**返回值（resolve 时）：** 传入 `resolve` 的参数
+
+**返回值（reject 时）：** `nil, string` — nil + 错误信息
+
+**特性：**
+- `resolve` 和 `reject` 只能调用一次，后续调用会被忽略
+- 如果 `fn` 执行过程中抛出错误，会自动 `reject`
+- 只能在协程上下文中使用
+
+**示例：**
+
+```lua
+-- 等待 setTimeout 回调
+local value = await(function(resolve)
+    setTimeout(100, function()
+        resolve(42)
+    end)
+end)
+print(value)  -- 42
+
+-- 带错误处理
+local result, err = await(function(resolve, reject)
+    setTimeout(100, function()
+        if math.random() > 0.5 then
+            resolve("ok")
+        else
+            reject("timeout")
+        end
+    end)
+end)
+if err then
+    print("failed:", err)
+else
+    print("got:", result)
+end
+```
 
 ---
 

@@ -427,6 +427,114 @@ TEST_F(LuaRuntimeTest, ClearTimeoutOnFiredTimerIsHarmless) {
     )")).status, LUA_OK);
 }
 
+// --- await() tests ---
+
+TEST_F(LuaRuntimeTest, AwaitResolveWithValue) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local value = await(function(resolve)
+            setTimeout(50, function()
+                resolve(42)
+            end)
+        end)
+        assert(value == 42, "expected 42, got " .. tostring(value))
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeTest, AwaitResolveWithString) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local msg = await(function(resolve)
+            setTimeout(50, function()
+                resolve("hello")
+            end)
+        end)
+        assert(msg == "hello", "expected hello, got " .. tostring(msg))
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeTest, AwaitRejectReturnsNilAndError) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local result, err = await(function(resolve, reject)
+            setTimeout(50, function()
+                reject("something went wrong")
+            end)
+        end)
+        assert(result == nil, "expected nil result on reject")
+        assert(err == "something went wrong", "expected error message, got " .. tostring(err))
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeTest, AwaitResolveCalledTwiceIsNoOp) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local value = await(function(resolve)
+            setTimeout(50, function()
+                resolve(1)
+                resolve(2)  -- should be ignored
+            end)
+        end)
+        assert(value == 1, "expected 1, got " .. tostring(value))
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeTest, AwaitResolveAndRejectRace) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local value, err = await(function(resolve, reject)
+            setTimeout(50, function()
+                resolve("ok")
+                reject("fail")  -- should be ignored
+            end)
+        end)
+        assert(value == "ok", "expected ok, got " .. tostring(value))
+        assert(err == nil, "expected nil error")
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeTest, AwaitSequentialCalls) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local a = await(function(resolve)
+            setTimeout(30, function() resolve(10) end)
+        end)
+        local b = await(function(resolve)
+            setTimeout(30, function() resolve(a + 5) end)
+        end)
+        local c = await(function(resolve)
+            setTimeout(30, function() resolve(b * 2) end)
+        end)
+        assert(c == 30, "expected 30, got " .. tostring(c))
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeTest, AwaitAutoRejectOnError) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local result, err = await(function(resolve, reject)
+            error("boom")
+        end)
+        assert(result == nil, "expected nil result")
+        assert(err ~= nil, "expected error message")
+        assert(string.find(err, "boom"), "error should contain 'boom', got: " .. tostring(err))
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeTest, AwaitRejectWithNoMessage) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local result, err = await(function(resolve, reject)
+            setTimeout(50, function()
+                reject()
+            end)
+        end)
+        assert(result == nil, "expected nil result")
+        assert(err == "rejected", "expected 'rejected', got " .. tostring(err))
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeTest, AwaitSynchronousResolve) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local value = await(function(resolve)
+            resolve(99)  -- resolve synchronously before yield
+        end)
+        assert(value == 99, "expected 99, got " .. tostring(value))
+    )")).status, LUA_OK);
+}
+
 // --- Custom require and loadfile ---
 
 class LuaRuntimeWithProviderTest : public ::testing::Test {

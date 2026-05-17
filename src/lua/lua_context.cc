@@ -240,6 +240,110 @@ int lua_clear_timeout(lua_State* L) {
     ctx->CancelTimer(handle);
     return 0;
 }
+
+// --- await(resolve, reject) — async-to-coroutine bridge ---
+
+enum { UV_CTX_PTR = 1, UV_HANDLE = 2, UV_DONE_TABLE = 3 };
+
+int lua_await_resolve(lua_State* L) {
+    // Check shared done flag
+    lua_rawgeti(L, lua_upvalueindex(UV_DONE_TABLE), 1);
+    bool done = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    if (done) return 0;
+
+    // Set done
+    lua_pushboolean(L, 1);
+    lua_rawseti(L, lua_upvalueindex(UV_DONE_TABLE), 1);
+
+    auto* ctx = static_cast<LuaContext*>(lua_touserdata(L, lua_upvalueindex(UV_CTX_PTR)));
+    auto handle = static_cast<AsyncHandle>(lua_tointeger(L, lua_upvalueindex(UV_HANDLE)));
+
+    int nargs = lua_gettop(L);
+    auto values = LuaContext::PeekValues(L, nargs);
+    ctx->PushResume(handle, std::move(values));
+    return 0;
+}
+
+int lua_await_reject(lua_State* L) {
+    // Check shared done flag
+    lua_rawgeti(L, lua_upvalueindex(UV_DONE_TABLE), 1);
+    bool done = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    if (done) return 0;
+
+    // Set done
+    lua_pushboolean(L, 1);
+    lua_rawseti(L, lua_upvalueindex(UV_DONE_TABLE), 1);
+
+    auto* ctx = static_cast<LuaContext*>(lua_touserdata(L, lua_upvalueindex(UV_CTX_PTR)));
+    auto handle = static_cast<AsyncHandle>(lua_tointeger(L, lua_upvalueindex(UV_HANDLE)));
+
+    // Resume with: nil, error_message
+    std::vector<LuaValue> args;
+    args.push_back(nullptr);
+    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
+        size_t len;
+        const char* s = lua_tolstring(L, 1, &len);
+        args.push_back(std::string(s, len));
+    } else {
+        args.push_back(std::string("rejected"));
+    }
+    ctx->PushResume(handle, std::move(args));
+    return 0;
+}
+
+int lua_await(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    auto ctx = LuaContext::FromLuaState(L);
+
+    // 1. Pre-yield: register coroutine in pending_
+    auto handle = ctx->PreYield(L);
+
+    // 2. Create shared done table (used by both resolve and reject)
+    lua_newtable(L);  // [fn, done_table]
+
+    // 3. Create resolve closure
+    lua_pushlightuserdata(L, ctx.get());     // ctx ptr
+    lua_pushinteger(L, handle);              // handle
+    lua_pushvalue(L, 2);                     // shared done table
+    lua_pushcclosure(L, lua_await_resolve, 3);
+    // Stack: [fn(1), done_table(2), resolve(3)]
+
+    // 4. Create reject closure
+    lua_pushlightuserdata(L, ctx.get());     // ctx ptr
+    lua_pushinteger(L, handle);              // handle
+    lua_pushvalue(L, 2);                     // shared done table
+    lua_pushcclosure(L, lua_await_reject, 3);
+    // Stack: [fn(1), done_table(2), resolve(3), reject(4)]
+
+    // 5. Call fn(resolve, reject)
+    lua_pushvalue(L, 1);   // fn
+    lua_pushvalue(L, 3);   // resolve
+    lua_pushvalue(L, 4);   // reject
+    int status = lua_pcall(L, 2, 0, 0);
+
+    if (status != LUA_OK) {
+        // fn threw — auto-reject if not already resolved
+        lua_rawgeti(L, 2, 1);
+        bool done = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+
+        if (!done) {
+            lua_pushboolean(L, 1);
+            lua_rawseti(L, 2, 1);
+
+            const char* err = lua_tostring(L, -1);
+            ctx->PushResume(handle, {
+                LuaValue{nullptr},
+                LuaValue{err ? std::string(err) : std::string("unknown error in await callback")}
+            });
+        }
+        lua_pop(L, 1);  // pop error
+    }
+
+    return LuaContext::Yield(L);
+}
 }  // namespace
 
 // --- LuaContext implementation ---
@@ -305,6 +409,9 @@ void LuaContext::SetupBuiltins(lua_State* main_L) {
 
     lua_pushcfunction(main_L, lua_clear_timeout);
     lua_setglobal(main_L, "clearTimeout");
+
+    lua_pushcfunction(main_L, lua_await);
+    lua_setglobal(main_L, "await");
 }
 
 void LuaContext::SetupCustomRequire(lua_State* main_L) {
