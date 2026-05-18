@@ -8,7 +8,7 @@ extern "C" {
 #include "lua.h"
 }
 
-#include "lua_context.h"
+#include "lua_runtime.h"
 
 struct SensorSpec {
     std::string name;
@@ -29,7 +29,7 @@ public:
 
     // Initialize: load sensor script and extract Enter/Tick/Exit refs (BT thread only)
     // base_path is the BT project root for resolving relative script paths
-    void Init(lua_State* L, LuaContext* ctx, const std::string& base_path);
+    void Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
 
     // Activate: call Enter, mark active, run first Tick
     void Activate(Blackboard& bb);
@@ -61,7 +61,7 @@ private:
 
     SensorSpec spec_;
     lua_State* main_L_ = nullptr;
-    LuaContext* lua_context_ = nullptr;
+    LuaRuntime* lua_context_ = nullptr;
 
     int enter_ref_ = LUA_NOREF;
     int tick_ref_ = LUA_NOREF;

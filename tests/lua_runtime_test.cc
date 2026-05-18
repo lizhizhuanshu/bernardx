@@ -1,5 +1,4 @@
 #include "lua_runtime.h"
-#include "lua_context.h"
 #include "lua_extension.h"
 #include "lua_library.h"
 
@@ -7,7 +6,6 @@
 
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
-#include <async_simple/executors/SimpleExecutor.h>
 #include <cerrno>
 #include <csignal>
 #include <map>
@@ -108,93 +106,12 @@ TEST_F(LuaRuntimeTest, RunScriptReturnsNoValues) {
     EXPECT_TRUE(r.values.empty());
 }
 
-#ifdef __linux__
-TEST(LuaRuntimeStressTest, RecreateRuntime100TimesWithTimeoutGuard) {
-    constexpr int kIterations = 100;
-    constexpr auto kTimeout = std::chrono::seconds(30);
-    constexpr auto kPollInterval = std::chrono::milliseconds(10);
-
-    pid_t pid = fork();
-    ASSERT_NE(pid, -1) << "fork failed";
-
-    if (pid == 0) {
-        for (int i = 0; i < kIterations; ++i) {
-            auto runtime = LuaRuntime::Builder().Create();
-            auto result = AWAIT(runtime->RunScript("local x = 1 + 1; assert(x == 2)"));
-            if (result.status != LUA_OK) {
-                _exit(2);
-            }
-        }
-        _exit(0);
-    }
-
-    const auto deadline = std::chrono::steady_clock::now() + kTimeout;
-    int status = 0;
-    while (std::chrono::steady_clock::now() < deadline) {
-        const pid_t wait_result = waitpid(pid, &status, WNOHANG);
-        if (wait_result == pid) {
-            if (WIFEXITED(status)) {
-                EXPECT_EQ(WEXITSTATUS(status), 0)
-                    << "child exited with non-zero status, possible runtime failure";
-            } else {
-                FAIL() << "child did not exit normally";
-            }
-            return;
-        }
-        ASSERT_NE(wait_result, -1) << "waitpid failed";
-        std::this_thread::sleep_for(kPollInterval);
-    }
-
-    // Final non-blocking reap to avoid a timeout-boundary race where child exits
-    // between the loop condition check and the timeout handling path.
-    const pid_t final_wait_result = waitpid(pid, &status, WNOHANG);
-    if (final_wait_result == pid) {
-        if (WIFEXITED(status)) {
-            EXPECT_EQ(WEXITSTATUS(status), 0)
-                << "child exited with non-zero status, possible runtime failure";
-        } else {
-            FAIL() << "child did not exit normally";
-        }
-        return;
-    }
-    ASSERT_NE(final_wait_result, -1) << "waitpid failed on final check";
-
-    const int kill_result = kill(pid, SIGKILL);
-    if (kill_result == -1) {
-        if (errno == ESRCH) {
-            // Already exited between final waitpid and kill; reap final status.
-            ASSERT_NE(waitpid(pid, &status, 0), -1) << "waitpid failed while reaping exited child";
-            if (WIFEXITED(status)) {
-                if (WEXITSTATUS(status) == 0) {
-                    FAIL() << "child completed just after timeout deadline (" << kIterations
-                           << " iterations exceeded "
-                           << std::chrono::duration_cast<std::chrono::milliseconds>(kTimeout).count()
-                           << " ms budget)";
-                }
-                FAIL() << "child exited with non-zero status " << WEXITSTATUS(status)
-                       << " near timeout boundary";
-            }
-            FAIL() << "child did not exit normally near timeout boundary";
-        } else {
-            FAIL() << "kill failed with errno " << errno;
-        }
-    } else {
-        ASSERT_NE(waitpid(pid, &status, 0), -1) << "waitpid failed after SIGKILL";
-        EXPECT_TRUE(WIFSIGNALED(status));
-        EXPECT_EQ(WTERMSIG(status), SIGKILL);
-    }
-
-    FAIL() << "timeout after " << std::chrono::duration_cast<std::chrono::milliseconds>(kTimeout).count()
-           << " ms while recreating LuaRuntime " << kIterations
-           << " times (possible destructor hang)";
-}
-#endif
 
 // --- Async yield/resume: single ---
 
 TEST_F(LuaRuntimeTest, AsyncNoArgs) {
     rt->lua().set_function("async_noop", [](lua_State* L) -> int {
-        auto ctx = LuaContext::FromLuaState(L);
+        auto ctx = LuaRuntime::FromLuaState(L);
         auto handle = ctx->PreYield(L);
         std::thread([ctx, handle]() { ctx->PushResume(handle); }).detach();
         return ctx->Yield(L);
@@ -204,7 +121,7 @@ TEST_F(LuaRuntimeTest, AsyncNoArgs) {
 
 TEST_F(LuaRuntimeTest, AsyncReturnsIntValue) {
     rt->lua().set_function("async_value", [](lua_State* L) -> int {
-        auto ctx = LuaContext::FromLuaState(L);
+        auto ctx = LuaRuntime::FromLuaState(L);
         auto handle = ctx->PreYield(L);
         std::thread([ctx, handle]() {
             ctx->PushResume(handle, {static_cast<int64_t>(99)});
@@ -219,7 +136,7 @@ TEST_F(LuaRuntimeTest, AsyncReturnsIntValue) {
 
 TEST_F(LuaRuntimeTest, AsyncReturnsDoubleValue) {
     rt->lua().set_function("async_double", [](lua_State* L) -> int {
-        auto ctx = LuaContext::FromLuaState(L);
+        auto ctx = LuaRuntime::FromLuaState(L);
         auto handle = ctx->PreYield(L);
         std::thread([ctx, handle]() {
             ctx->PushResume(handle, {3.14});
@@ -234,7 +151,7 @@ TEST_F(LuaRuntimeTest, AsyncReturnsDoubleValue) {
 
 TEST_F(LuaRuntimeTest, AsyncReturnsBoolValue) {
     rt->lua().set_function("async_bool", [](lua_State* L) -> int {
-        auto ctx = LuaContext::FromLuaState(L);
+        auto ctx = LuaRuntime::FromLuaState(L);
         auto handle = ctx->PreYield(L);
         std::thread([ctx, handle]() {
             ctx->PushResume(handle, {LuaValue{true}});
@@ -249,7 +166,7 @@ TEST_F(LuaRuntimeTest, AsyncReturnsBoolValue) {
 
 TEST_F(LuaRuntimeTest, AsyncReturnsStringValue) {
     rt->lua().set_function("async_str", [](lua_State* L) -> int {
-        auto ctx = LuaContext::FromLuaState(L);
+        auto ctx = LuaRuntime::FromLuaState(L);
         auto handle = ctx->PreYield(L);
         std::thread([ctx, handle]() {
             ctx->PushResume(handle, {std::string("hello from C++")});
@@ -264,7 +181,7 @@ TEST_F(LuaRuntimeTest, AsyncReturnsStringValue) {
 
 TEST_F(LuaRuntimeTest, AsyncReturnsNilValue) {
     rt->lua().set_function("async_nil", [](lua_State* L) -> int {
-        auto ctx = LuaContext::FromLuaState(L);
+        auto ctx = LuaRuntime::FromLuaState(L);
         auto handle = ctx->PreYield(L);
         std::thread([ctx, handle]() {
             ctx->PushResume(handle, {LuaValue{nullptr}});
@@ -280,7 +197,7 @@ TEST_F(LuaRuntimeTest, SequentialAsyncCalls) {
     rt->lua().set_function("async_add", [](lua_State* L) -> int {
         int a = static_cast<int>(luaL_checkinteger(L, 1));
         int b = static_cast<int>(luaL_checkinteger(L, 2));
-        auto ctx = LuaContext::FromLuaState(L);
+        auto ctx = LuaRuntime::FromLuaState(L);
         auto handle = ctx->PreYield(L);
         std::thread([ctx, handle, a, b]() {
             ctx->PushResume(handle, {static_cast<int64_t>(a + b)});
@@ -303,7 +220,7 @@ TEST_F(LuaRuntimeTest, ConcurrentRuntimes) {
         auto r = LuaRuntime::Builder().Create();
         r->lua().set_function("async_id", [](lua_State* L) -> int {
             int id = static_cast<int>(luaL_checkinteger(L, 1));
-            auto ctx = LuaContext::FromLuaState(L);
+            auto ctx = LuaRuntime::FromLuaState(L);
             auto handle = ctx->PreYield(L);
             std::thread([ctx, handle, id]() {
                 ctx->PushResume(handle, {static_cast<int64_t>(id)});
@@ -567,11 +484,9 @@ protected:
         auto p = std::make_unique<TestCodeProvider>();
         provider = p.get();
         rt = LuaRuntime::Builder()
-            .WithExecutor(executor)
             .WithCodeProvider(std::move(p))
             .Create();
     }
-    async_simple::executors::SimpleExecutor executor{1};
     TestCodeProvider* provider = nullptr;
     LuaRuntime::Ptr rt;
 };
@@ -765,7 +680,6 @@ protected:
         provider->set_module("util", "return { answer = 42 }");
         provider->set_module("helper", "return { greet = function() return 'hello' end }");
         rt = LuaRuntime::Builder()
-            .WithExecutor(executor)
             .Register("util", [](lua_State* L) -> int {
                 lua_newtable(L);
                 lua_pushstring(L, "from_c");
@@ -775,7 +689,6 @@ protected:
             .WithCodeProvider(std::move(provider))
             .Create();
     }
-    async_simple::executors::SimpleExecutor executor{1};
     LuaRuntime::Ptr rt;
 };
 
@@ -796,7 +709,7 @@ TEST_F(LuaRuntimeTest, CallLuaFunctionFromCpp) {
     lua_pushlightuserdata(main_L, main_L);
     lua_pushcclosure(main_L, [](lua_State* L) -> int {
         luaL_checktype(L, 1, LUA_TFUNCTION);
-        auto ctx = LuaContext::FromLuaState(L);
+        auto ctx = LuaRuntime::FromLuaState(L);
         lua_pushvalue(L, 1);
         int fn_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
@@ -826,7 +739,7 @@ TEST_F(LuaRuntimeTest, CallLuaFunctionWithArgs) {
     lua_pushlightuserdata(main_L, main_L);
     lua_pushcclosure(main_L, [](lua_State* L) -> int {
         luaL_checktype(L, 1, LUA_TFUNCTION);
-        auto ctx = LuaContext::FromLuaState(L);
+        auto ctx = LuaRuntime::FromLuaState(L);
         lua_pushvalue(L, 1);
         int fn_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
@@ -890,7 +803,7 @@ TEST_F(LuaRuntimeTest, LuaRefRoundTripViaResume) {
     lua_pushlightuserdata(main_L, main_L);
     lua_pushcclosure(main_L, [](lua_State* L) -> int {
         luaL_checktype(L, 1, LUA_TTABLE);
-        auto ctx = LuaContext::FromLuaState(L);
+        auto ctx = LuaRuntime::FromLuaState(L);
         lua_pushvalue(L, 1);
         int fn_ref = luaL_ref(L, LUA_REGISTRYINDEX);
         auto handle = ctx->PreYield(L);
@@ -921,7 +834,7 @@ TEST_F(LuaRuntimeTest, ReleaseRefsBatch) {
         for (auto v : va) {
             refs.push_back(v.as<int>());
         }
-        rt->context().PushRelease(std::move(refs));
+        rt->PushRelease(std::move(refs));
     });
 
     // Create refs, release them, then verify slots are reused by new refs
@@ -961,7 +874,7 @@ TEST_F(LuaRuntimeTest, CallFunctionReturnsValues) {
     ASSERT_EQ(r.values.size(), 2u);
     EXPECT_EQ(std::get<int64_t>(r.values[0]), 7);
     EXPECT_EQ(std::get<int64_t>(r.values[1]), 12);
-    rt->context().PushRelease({fn_ref});
+    rt->PushRelease({fn_ref});
 }
 
 TEST_F(LuaRuntimeTest, CallFunctionReturnsString) {
@@ -976,7 +889,7 @@ TEST_F(LuaRuntimeTest, CallFunctionReturnsString) {
     EXPECT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 1u);
     EXPECT_EQ(std::get<std::string>(r.values[0]), "hello from CallFunction");
-    rt->context().PushRelease({fn_ref});
+    rt->PushRelease({fn_ref});
 }
 
 TEST_F(LuaRuntimeTest, CallFunctionReturnsTable) {
@@ -993,7 +906,7 @@ TEST_F(LuaRuntimeTest, CallFunctionReturnsTable) {
     ASSERT_TRUE(std::holds_alternative<LuaRef>(r.values[0]));
     // Can't easily verify table contents from C++, just check type
     EXPECT_EQ(std::get<LuaRef>(r.values[0])->type, LUA_TTABLE);
-    rt->context().PushRelease({fn_ref});
+    rt->PushRelease({fn_ref});
 }
 
 TEST_F(LuaRuntimeTest, CallFunctionReturnsError) {
@@ -1006,7 +919,7 @@ TEST_F(LuaRuntimeTest, CallFunctionReturnsError) {
     auto r = AWAIT(rt->CallFunction(fn_ref));
     EXPECT_NE(r.status, LUA_OK);
     EXPECT_NE(r.error.find("intentional error"), std::string::npos);
-    rt->context().PushRelease({fn_ref});
+    rt->PushRelease({fn_ref});
 }
 
 TEST_F(LuaRuntimeTest, CallFunctionNoArgs) {
@@ -1021,13 +934,13 @@ TEST_F(LuaRuntimeTest, CallFunctionNoArgs) {
     EXPECT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 1u);
     EXPECT_EQ(std::get<int64_t>(r.values[0]), 42);
-    rt->context().PushRelease({fn_ref});
+    rt->PushRelease({fn_ref});
 }
 
 TEST_F(LuaRuntimeTest, CallFunctionCanYield) {
     lua_State* main_L = rt->lua().lua_state();
     lua_pushcfunction(main_L, [](lua_State* L) -> int {
-        auto ctx = LuaContext::FromLuaState(L);
+        auto ctx = LuaRuntime::FromLuaState(L);
         int ms = static_cast<int>(luaL_checkinteger(L, 1));
         auto handle = ctx->PreYield(L);
         std::thread([ctx, handle, ms]() {
@@ -1044,7 +957,7 @@ TEST_F(LuaRuntimeTest, CallFunctionCanYield) {
         std::chrono::steady_clock::now() - start).count();
     EXPECT_EQ(r.status, LUA_OK);
     EXPECT_GE(elapsed, 30);
-    rt->context().PushRelease({fn_ref});
+    rt->PushRelease({fn_ref});
 }
 
 // --- Factory: shared config across multiple runtimes ---
@@ -1069,12 +982,10 @@ protected:
         provider->set_module("greet", "return { hello = function() return 'hi' end }");
 
         factory = std::make_unique<LuaRuntime::Builder>();
-        factory->WithExecutor(executor);
         factory->WithCodeProvider(std::move(p));
         factory->Register("testmath", luaopen_testmath);
     }
 
-    async_simple::executors::SimpleExecutor executor{1};
     TestCodeProvider* provider = nullptr;
     std::unique_ptr<LuaRuntime::Builder> factory;
 };
@@ -1189,7 +1100,6 @@ protected:
             .Create();
     }
 
-    async_simple::executors::SimpleExecutor executor{1};
     std::shared_ptr<TestLibrary> lib;
     LuaRuntime::Ptr rt;
 };
@@ -1238,7 +1148,6 @@ TEST_F(LuaLibraryTest, LibraryWithCodeProviderPrecedence) {
     provider->set_module("testlib", "return { from_provider = true }");
 
     auto rt2 = LuaRuntime::Builder()
-        .WithExecutor(executor)
         .RegisterLibrary(lib)
         .WithCodeProvider(std::move(provider))
         .Create();

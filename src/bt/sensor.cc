@@ -22,7 +22,7 @@ ActiveSensor::~ActiveSensor() {
     }
 }
 
-void ActiveSensor::Init(lua_State* L, LuaContext* ctx, const std::string& base_path) {
+void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
     main_L_ = L;
     lua_context_ = ctx;
 
@@ -194,7 +194,7 @@ void ActiveSensor::RunOnce(Blackboard& bb) {
     lua_context_->RemoveCoCompleteCallback(co);
 
     if (status == LUA_OK) {
-        auto values = LuaContext::PeekValues(co, nresults);
+        auto values = LuaRuntime::PeekValues(co, nresults);
         lua_pop(co, nresults);
         HandleResult(values, bb);
     } else {

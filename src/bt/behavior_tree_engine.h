@@ -48,14 +48,14 @@ public:
     // Event injection (thread-safe)
     void Notify(const std::string& event_name, LuaValue data);
 
-    // Initialize script nodes with lua_State and LuaContext (called on event loop thread)
-    void InitScriptNodes(lua_State* L, LuaContext* ctx);
+    // Initialize script nodes with lua_State and LuaRuntime (called on event loop thread)
+    void InitScriptNodes(lua_State* L, LuaRuntime* ctx);
 
     void SetProjectPath(std::string path) { project_path_ = std::move(path); }
     const std::string& project_path() const { return project_path_; }
 
-    // Initialize sensors with lua_State and LuaContext (called on BT thread)
-    void InitSensors(lua_State* L, LuaContext* ctx);
+    // Initialize sensors with lua_State and LuaRuntime (called on BT thread)
+    void InitSensors(lua_State* L, LuaRuntime* ctx);
 
     // Activate sensors for the initial active path (root → first child → ...)
     void ActivateInitialSensors();
@@ -72,7 +72,7 @@ private:
     void PropagateAbort(Node* source, AbortMode mode);
     void HandleEvents();
     void ResetTree();
-    void InitScriptNodesRecursive(Node* node, lua_State* L, LuaContext* ctx);
+    void InitScriptNodesRecursive(Node* node, lua_State* L, LuaRuntime* ctx);
     void CollectRunningNodes(Node* node, std::vector<Node*>& out);
     bool IsDescendantOf(Node* node, Node* ancestor) const;
 
@@ -82,7 +82,7 @@ private:
     void CollectActiveNodes(Node* node, std::set<Node*>& out);
     void ActivateNodeSensors(Node* node);
     void DeactivateNodeSensors(Node* node, const std::set<Node*>& still_active);
-    void InitSensorsRecursive(Node* node, lua_State* L, LuaContext* ctx);
+    void InitSensorsRecursive(Node* node, lua_State* L, LuaRuntime* ctx);
 
     static int64_t NowMs();
 

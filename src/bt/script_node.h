@@ -8,7 +8,7 @@ extern "C" {
 }
 
 #include "leaf.h"
-#include "lua_context.h"
+#include "lua_runtime.h"
 
 class ScriptNode : public Leaf {
 public:
@@ -18,7 +18,7 @@ public:
 
     // Initialize: load script file, extract function refs (called on event loop thread)
     // base_path is the BT project root for resolving relative script paths
-    void Init(lua_State* L, LuaContext* ctx, const std::string& base_path);
+    void Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
 
     bool is_loaded() const { return tick_ref_ != LUA_NOREF; }
 
@@ -39,7 +39,7 @@ private:
 
     std::string script_path_;
     lua_State* main_L_ = nullptr;
-    LuaContext* lua_context_ = nullptr;
+    LuaRuntime* lua_context_ = nullptr;
 
     int enter_ref_ = LUA_NOREF;
     int tick_ref_ = LUA_NOREF;
@@ -48,7 +48,7 @@ private:
 
     bool active_ = false;
 
-    // Yielded coroutine state (managed by LuaContext's coroutine pool)
+    // Yielded coroutine state (managed by LuaRuntime's coroutine pool)
     lua_State* yielded_co_ = nullptr;
 
     // Result from coroutine completion callback

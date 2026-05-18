@@ -5,7 +5,7 @@
 #include <string>
 #include <unordered_map>
 
-#include "lua_context.h"
+#include "lua_runtime.h"
 
 class Blackboard {
 public:
@@ -43,7 +43,7 @@ public:
         lua_newtable(L);
         for (const auto& [key, value] : data_) {
             lua_pushstring(L, key.c_str());
-            LuaContext::PushValues(L, {value});
+            LuaRuntime::PushValues(L, {value});
             lua_settable(L, -3);
         }
     }

@@ -11,7 +11,7 @@ ScriptNode::ScriptNode(uint32_t id, std::string name, std::string script_path)
     : Leaf(id, "Script", std::move(name)),
       script_path_(std::move(script_path)) {}
 
-void ScriptNode::Init(lua_State* L, LuaContext* ctx, const std::string& base_path) {
+void ScriptNode::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
     main_L_ = L;
     lua_context_ = ctx;
 
@@ -149,7 +149,7 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
         }
     }
 
-    // Create coroutine via LuaContext's pool
+    // Create coroutine via LuaRuntime's pool
     lua_State* co = lua_context_->AcquireCoroutine();
 
     // Push Tick function and blackboard argument on the coroutine
@@ -181,7 +181,7 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
         return NodeStatus::kFailure;
     }
 
-    auto values = LuaContext::PeekValues(co, nresults);
+    auto values = LuaRuntime::PeekValues(co, nresults);
     lua_pop(co, nresults);
 
     bool deactivate = false;

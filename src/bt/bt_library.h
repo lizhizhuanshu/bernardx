@@ -6,7 +6,7 @@
 #include <thread>
 
 #include "behavior_tree_engine.h"
-#include "lua_context.h"
+#include "lua_runtime.h"
 #include "lua_library.h"
 
 namespace sol {
@@ -42,7 +42,7 @@ public:
 
     // Accessed by bt_run/bt_stop C functions (via upvalue pointer)
     AsyncHandle pending_run_handle_ = 0;
-    LuaContext::Ptr pending_run_ctx_;
+    LuaRuntime::Ptr pending_run_ctx_;
     std::atomic<bool> run_completed_{false};
 
 private:
@@ -51,7 +51,7 @@ private:
     BehaviorTreeEngine::Ptr engine_;
 
     std::unique_ptr<sol::state> bt_lua_;
-    LuaContext::Ptr bt_context_;
+    LuaRuntime::Ptr bt_context_;
 
     std::thread bt_thread_;
     std::atomic<bool> bt_running_{false};

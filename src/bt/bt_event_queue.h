@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "lua_context.h"
+#include "lua_runtime.h"
 
 struct BtEvent {
     std::string name;

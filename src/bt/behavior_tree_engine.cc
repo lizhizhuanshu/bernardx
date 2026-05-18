@@ -84,13 +84,13 @@ std::string BehaviorTreeEngine::GetCurrentNode() const {
     return current_node_path_;
 }
 
-void BehaviorTreeEngine::InitScriptNodes(lua_State* L, LuaContext* ctx) {
+void BehaviorTreeEngine::InitScriptNodes(lua_State* L, LuaRuntime* ctx) {
     if (root_) {
         InitScriptNodesRecursive(root_.get(), L, ctx);
     }
 }
 
-void BehaviorTreeEngine::InitScriptNodesRecursive(Node* node, lua_State* L, LuaContext* ctx) {
+void BehaviorTreeEngine::InitScriptNodesRecursive(Node* node, lua_State* L, LuaRuntime* ctx) {
     if (auto* script = dynamic_cast<ScriptNode*>(node)) {
         script->Init(L, ctx, project_path_);
     }
@@ -232,12 +232,12 @@ bool BehaviorTreeEngine::IsDescendantOf(Node* node, Node* ancestor) const {
 
 // --- Sensor management ---
 
-void BehaviorTreeEngine::InitSensors(lua_State* L, LuaContext* ctx) {
+void BehaviorTreeEngine::InitSensors(lua_State* L, LuaRuntime* ctx) {
     if (!root_) return;
     InitSensorsRecursive(root_.get(), L, ctx);
 }
 
-void BehaviorTreeEngine::InitSensorsRecursive(Node* node, lua_State* L, LuaContext* ctx) {
+void BehaviorTreeEngine::InitSensorsRecursive(Node* node, lua_State* L, LuaRuntime* ctx) {
     for (auto& spec : node->sensor_specs()) {
         if (active_sensors_.count(spec.name)) {
             spdlog::warn("BehaviorTreeEngine: duplicate sensor name '{}', overwriting", spec.name);

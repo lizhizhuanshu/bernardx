@@ -5,7 +5,7 @@ extern "C" {
 #include "lua.h"
 }
 
-#include "lua_context.h"
+#include "lua_runtime.h"
 
 #include <asio.hpp>
 #include <cinatra/coro_http_client.hpp>
@@ -126,7 +126,7 @@ static int http_request(lua_State* L, F&& make_lazy) {
         return luaL_error(L, "http library is shutting down");
     }
     auto* exec = state->exec;
-    auto rt = LuaContext::FromLuaState(L);
+    auto rt = LuaRuntime::FromLuaState(L);
     auto handle = rt->PreYield(L);
 
     asio::post(exec->context(), [state, exec, rt, handle, lazy_factory = std::forward<F>(make_lazy)]() mutable {
@@ -220,7 +220,7 @@ static const char* kWsMetatable = "http__ws";
 struct WsConn {
     std::shared_ptr<cinatra::coro_http_client> client;
     std::shared_ptr<HttpLibraryState> state;
-    LuaContext::Ptr rt;
+    LuaRuntime::Ptr rt;
     std::string url;
     std::atomic<bool> closed{false};
 
@@ -288,7 +288,7 @@ static int ws_create(lua_State* L) {
     if (!state || state->shutting_down.load() || !state->exec) {
         return luaL_error(L, "http library is shutting down");
     }
-    auto rt = LuaContext::FromLuaState(L);
+    auto rt = LuaRuntime::FromLuaState(L);
 
     auto* slot = static_cast<std::shared_ptr<WsConn>*>(lua_newuserdatauv(L, sizeof(std::shared_ptr<WsConn>), 0));
     auto conn = std::make_shared<WsConn>();
@@ -359,7 +359,7 @@ static int ws_connect_method(lua_State* L) {
         return 2;
     }
 
-    auto rt = LuaContext::FromLuaState(L);
+    auto rt = LuaRuntime::FromLuaState(L);
     auto handle = rt->PreYield(L);
     auto* exec = conn->state->exec;
     // Capture shared_ptr to keep WsConn alive for the duration of async ops
@@ -434,7 +434,7 @@ static int ws_send(lua_State* L) {
     const char* mode = lua_isstring(L, 3) ? lua_tostring(L, 3) : "text";
     auto op = (mode && mode[0] == 'b') ? cinatra::opcode::binary : cinatra::opcode::text;
 
-    auto rt = LuaContext::FromLuaState(L);
+    auto rt = LuaRuntime::FromLuaState(L);
     auto handle = rt->PreYield(L);
     auto* exec = conn->state->exec;
     auto client = conn->client;
@@ -470,7 +470,7 @@ static int ws_close(lua_State* L) {
         return 1;
     }
 
-    auto rt = LuaContext::FromLuaState(L);
+    auto rt = LuaRuntime::FromLuaState(L);
     auto handle = rt->PreYield(L);
     auto* exec = conn->state->exec;
     auto client = conn->client;

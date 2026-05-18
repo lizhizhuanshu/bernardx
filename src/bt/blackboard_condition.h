@@ -4,7 +4,7 @@
 #include <string>
 
 #include "decorator.h"
-#include "lua_context.h"
+#include "lua_runtime.h"
 
 class BlackboardCondition : public Decorator {
 public:

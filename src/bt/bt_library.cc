@@ -13,7 +13,7 @@ extern "C" {
 
 #include "blackboard.h"
 #include "file_system_code_provider.h"
-#include "lua_context.h"
+#include "lua_runtime.h"
 #include "tree_parser.h"
 #include "types.h"
 
@@ -45,7 +45,7 @@ LuaValue PopLuaValue(lua_State* L, int idx) {
 }
 
 void PushLuaValue(lua_State* L, const LuaValue& v) {
-    LuaContext::PushValues(L, {v});
+    LuaRuntime::PushValues(L, {v});
 }
 
 BehaviorTreeEngine* GetEngine(lua_State* L) {
@@ -94,11 +94,11 @@ int bt_run(lua_State* L) {
     // Set project path on engine for script/sensor path resolution
     engine->SetProjectPath(lib->project_path());
 
-    // Get LuaRuntime's LuaContext for yield/resume
-    auto rt_ctx = LuaContext::FromLuaState(L);
+    // Get LuaRuntime's LuaRuntime for yield/resume
+    auto rt_ctx = LuaRuntime::FromLuaState(L);
     if (!rt_ctx) {
         lua_pushboolean(L, 0);
-        lua_pushstring(L, "no LuaContext");
+        lua_pushstring(L, "no LuaRuntime");
         return 2;
     }
 
@@ -257,19 +257,19 @@ void BehaviorTreeLibrary::Close(lua_State* L) {
 
 void BehaviorTreeLibrary::StartBtThread(std::shared_ptr<CodeProvider> code_provider,
                                          CompletionCallback on_complete) {
-    // Create BT's own Lua state and LuaContext
+    // Create BT's own Lua state and LuaRuntime
     bt_lua_ = std::make_unique<sol::state>();
     bt_lua_->open_libraries();
 
-    bt_context_ = std::make_shared<LuaContext>(bt_lua_->lua_state());
-    LuaContext::SetExtraspace(bt_lua_->lua_state(), bt_context_.get());
+    bt_context_ = std::make_shared<LuaRuntime>(bt_lua_->lua_state());
+    LuaRuntime::SetExtraspace(bt_lua_->lua_state(), bt_context_.get());
 
     if (code_provider) {
         bt_context_->SetCodeProvider(std::move(code_provider));
     }
     bt_context_->Setup(bt_lua_->lua_state());
 
-    // Initialize script nodes using BT's LuaContext
+    // Initialize script nodes using BT's LuaRuntime
     engine_->InitScriptNodes(bt_lua_->lua_state(), bt_context_.get());
 
     // Initialize sensors and activate initial set
@@ -309,7 +309,7 @@ void BehaviorTreeLibrary::StopBtThread(bool resume_pending) {
     pending_run_ctx_.reset();
     pending_run_handle_ = 0;
 
-    // Cleanup BT's LuaContext
+    // Cleanup BT's LuaRuntime
     if (bt_context_) {
         bt_context_->Shutdown();
         bt_context_.reset();
@@ -323,7 +323,7 @@ void BehaviorTreeLibrary::BtEventLoop() {
     int64_t next_tick = NowMs() + tick_interval_ms_;
 
     while (bt_running_.load(std::memory_order_acquire)) {
-        // Process BT's LuaContext events (timers, resumes for script nodes)
+        // Process BT's LuaRuntime events (timers, resumes for script nodes)
         bt_context_->ProcessExpiredTimers();
         while (bt_context_->DrainOneWork()) {
         }
