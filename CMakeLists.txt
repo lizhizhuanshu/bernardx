@@ -101,6 +101,19 @@ add_library(bernardx_lib STATIC
     src/lua/lua_runtime.cc
     src/lua/http_library.cc
     src/lua/json_library.cc
+    src/bt/bt_library.cc
+    src/bt/behavior_tree_engine.cc
+    src/bt/tree_parser.cc
+    src/bt/script_node.cc
+    src/bt/sensor.cc
+    src/bt/node.cc
+    src/bt/composite.cc
+    src/bt/selector.cc
+    src/bt/sequence.cc
+    src/bt/parallel.cc
+    src/bt/inverter.cc
+    src/bt/force_success.cc
+    src/bt/blackboard_condition.cc
 )
 target_include_directories(bernardx_lib PUBLIC src/lua src/bt)
 cinatra_use_third_party_headers(bernardx_lib)
@@ -152,10 +165,9 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(googletest)
 
 file(GLOB TEST_SOURCES tests/*.cc)
-list(FILTER TEST_SOURCES EXCLUDE REGEX ".*bt_test\\.cc")
 add_executable(bernardx_test ${TEST_SOURCES})
 target_link_libraries(bernardx_test PRIVATE bernardx_lib GTest::gtest_main)
-target_include_directories(bernardx_test PRIVATE ${CMAKE_SOURCE_DIR}/src/lua)
+target_include_directories(bernardx_test PRIVATE ${CMAKE_SOURCE_DIR}/src/lua ${CMAKE_SOURCE_DIR}/src/bt)
 target_include_directories(bernardx_test SYSTEM PRIVATE ${cinatra_SOURCE_DIR}/include)
 cinatra_use_third_party_headers(bernardx_test)
 include(GoogleTest)

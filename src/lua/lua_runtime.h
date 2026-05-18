@@ -105,6 +105,14 @@ public:
 
     LuaRef CreateRef(int ref, int type);
 
+    // --- BT support ---
+
+    lua_State* AcquireCoroutine() { return AcquireCo(); }
+    void ReleaseCoroutine(lua_State* co) { ReleaseCo(co); }
+    void SetCoCompleteCallback(lua_State* co, std::function<void(ScriptResult)> cb);
+    void RemoveCoCompleteCallback(lua_State* co);
+    std::shared_ptr<CodeProvider> shared_code_provider() const { return code_provider_; }
+
     // --- Internal accessors (used by builtin helpers in .cc) ---
 
     CodeProvider* code_provider() const { return code_provider_.get(); }
@@ -176,10 +184,6 @@ private:
 
     // Resume
     ResumeResult DoResume(AsyncHandle handle, std::vector<LuaValue> args);
-
-    // Coroutine completion callback
-    void SetCoCompleteCallback(lua_State* co, CoCompleteCallback cb);
-    void RemoveCoCompleteCallback(lua_State* co);
 
     // Coroutine pool
     [[nodiscard]] lua_State* AcquireCo();

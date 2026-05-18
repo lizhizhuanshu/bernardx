@@ -5,7 +5,6 @@ extern "C" {
 #include "lua.h"
 }
 
-#include <chrono>
 #include <filesystem>
 
 #include <spdlog/spdlog.h>
@@ -18,12 +17,6 @@ extern "C" {
 #include "types.h"
 
 namespace {
-
-int64_t NowMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
 
 LuaValue PopLuaValue(lua_State* L, int idx) {
     int t = lua_type(L, idx);
@@ -57,8 +50,6 @@ BehaviorTreeLibrary* GetLibrary(lua_State* L) {
 }
 
 // bt.run(json_or_path) — yields coroutine, resumes when BT tree completes
-// Accepts either a JSON string or a directory path containing root.json + subtree files
-// If project_path is set, non-JSON paths are resolved relative to project_path
 int bt_run(lua_State* L) {
     auto* engine = GetEngine(L);
     auto* lib = GetLibrary(L);
@@ -72,7 +63,6 @@ int bt_run(lua_State* L) {
     if (input[0] == '{' || input[0] == '[') {
         json_str = input;
     } else {
-        // Resolve relative to project path if set
         std::filesystem::path tree_path(input);
         if (!lib->project_path().empty()) {
             tree_path = std::filesystem::path(lib->project_path()) / input;
@@ -91,10 +81,8 @@ int bt_run(lua_State* L) {
         return 2;
     }
 
-    // Set project path on engine for script/sensor path resolution
     engine->SetProjectPath(lib->project_path());
 
-    // Get LuaRuntime's LuaRuntime for yield/resume
     auto rt_ctx = LuaRuntime::FromLuaState(L);
     if (!rt_ctx) {
         lua_pushboolean(L, 0);
@@ -102,10 +90,8 @@ int bt_run(lua_State* L) {
         return 2;
     }
 
-    // Yield the current coroutine
     auto handle = rt_ctx->PreYield(L);
 
-    // Create BT-specific code provider based on project path, or fall back to main
     std::shared_ptr<CodeProvider> code_provider;
     if (!lib->project_path().empty()) {
         auto pp = std::filesystem::absolute(lib->project_path());
@@ -122,11 +108,9 @@ int bt_run(lua_State* L) {
         code_provider = rt_ctx->shared_code_provider();
     }
 
-    // Store pending run info so StopBtThread can resume the coroutine if needed
     lib->pending_run_handle_ = handle;
     lib->pending_run_ctx_ = rt_ctx;
 
-    // Start BT thread; on completion, resume the yielded coroutine
     lib->StartBtThread(code_provider, [rt_ctx, handle](const std::string& status) {
         std::vector<LuaValue> args;
         args.push_back(status);
@@ -136,19 +120,16 @@ int bt_run(lua_State* L) {
     return lua_yield(L, 0);
 }
 
-// bt.pause()
 int bt_pause(lua_State* L) {
     GetEngine(L)->Pause();
     return 0;
 }
 
-// bt.resume()
 int bt_resume(lua_State* L) {
     GetEngine(L)->Resume();
     return 0;
 }
 
-// bt.stop()
 int bt_stop(lua_State* L) {
     auto* engine = GetEngine(L);
     auto* lib = GetLibrary(L);
@@ -157,7 +138,6 @@ int bt_stop(lua_State* L) {
     return 0;
 }
 
-// bt.set(key, value)
 int bt_set(lua_State* L) {
     auto* engine = GetEngine(L);
     const char* key = luaL_checkstring(L, 1);
@@ -166,7 +146,6 @@ int bt_set(lua_State* L) {
     return 0;
 }
 
-// bt.get(key) -> value
 int bt_get(lua_State* L) {
     auto* engine = GetEngine(L);
     const char* key = luaL_checkstring(L, 1);
@@ -179,13 +158,11 @@ int bt_get(lua_State* L) {
     return 1;
 }
 
-// bt.get_blackboard() -> table
 int bt_get_blackboard(lua_State* L) {
     GetEngine(L)->blackboard().PushAsTable(L);
     return 1;
 }
 
-// bt.notify(event_name, data)
 int bt_notify(lua_State* L) {
     auto* engine = GetEngine(L);
     const char* name = luaL_checkstring(L, 1);
@@ -194,21 +171,18 @@ int bt_notify(lua_State* L) {
     return 0;
 }
 
-// bt.get_status() -> string
 int bt_get_status(lua_State* L) {
     auto status = GetEngine(L)->GetStatus();
     lua_pushstring(L, status.c_str());
     return 1;
 }
 
-// bt.get_current_node() -> string
 int bt_get_current_node(lua_State* L) {
     auto node = GetEngine(L)->GetCurrentNode();
     lua_pushstring(L, node.c_str());
     return 1;
 }
 
-// bt.set_project_path(path)
 int bt_set_project_path(lua_State* L) {
     auto* lib = GetLibrary(L);
     const char* path = luaL_checkstring(L, 1);
@@ -257,113 +231,64 @@ void BehaviorTreeLibrary::Close(lua_State* L) {
 
 void BehaviorTreeLibrary::StartBtThread(std::shared_ptr<CodeProvider> code_provider,
                                          CompletionCallback on_complete) {
-    // Create BT's own Lua state and LuaRuntime
-    bt_lua_ = std::make_unique<sol::state>();
-    bt_lua_->open_libraries();
+    bt_context_ = LuaRuntime::Builder()
+        .WithCodeProvider(std::move(code_provider))
+        .Create();
 
-    bt_context_ = std::make_shared<LuaRuntime>(bt_lua_->lua_state());
-    LuaRuntime::SetExtraspace(bt_lua_->lua_state(), bt_context_.get());
-
-    if (code_provider) {
-        bt_context_->SetCodeProvider(std::move(code_provider));
-    }
-    bt_context_->Setup(bt_lua_->lua_state());
-
-    // Initialize script nodes using BT's LuaRuntime
-    engine_->InitScriptNodes(bt_lua_->lua_state(), bt_context_.get());
-
-    // Initialize sensors and activate initial set
-    engine_->InitSensors(bt_lua_->lua_state(), bt_context_.get());
-    engine_->ActivateInitialSensors();
-
-    // Store completion callback and start engine
     on_complete_ = std::move(on_complete);
     run_completed_.store(false);
-    engine_->Run();
-
-    // Start BT event loop thread
     bt_running_.store(true);
-    bt_thread_ = std::thread(&BehaviorTreeLibrary::BtEventLoop, this);
+
+    auto self = shared_from_this();
+    bt_context_->executor()->schedule([self]() {
+        if (!self->bt_context_) return;
+        self->engine_->InitScriptNodes(
+            self->bt_context_->main_state(), self->bt_context_.get());
+        self->engine_->InitSensors(
+            self->bt_context_->main_state(), self->bt_context_.get());
+        self->engine_->ActivateInitialSensors();
+        self->engine_->Run();
+        self->ScheduleNextTick();
+    });
 }
 
 void BehaviorTreeLibrary::StopBtThread(bool resume_pending) {
     bt_running_.store(false);
     engine_->DeactivateAllSensors();
-    if (bt_context_) {
-        bt_context_->cv().notify_all();
-    }
-    if (bt_thread_.joinable()) {
-        bt_thread_.join();
-    }
 
-    // If BT was running but tree didn't complete (stopped externally),
-    // resume the pending coroutine with "stopped".
-    // Only do this when called from bt.stop() (event loop still running),
-    // not during shutdown (event loop already stopped, nobody will drain the resume).
     if (resume_pending && !run_completed_.load() && pending_run_ctx_) {
         std::vector<LuaValue> args;
         args.push_back(std::string("stopped"));
         pending_run_ctx_->PushResume(pending_run_handle_, std::move(args));
     }
+    bt_context_.reset();
+
     run_completed_.store(false);
     pending_run_ctx_.reset();
     pending_run_handle_ = 0;
-
-    // Cleanup BT's LuaRuntime
-    if (bt_context_) {
-        bt_context_->Shutdown();
-        bt_context_.reset();
-    }
-    bt_lua_.reset();
     on_complete_ = nullptr;
 }
 
-void BehaviorTreeLibrary::BtEventLoop() {
-    spdlog::info("BT event loop started (interval={}ms)", tick_interval_ms_);
-    int64_t next_tick = NowMs() + tick_interval_ms_;
+void BehaviorTreeLibrary::ScheduleNextTick() {
+    if (!bt_running_.load(std::memory_order_acquire)) return;
 
-    while (bt_running_.load(std::memory_order_acquire)) {
-        // Process BT's LuaRuntime events (timers, resumes for script nodes)
-        bt_context_->ProcessExpiredTimers();
-        while (bt_context_->DrainOneWork()) {
-        }
+    auto self = shared_from_this();
+    bt_context_->executor()->schedule([self]() {
+        if (!self->bt_running_.load(std::memory_order_acquire) || !self->bt_context_) return;
 
-        // BT tick if interval elapsed
-        int64_t now = NowMs();
-        if (now >= next_tick) {
-            auto status = engine_->TickOnce();
+        auto status = self->engine_->TickOnce();
 
-            if (status == NodeStatus::kSuccess || status == NodeStatus::kFailure) {
-                // Tree completed — fire callback and stop
-                spdlog::info("BT event loop: tree completed with status={}",
-                             status == NodeStatus::kSuccess ? "success" : "failure");
-                engine_->Stop();
-                run_completed_.store(true);
-                if (on_complete_) {
-                    std::string status_str =
-                        (status == NodeStatus::kSuccess) ? "success" : "failure";
-                    on_complete_(status_str);
-                }
-                break;
+        if (status == NodeStatus::kSuccess || status == NodeStatus::kFailure) {
+            self->engine_->Stop();
+            self->run_completed_.store(true);
+            if (self->on_complete_) {
+                std::string status_str =
+                    (status == NodeStatus::kSuccess) ? "success" : "failure";
+                self->on_complete_(status_str);
             }
-
-            next_tick = now + tick_interval_ms_;
+            return;
         }
 
-        // Wait for next event: tick deadline or timer deadline
-        std::unique_lock<std::mutex> lock(bt_context_->mutex());
-        auto timer_deadline = bt_context_->NextTimerDeadline();
-
-        int64_t wait_deadline = next_tick;
-        if (timer_deadline.has_value() && *timer_deadline < wait_deadline) {
-            wait_deadline = *timer_deadline;
-        }
-
-        int64_t wait_ms = std::max<int64_t>(0, wait_deadline - NowMs());
-        bt_context_->cv().wait_for(lock, std::chrono::milliseconds(wait_ms), [this] {
-            return !bt_running_.load(std::memory_order_acquire) || bt_context_->HasWork();
-        });
-    }
-
-    spdlog::info("BT event loop stopped");
+        self->ScheduleNextTick();
+    }, std::chrono::milliseconds(tick_interval_ms_));
 }

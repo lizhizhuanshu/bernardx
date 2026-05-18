@@ -16,7 +16,6 @@
 #include "decorator.h"
 #include "force_success.h"
 #include "inverter.h"
-#include "lua_context.h"
 #include "lua_runtime.h"
 #include "node.h"
 #include "parallel.h"

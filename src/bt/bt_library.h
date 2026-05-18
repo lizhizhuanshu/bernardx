@@ -3,20 +3,21 @@
 #include <atomic>
 #include <functional>
 #include <memory>
-#include <thread>
 
 #include "behavior_tree_engine.h"
 #include "lua_runtime.h"
 #include "lua_library.h"
 
-namespace sol {
-class state;
-}
-
-class BehaviorTreeLibrary : public LuaLibrary {
+class BehaviorTreeLibrary : public LuaLibrary,
+                            public std::enable_shared_from_this<BehaviorTreeLibrary> {
 public:
     BehaviorTreeLibrary();
     ~BehaviorTreeLibrary() override;
+
+    BehaviorTreeLibrary(const BehaviorTreeLibrary&) = delete;
+    BehaviorTreeLibrary& operator=(const BehaviorTreeLibrary&) = delete;
+    BehaviorTreeLibrary(BehaviorTreeLibrary&&) = delete;
+    BehaviorTreeLibrary& operator=(BehaviorTreeLibrary&&) = delete;
 
     std::string name() const override { return "bt"; }
     void Open(lua_State* L) override;
@@ -46,21 +47,16 @@ public:
     std::atomic<bool> run_completed_{false};
 
 private:
-    void BtEventLoop();
+    void ScheduleNextTick();
 
     BehaviorTreeEngine::Ptr engine_;
-
-    std::unique_ptr<sol::state> bt_lua_;
     LuaRuntime::Ptr bt_context_;
 
-    std::thread bt_thread_;
     std::atomic<bool> bt_running_{false};
     int64_t tick_interval_ms_ = 100;
 
     std::string project_path_;
     std::string main_libs_path_;
 
-    // on_complete_ is set on LuaRuntime thread before BT thread starts,
-    // read only on BT thread. Thread creation provides the happens-before.
     CompletionCallback on_complete_;
 };
