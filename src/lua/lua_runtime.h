@@ -90,6 +90,13 @@ public:
     async_simple::coro::Lazy<ScriptResult> CallFunction(int fn_ref, std::vector<LuaValue> args = {});
     sol::state& lua() { return *lua_; }
 
+    // --- Async coroutine API (executor thread only) ---
+
+    // Call a function ref in a new coroutine. Awaits completion (handles yield).
+    async_simple::coro::Lazy<ScriptResult> CallAsync(int fn_ref, std::vector<LuaValue> args = {});
+    // Load and run a file in a new coroutine. Awaits completion (handles yield).
+    async_simple::coro::Lazy<ScriptResult> DoFileAsync(const std::string& path);
+
     // --- Extraspace ---
 
     static void SetExtraspace(lua_State* L, LuaRuntime* rt);
@@ -184,6 +191,9 @@ private:
 
     // Resume
     ResumeResult DoResume(AsyncHandle handle, std::vector<LuaValue> args);
+
+    // Async coroutine helper (executor thread only)
+    async_simple::coro::Lazy<ScriptResult> AwaitCoroutine(lua_State* co, int status, int nresults);
 
     // Coroutine pool
     [[nodiscard]] lua_State* AcquireCo();

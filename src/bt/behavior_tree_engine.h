@@ -10,6 +10,8 @@ extern "C" {
 #include "lua.h"
 }
 
+#include <async_simple/coro/Lazy.h>
+
 #include "blackboard.h"
 #include "bt_event_queue.h"
 #include "node.h"
@@ -49,7 +51,8 @@ public:
     void Notify(const std::string& event_name, LuaValue data);
 
     // Initialize script nodes with lua_State and LuaRuntime (called on event loop thread)
-    void InitScriptNodes(lua_State* L, LuaRuntime* ctx);
+    // Async — each script's Init can yield (e.g., for async require)
+    async_simple::coro::Lazy<void> InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx);
 
     void SetProjectPath(std::string path) { project_path_ = std::move(path); }
     const std::string& project_path() const { return project_path_; }
@@ -72,7 +75,7 @@ private:
     void PropagateAbort(Node* source, AbortMode mode);
     void HandleEvents();
     void ResetTree();
-    void InitScriptNodesRecursive(Node* node, lua_State* L, LuaRuntime* ctx);
+    async_simple::coro::Lazy<void> InitScriptNodesRecursiveAsync(Node* node, lua_State* L, LuaRuntime* ctx);
     void CollectRunningNodes(Node* node, std::vector<Node*>& out);
     bool IsDescendantOf(Node* node, Node* ancestor) const;
 

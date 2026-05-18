@@ -84,19 +84,20 @@ std::string BehaviorTreeEngine::GetCurrentNode() const {
     return current_node_path_;
 }
 
-void BehaviorTreeEngine::InitScriptNodes(lua_State* L, LuaRuntime* ctx) {
+async_simple::coro::Lazy<void> BehaviorTreeEngine::InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx) {
     if (root_) {
-        InitScriptNodesRecursive(root_.get(), L, ctx);
+        co_await InitScriptNodesRecursiveAsync(root_.get(), L, ctx);
     }
 }
 
-void BehaviorTreeEngine::InitScriptNodesRecursive(Node* node, lua_State* L, LuaRuntime* ctx) {
+async_simple::coro::Lazy<void> BehaviorTreeEngine::InitScriptNodesRecursiveAsync(
+    Node* node, lua_State* L, LuaRuntime* ctx) {
     if (auto* script = dynamic_cast<ScriptNode*>(node)) {
-        script->Init(L, ctx, project_path_);
+        co_await script->Init(L, ctx, project_path_);
     }
     if (auto* composite = dynamic_cast<Composite*>(node)) {
         for (auto& child : composite->children()) {
-            InitScriptNodesRecursive(child.get(), L, ctx);
+            co_await InitScriptNodesRecursiveAsync(child.get(), L, ctx);
         }
     }
 }

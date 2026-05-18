@@ -1,8 +1,12 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
+
+#include <async_simple/coro/Lazy.h>
 
 #include "behavior_tree_engine.h"
 #include "lua_runtime.h"
@@ -25,8 +29,8 @@ public:
 
     BehaviorTreeEngine::Ptr engine() const { return engine_; }
 
-    void SetTickIntervalMs(int64_t ms) { tick_interval_ms_ = ms; }
-    int64_t tick_interval_ms() const { return tick_interval_ms_; }
+    void SetTickIntervalMs(int64_t ms) { tick_interval_ms_.store(ms, std::memory_order_relaxed); }
+    int64_t tick_interval_ms() const { return tick_interval_ms_.load(std::memory_order_relaxed); }
 
     void SetMainLibsPath(std::string path) { main_libs_path_ = std::move(path); }
     const std::string& main_libs_path() const { return main_libs_path_; }
@@ -47,16 +51,20 @@ public:
     std::atomic<bool> run_completed_{false};
 
 private:
-    void ScheduleNextTick();
+    async_simple::coro::Lazy<void> BtTickLoop(LuaRuntime::Ptr ctx,
+                                               CompletionCallback on_complete);
 
     BehaviorTreeEngine::Ptr engine_;
     LuaRuntime::Ptr bt_context_;
 
     std::atomic<bool> bt_running_{false};
-    int64_t tick_interval_ms_ = 100;
+    std::atomic<int64_t> tick_interval_ms_{100};
 
     std::string project_path_;
     std::string main_libs_path_;
 
-    CompletionCallback on_complete_;
+    // Synchronization: StopBtThread blocks until BtTickLoop exits.
+    std::mutex tick_loop_mu_;
+    std::condition_variable tick_loop_cv_;
+    bool tick_loop_exited_ = true;
 };

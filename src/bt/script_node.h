@@ -7,18 +7,22 @@ extern "C" {
 #include "lua.h"
 }
 
+#include <async_simple/coro/Lazy.h>
+
 #include "leaf.h"
 #include "lua_runtime.h"
 
 class ScriptNode : public Leaf {
 public:
     ScriptNode(uint32_t id, std::string name, std::string script_path);
+    ~ScriptNode() override;
 
     const std::string& script_path() const { return script_path_; }
 
     // Initialize: load script file, extract function refs (called on event loop thread)
     // base_path is the BT project root for resolving relative script paths
-    void Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
+    // Now async — the script can yield (e.g., require async modules)
+    async_simple::coro::Lazy<void> Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
 
     bool is_loaded() const { return tick_ref_ != LUA_NOREF; }
 

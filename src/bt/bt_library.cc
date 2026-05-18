@@ -235,26 +235,33 @@ void BehaviorTreeLibrary::StartBtThread(std::shared_ptr<CodeProvider> code_provi
         .WithCodeProvider(std::move(code_provider))
         .Create();
 
-    on_complete_ = std::move(on_complete);
     run_completed_.store(false);
     bt_running_.store(true);
+    {
+        std::lock_guard lock(tick_loop_mu_);
+        tick_loop_exited_ = false;
+    }
 
+    auto ctx = bt_context_;
     auto self = shared_from_this();
-    bt_context_->executor()->schedule([self]() {
+    bt_context_->executor()->schedule([self, ctx, cb = std::move(on_complete)]() mutable {
         if (!self->bt_context_) return;
-        self->engine_->InitScriptNodes(
-            self->bt_context_->main_state(), self->bt_context_.get());
-        self->engine_->InitSensors(
-            self->bt_context_->main_state(), self->bt_context_.get());
-        self->engine_->ActivateInitialSensors();
-        self->engine_->Run();
-        self->ScheduleNextTick();
+        self->BtTickLoop(std::move(ctx), std::move(cb))
+            .via(self->bt_context_->executor())
+            .start([self](auto&&) {});
     });
 }
 
 void BehaviorTreeLibrary::StopBtThread(bool resume_pending) {
-    bt_running_.store(false);
+    bt_running_.store(false, std::memory_order_release);
     engine_->DeactivateAllSensors();
+
+    // Block until BtTickLoop exits — prevents Load() from destroying the tree
+    // while callbacks are still pending on the BT executor thread.
+    {
+        std::unique_lock lock(tick_loop_mu_);
+        tick_loop_cv_.wait(lock, [this] { return tick_loop_exited_; });
+    }
 
     if (resume_pending && !run_completed_.load() && pending_run_ctx_) {
         std::vector<LuaValue> args;
@@ -266,29 +273,49 @@ void BehaviorTreeLibrary::StopBtThread(bool resume_pending) {
     run_completed_.store(false);
     pending_run_ctx_.reset();
     pending_run_handle_ = 0;
-    on_complete_ = nullptr;
 }
 
-void BehaviorTreeLibrary::ScheduleNextTick() {
-    if (!bt_running_.load(std::memory_order_acquire)) return;
+async_simple::coro::Lazy<void> BehaviorTreeLibrary::BtTickLoop(
+    LuaRuntime::Ptr ctx, CompletionCallback on_complete) {
+    // RAII guard: signals StopBtThread when the coroutine exits (any path)
+    auto done_guard = [this]() {
+        {
+            std::lock_guard lock(tick_loop_mu_);
+            tick_loop_exited_ = true;
+        }
+        tick_loop_cv_.notify_all();
+    };
 
-    auto self = shared_from_this();
-    bt_context_->executor()->schedule([self]() {
-        if (!self->bt_running_.load(std::memory_order_acquire) || !self->bt_context_) return;
+    co_await engine_->InitScriptNodesAsync(ctx->main_state(), ctx.get());
 
-        auto status = self->engine_->TickOnce();
+    engine_->InitSensors(ctx->main_state(), ctx.get());
+    engine_->ActivateInitialSensors();
+    engine_->Run();
+
+    while (bt_running_.load(std::memory_order_acquire)) {
+        auto status = engine_->TickOnce();
 
         if (status == NodeStatus::kSuccess || status == NodeStatus::kFailure) {
-            self->engine_->Stop();
-            self->run_completed_.store(true);
-            if (self->on_complete_) {
-                std::string status_str =
-                    (status == NodeStatus::kSuccess) ? "success" : "failure";
-                self->on_complete_(status_str);
+            engine_->Stop();
+            run_completed_.store(true);
+            if (on_complete) {
+                std::string s = (status == NodeStatus::kSuccess) ? "success" : "failure";
+                on_complete(s);
             }
-            return;
+            done_guard();
+            co_return;
         }
 
-        self->ScheduleNextTick();
-    }, std::chrono::milliseconds(tick_interval_ms_));
+        // Sleep until next tick
+        async_simple::Promise<void> p;
+        auto f = p.getFuture();
+        auto* ex = ctx->executor();
+        ex->schedule([p = std::move(p)]() mutable { p.setValue(); },
+                     std::chrono::milliseconds(tick_interval_ms_.load(std::memory_order_relaxed)));
+        co_await std::move(f);
+    }
+
+    // Stopped externally
+    engine_->Stop();
+    done_guard();
 }

@@ -902,6 +902,67 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::CallFunction(int fn_ref, std:
     co_return co_await std::move(future);
 }
 
+// --- Async coroutine API (executor thread only) ---
+
+async_simple::coro::Lazy<ScriptResult> LuaRuntime::AwaitCoroutine(lua_State* co, int status, int nresults) {
+    if (status == LUA_OK) {
+        auto values = PeekValues(co, nresults);
+        ReleaseCo(co);
+        co_return ScriptResult{LUA_OK, std::move(values)};
+    }
+
+    if (status == LUA_YIELD) {
+        async_simple::Promise<ScriptResult> promise;
+        auto future = promise.getFuture();
+
+        SetCoCompleteCallback(co, [p = std::move(promise)](ScriptResult result) mutable {
+            p.setValue(std::move(result));
+        });
+
+        co_return co_await std::move(future);
+    }
+
+    // Error
+    const char* err = lua_tostring(co, -1);
+    std::string errmsg = err ? err : "unknown error";
+    spdlog::error("LuaRuntime: {}", errmsg);
+    lua_pop(co, 1);
+    ReleaseCo(co);
+    co_return ScriptResult{status, {}, std::move(errmsg)};
+}
+
+async_simple::coro::Lazy<ScriptResult> LuaRuntime::CallAsync(int fn_ref, std::vector<LuaValue> args) {
+    lua_State* co = AcquireCo();
+
+    lua_rawgeti(co, LUA_REGISTRYINDEX, fn_ref);
+    PushValues(co, args);
+    int nargs = static_cast<int>(args.size());
+
+    int nresults = 0;
+    int status = lua_resume(co, main_L_, nargs, &nresults);
+
+    co_return co_await AwaitCoroutine(co, status, nresults);
+}
+
+async_simple::coro::Lazy<ScriptResult> LuaRuntime::DoFileAsync(const std::string& path) {
+    lua_State* co = AcquireCo();
+
+    int load_status = luaL_loadfile(co, path.c_str());
+    if (load_status != LUA_OK) {
+        const char* err = lua_tostring(co, -1);
+        std::string errmsg = err ? err : "unknown error";
+        spdlog::error("LuaRuntime::DoFileAsync: {}", errmsg);
+        lua_pop(co, 1);
+        ReleaseCo(co);
+        co_return ScriptResult{load_status, {}, std::move(errmsg)};
+    }
+
+    int nresults = 0;
+    int status = lua_resume(co, main_L_, 0, &nresults);
+
+    co_return co_await AwaitCoroutine(co, status, nresults);
+}
+
 // --- LuaRuntime::Builder ---
 
 LuaRuntime::Builder& LuaRuntime::Builder::WithCodeProvider(std::shared_ptr<CodeProvider> provider) {

@@ -11,7 +11,14 @@ ScriptNode::ScriptNode(uint32_t id, std::string name, std::string script_path)
     : Leaf(id, "Script", std::move(name)),
       script_path_(std::move(script_path)) {}
 
-void ScriptNode::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
+ScriptNode::~ScriptNode() {
+    if (yielded_co_ != nullptr && lua_context_ != nullptr) {
+        lua_context_->RemoveCoCompleteCallback(yielded_co_);
+        yielded_co_ = nullptr;
+    }
+}
+
+async_simple::coro::Lazy<void> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
     main_L_ = L;
     lua_context_ = ctx;
 
@@ -20,37 +27,43 @@ void ScriptNode::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_pat
         full_path = std::filesystem::absolute(base_path + "/" + script_path_).string();
     }
 
-    if (luaL_loadfile(L, full_path.c_str()) != LUA_OK) {
-        const char* err = lua_tostring(L, -1);
-        spdlog::error("ScriptNode::Init: failed to load '{}': {}", full_path, err ? err : "unknown");
-        lua_pop(L, 1);
-        return;
+    auto result = co_await ctx->DoFileAsync(full_path);
+
+    if (result.status != LUA_OK) {
+        spdlog::error("ScriptNode::Init: failed to execute '{}': {}", full_path,
+                      result.error.empty() ? "unknown error" : result.error);
+        co_return;
     }
 
-    if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
-        const char* err = lua_tostring(L, -1);
-        spdlog::error("ScriptNode::Init: failed to execute '{}': {}", full_path, err ? err : "unknown");
-        lua_pop(L, 1);
-        return;
+    if (result.values.empty()) {
+        spdlog::error("ScriptNode::Init: '{}' did not return a value", full_path);
+        co_return;
     }
 
-    if (!lua_istable(L, -1)) {
+    auto* table_ref = std::get_if<LuaRef>(&result.values[0]);
+    if (!table_ref) {
         spdlog::error("ScriptNode::Init: '{}' did not return a table", full_path);
-        lua_pop(L, 1);
-        return;
+        co_return;
     }
 
-    int table_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    // Access the returned table on main_L_ via shared registry
+    lua_rawgeti(main_L_, LUA_REGISTRYINDEX, (*table_ref)->ref);
+    if (!lua_istable(main_L_, -1)) {
+        spdlog::error("ScriptNode::Init: '{}' did not return a table", full_path);
+        lua_pop(main_L_, 1);
+        co_return;
+    }
+
+    int table_idx = lua_absindex(main_L_, -1);
 
     auto get_ref = [&](const char* name) -> int {
-        lua_rawgeti(L, LUA_REGISTRYINDEX, table_ref);
-        lua_getfield(L, -1, name);
+        lua_getfield(main_L_, table_idx, name);
         int ref = LUA_NOREF;
-        if (lua_isfunction(L, -1)) {
-            lua_pushvalue(L, -1);
-            ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        if (lua_isfunction(main_L_, -1)) {
+            lua_pushvalue(main_L_, -1);
+            ref = luaL_ref(main_L_, LUA_REGISTRYINDEX);
         }
-        lua_pop(L, 2);
+        lua_pop(main_L_, 1);
         return ref;
     };
 
@@ -59,7 +72,7 @@ void ScriptNode::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_pat
     exit_ref_ = get_ref("Exit");
     abort_ref_ = get_ref("Abort");
 
-    luaL_unref(L, LUA_REGISTRYINDEX, table_ref);
+    lua_pop(main_L_, 1);  // pop table
 
     if (tick_ref_ == LUA_NOREF) {
         spdlog::error("ScriptNode::Init: '{}' missing required 'Tick' function", script_path_);
