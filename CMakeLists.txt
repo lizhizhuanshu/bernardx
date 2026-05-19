@@ -9,6 +9,17 @@ include(FetchContent)
 
 # ── Dependencies ────────────────────────────────────────────────────────────
 
+# asio (header-only, needed by async_simple and cinatra)
+add_definitions(-DASIO_STANDALONE)
+FetchContent_Declare(
+    asio
+    GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+    GIT_TAG        asio-1-36-0
+    GIT_SUBMODULES ""
+    GIT_SUBMODULES_RECURSE OFF
+)
+FetchContent_MakeAvailable(asio)
+
 # async_simple (coroutine + executor)
 set(ASYNC_SIMPLE_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
 set(ASYNC_SIMPLE_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -62,17 +73,6 @@ FetchContent_Declare(
     GIT_TAG        openssl-3.4.0
 )
 FetchContent_MakeAvailable(openssl)
-
-# asio (header-only, needed by cinatra)
-add_definitions(-DASIO_STANDALONE)
-FetchContent_Declare(
-    asio
-    GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
-    GIT_TAG        asio-1-36-0
-    GIT_SUBMODULES ""
-    GIT_SUBMODULES_RECURSE OFF
-)
-FetchContent_MakeAvailable(asio)
 
 # cinatra (HTTP client, header-only) -- reuses asio fetched above
 set(ENABLE_SSL ON CACHE BOOL "" FORCE)

@@ -6,6 +6,8 @@
 #include <spdlog/spdlog.h>
 
 #include "composite.h"
+#include "file_system_code_provider.h"
+#include "lua_runtime.h"
 #include "script_node.h"
 #include "tree_parser.h"
 
@@ -344,4 +346,86 @@ void BehaviorTreeEngine::DeactivateAllSensors() {
         sensor->Deactivate(&blackboard_);
     }
     prev_sensor_nodes_.clear();
+}
+
+// --- Tick loop management ---
+
+void BehaviorTreeEngine::StartLoop(std::shared_ptr<CodeProvider> code_provider,
+                                    int64_t tick_interval_ms,
+                                    CompletionCallback on_complete) {
+    bt_context_ = LuaRuntime::Builder()
+        .WithCodeProvider(std::move(code_provider))
+        .Create();
+
+    {
+        std::lock_guard lock(tick_loop_mu_);
+        tick_loop_exited_ = false;
+    }
+    loop_running_.store(true);
+
+    auto self = shared_from_this();
+    auto ctx = bt_context_;
+    bt_context_->executor()->schedule(
+        [self, ctx, tick_interval_ms, cb = std::move(on_complete)]() mutable {
+            if (!self->bt_context_) return;
+            self->TickLoop(std::move(ctx), tick_interval_ms, std::move(cb))
+                .via(self->bt_context_->executor())
+                .start([self](auto&&) {});
+        });
+}
+
+void BehaviorTreeEngine::StopLoop() {
+    if (!loop_running_.load()) return;
+
+    loop_running_.store(false, std::memory_order_release);
+    DeactivateAllSensors();
+
+    {
+        std::unique_lock lock(tick_loop_mu_);
+        tick_loop_cv_.wait(lock, [this] { return tick_loop_exited_; });
+    }
+
+    bt_context_.reset();
+}
+
+async_simple::coro::Lazy<void> BehaviorTreeEngine::TickLoop(
+    LuaRuntime::Ptr ctx, int64_t tick_interval_ms,
+    CompletionCallback on_complete) {
+    auto done_guard = [this]() {
+        {
+            std::lock_guard lock(tick_loop_mu_);
+            tick_loop_exited_ = true;
+        }
+        tick_loop_cv_.notify_all();
+    };
+
+    co_await InitScriptNodesAsync(ctx->main_state(), ctx.get());
+
+    InitSensors(ctx->main_state(), ctx.get());
+    ActivateInitialSensors();
+    Run();
+
+    while (loop_running_.load(std::memory_order_acquire)) {
+        auto status = TickOnce();
+
+        if (status == NodeStatus::kSuccess || status == NodeStatus::kFailure) {
+            Stop();
+            if (on_complete) {
+                std::string s = (status == NodeStatus::kSuccess) ? "success" : "failure";
+                on_complete(s);
+            }
+            done_guard();
+            co_return;
+        }
+
+        async_simple::Promise<void> p;
+        auto f = p.getFuture();
+        auto* ex = ctx->executor();
+        ex->schedule([p = std::move(p)]() mutable { p.setValue(); },
+                     std::chrono::milliseconds(tick_interval_ms));
+        co_await std::move(f);
+    }
+
+    Stop();
+    done_guard();
 }

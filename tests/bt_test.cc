@@ -797,7 +797,7 @@ protected:
 
     void TearDown() override {
         if (lib && lib->engine() && lib->engine()->IsRunning()) {
-            lib->StopBtThread(true);
+            lib->engine()->StopLoop();
             lib->engine()->Stop();
         }
     }

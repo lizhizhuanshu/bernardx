@@ -1,8 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 
@@ -37,6 +40,16 @@ public:
     void Pause();
     void Resume();
     void Stop();
+
+    // Tick loop management — creates a dedicated LuaRuntime and runs TickOnce
+    // in a loop on its executor until the tree completes or StopLoop is called.
+    using CompletionCallback = std::function<void(const std::string& status)>;
+
+    void StartLoop(std::shared_ptr<CodeProvider> code_provider,
+                   int64_t tick_interval_ms,
+                   CompletionCallback on_complete);
+    void StopLoop();
+    bool IsLoopRunning() const { return loop_running_.load(); }
 
     // State queries (thread-safe)
     bool IsRunning() const { return running_.load(); }
@@ -104,4 +117,15 @@ private:
     std::map<std::string, std::unique_ptr<ActiveSensor>> active_sensors_;
     // Nodes that had sensors activated last tick
     std::set<Node*> prev_sensor_nodes_;
+
+    // Tick loop state
+    LuaRuntime::Ptr bt_context_;
+    async_simple::coro::Lazy<void> TickLoop(LuaRuntime::Ptr ctx,
+                                             int64_t tick_interval_ms,
+                                             CompletionCallback on_complete);
+
+    std::atomic<bool> loop_running_{false};
+    std::mutex tick_loop_mu_;
+    std::condition_variable tick_loop_cv_;
+    bool tick_loop_exited_ = true;
 };

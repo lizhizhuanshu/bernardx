@@ -56,7 +56,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (bt_lib->engine() && bt_lib->engine()->IsRunning()) {
-        bt_lib->StopBtThread(true);
+        bt_lib->engine()->StopLoop();
         bt_lib->engine()->Stop();
     }
 

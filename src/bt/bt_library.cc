@@ -49,14 +49,24 @@ BehaviorTreeLibrary* GetLibrary(lua_State* L) {
     return static_cast<BehaviorTreeLibrary*>(lua_touserdata(L, lua_upvalueindex(2)));
 }
 
-// bt.run(json_or_path) — yields coroutine, resumes when BT tree completes
+void StopAndResumePending(BehaviorTreeEngine* engine, BehaviorTreeLibrary* lib) {
+    engine->StopLoop();
+    if (!lib->run_completed_.load() && lib->pending_run_ctx_) {
+        std::vector<LuaValue> args;
+        args.push_back(std::string("stopped"));
+        lib->pending_run_ctx_->PushResume(lib->pending_run_handle_, std::move(args));
+    }
+    lib->run_completed_.store(false);
+    lib->pending_run_ctx_.reset();
+    lib->pending_run_handle_ = 0;
+}
+
 int bt_run(lua_State* L) {
     auto* engine = GetEngine(L);
     auto* lib = GetLibrary(L);
     const char* input = luaL_checkstring(L, 1);
 
-    // Stop any previous run (resume its coroutine first)
-    lib->StopBtThread(true);
+    StopAndResumePending(engine, lib);
 
     // Detect JSON vs directory path
     std::string json_str;
@@ -110,12 +120,15 @@ int bt_run(lua_State* L) {
 
     lib->pending_run_handle_ = handle;
     lib->pending_run_ctx_ = rt_ctx;
+    lib->run_completed_.store(false);
 
-    lib->StartBtThread(code_provider, [rt_ctx, handle](const std::string& status) {
-        std::vector<LuaValue> args;
-        args.push_back(status);
-        rt_ctx->PushResume(handle, std::move(args));
-    });
+    engine->StartLoop(code_provider, lib->tick_interval_ms(),
+        [rt_ctx, handle, lib](const std::string& status) {
+            lib->run_completed_.store(true);
+            std::vector<LuaValue> args;
+            args.push_back(LuaValue(status));
+            rt_ctx->PushResume(handle, std::move(args));
+        });
 
     return lua_yield(L, 0);
 }
@@ -133,7 +146,8 @@ int bt_resume(lua_State* L) {
 int bt_stop(lua_State* L) {
     auto* engine = GetEngine(L);
     auto* lib = GetLibrary(L);
-    lib->StopBtThread(true);
+
+    StopAndResumePending(engine, lib);
     engine->Stop();
     return 0;
 }
@@ -192,12 +206,11 @@ int bt_set_project_path(lua_State* L) {
 
 }  // namespace
 
-BehaviorTreeLibrary::BehaviorTreeLibrary() {
-    engine_ = std::make_shared<BehaviorTreeEngine>();
-}
+BehaviorTreeLibrary::BehaviorTreeLibrary()
+    : engine_(std::make_shared<BehaviorTreeEngine>()) {}
 
 BehaviorTreeLibrary::~BehaviorTreeLibrary() {
-    StopBtThread();
+    engine_->StopLoop();
 }
 
 void BehaviorTreeLibrary::Open(lua_State* L) {
@@ -225,97 +238,6 @@ void BehaviorTreeLibrary::Open(lua_State* L) {
 }
 
 void BehaviorTreeLibrary::Close(lua_State* L) {
-    StopBtThread();
+    engine_->StopLoop();
     engine_->Stop();
-}
-
-void BehaviorTreeLibrary::StartBtThread(std::shared_ptr<CodeProvider> code_provider,
-                                         CompletionCallback on_complete) {
-    bt_context_ = LuaRuntime::Builder()
-        .WithCodeProvider(std::move(code_provider))
-        .Create();
-
-    run_completed_.store(false);
-    bt_running_.store(true);
-    {
-        std::lock_guard lock(tick_loop_mu_);
-        tick_loop_exited_ = false;
-    }
-
-    auto ctx = bt_context_;
-    auto self = shared_from_this();
-    bt_context_->executor()->schedule([self, ctx, cb = std::move(on_complete)]() mutable {
-        if (!self->bt_context_) return;
-        self->BtTickLoop(std::move(ctx), std::move(cb))
-            .via(self->bt_context_->executor())
-            .start([self](auto&&) {});
-    });
-}
-
-void BehaviorTreeLibrary::StopBtThread(bool resume_pending) {
-    bt_running_.store(false, std::memory_order_release);
-    engine_->DeactivateAllSensors();
-
-    // Block until BtTickLoop exits — prevents Load() from destroying the tree
-    // while callbacks are still pending on the BT executor thread.
-    {
-        std::unique_lock lock(tick_loop_mu_);
-        tick_loop_cv_.wait(lock, [this] { return tick_loop_exited_; });
-    }
-
-    if (resume_pending && !run_completed_.load() && pending_run_ctx_) {
-        std::vector<LuaValue> args;
-        args.push_back(std::string("stopped"));
-        pending_run_ctx_->PushResume(pending_run_handle_, std::move(args));
-    }
-    bt_context_.reset();
-
-    run_completed_.store(false);
-    pending_run_ctx_.reset();
-    pending_run_handle_ = 0;
-}
-
-async_simple::coro::Lazy<void> BehaviorTreeLibrary::BtTickLoop(
-    LuaRuntime::Ptr ctx, CompletionCallback on_complete) {
-    // RAII guard: signals StopBtThread when the coroutine exits (any path)
-    auto done_guard = [this]() {
-        {
-            std::lock_guard lock(tick_loop_mu_);
-            tick_loop_exited_ = true;
-        }
-        tick_loop_cv_.notify_all();
-    };
-
-    co_await engine_->InitScriptNodesAsync(ctx->main_state(), ctx.get());
-
-    engine_->InitSensors(ctx->main_state(), ctx.get());
-    engine_->ActivateInitialSensors();
-    engine_->Run();
-
-    while (bt_running_.load(std::memory_order_acquire)) {
-        auto status = engine_->TickOnce();
-
-        if (status == NodeStatus::kSuccess || status == NodeStatus::kFailure) {
-            engine_->Stop();
-            run_completed_.store(true);
-            if (on_complete) {
-                std::string s = (status == NodeStatus::kSuccess) ? "success" : "failure";
-                on_complete(s);
-            }
-            done_guard();
-            co_return;
-        }
-
-        // Sleep until next tick
-        async_simple::Promise<void> p;
-        auto f = p.getFuture();
-        auto* ex = ctx->executor();
-        ex->schedule([p = std::move(p)]() mutable { p.setValue(); },
-                     std::chrono::milliseconds(tick_interval_ms_.load(std::memory_order_relaxed)));
-        co_await std::move(f);
-    }
-
-    // Stopped externally
-    engine_->Stop();
-    done_guard();
 }
