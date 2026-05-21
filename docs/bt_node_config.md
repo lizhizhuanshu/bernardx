@@ -411,49 +411,39 @@ Subtree 节点支持 `decorators` 和 `sensors`，与普通节点一致。子树
 
 ### 传感器脚本格式
 
-脚本 `return` 一个 **table** 或 **function**：
-
-#### Table 格式（推荐）
+脚本文件必须 **return 一个 table**，使用冒号语法定义回调函数。`self` 是脚本 table 本身，用于存储跨 tick 的用户状态：
 
 ```lua
 -- sensors/element_visible.lua
-return {
-    Enter = function(bb)
-        -- 节点进入活跃路径时调用（同步，不可 yield）
-        print("sensor activated")
-    end,
 
-    Tick = function(bb)
-        -- 周期性调用（协程，可 yield）
-        local found = coroutine.yield(async_query("#login-btn"))
-        return found ~= nil  -- 返回值 → 黑板[传感器名]
-    end,
+local M = {}
 
-    Exit = function(bb)
-        -- 节点离开活跃路径时调用（同步，不可 yield）
-        print("sensor deactivated")
-    end
-}
-```
-
-| 回调 | 参数 | 可否 yield | 说明 |
-|------|------|-----------|------|
-| `Enter` | `bb` (table) | 否 | 激活时调用一次 |
-| `Tick` | `bb` (table) | **是** | 按 interval 周期调用，返回值写入黑板 |
-| `Exit` | `bb` (table) | 否 | 停用时调用一次 |
-
-`Enter` 和 `Exit` 是可选的，`Tick` 是必需的。
-
-#### Function 格式（简化）
-
-```lua
--- sensors/check_hp.lua
-return function(bb)
-    return bb.hp and bb.hp > 0
+function M:Enter()
+  -- 激活时调用一次（同步，不可 yield）
+  print("sensor activated")
 end
+
+function M:Tick()
+  -- 按 interval 周期调用（协程，可 yield）
+  local found = coroutine.yield(async_query("#login-btn"))
+  return found ~= nil  -- 返回值 → 黑板[传感器名]
+end
+
+function M:Exit()
+  -- 停用时调用一次（同步，不可 yield）
+  print("sensor deactivated")
+end
+
+return M
 ```
 
-返回单个函数时，等同于只有 `Tick`。
+| 回调 | 签名 | 必需 | 可否 yield | 说明 |
+|------|------|------|-----------|------|
+| `Enter` | `self:Enter()` | 否 | 否 | 激活时调用一次 |
+| `Tick` | `self:Tick()` | **是** | **是** | 按 interval 周期调用，返回值写入黑板 |
+| `Exit` | `self:Exit()` | 否 | 否 | 停用时调用一次 |
+
+`self` 是脚本返回的 table，可自由存储跨 tick 的状态。黑板通过 `bt.get`/`bt.set` 访问。
 
 ### 传感器与装饰器配合
 

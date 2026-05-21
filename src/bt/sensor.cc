@@ -10,16 +10,20 @@ ActiveSensor::ActiveSensor(SensorSpec spec)
 
 ActiveSensor::~ActiveSensor() {
     Deactivate();
+}
 
-    // Release Lua registry refs
-    if (main_L_) {
-        if (enter_ref_ != LUA_NOREF) luaL_unref(main_L_, LUA_REGISTRYINDEX, enter_ref_);
-        if (tick_ref_ != LUA_NOREF) luaL_unref(main_L_, LUA_REGISTRYINDEX, tick_ref_);
-        if (exit_ref_ != LUA_NOREF) luaL_unref(main_L_, LUA_REGISTRYINDEX, exit_ref_);
-        enter_ref_ = LUA_NOREF;
-        tick_ref_ = LUA_NOREF;
-        exit_ref_ = LUA_NOREF;
-    }
+void ActiveSensor::ReleaseRefs() {
+    if (!main_L_) return;
+    auto unref = [&](int& ref) {
+        if (ref != LUA_NOREF) {
+            luaL_unref(main_L_, LUA_REGISTRYINDEX, ref);
+            ref = LUA_NOREF;
+        }
+    };
+    unref(script_table_ref_);
+    unref(enter_ref_);
+    unref(tick_ref_);
+    unref(exit_ref_);
 }
 
 void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
@@ -47,32 +51,27 @@ void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_p
         return;
     }
 
-    // Support both table format {Enter=, Tick=, Exit=} and plain function
-    if (lua_isfunction(L, -1)) {
-        tick_ref_ = luaL_ref(L, LUA_REGISTRYINDEX);
-        spdlog::info("ActiveSensor::Init: loaded '{}' → sensor '{}' (function)",
-                     spec_.script_path, spec_.name);
-        return;
-    }
-
     if (!lua_istable(L, -1)) {
-        spdlog::error("ActiveSensor::Init: '{}' did not return a table or function",
+        spdlog::error("ActiveSensor::Init: '{}' did not return a table",
                        spec_.script_path);
         lua_pop(L, 1);
         return;
     }
 
-    int table_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    // Save script table ref for colon-method calls (self)
+    lua_pushvalue(L, -1);
+    script_table_ref_ = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    int table_idx = lua_absindex(L, -1);
 
     auto get_ref = [&](const char* name) -> int {
-        lua_rawgeti(L, LUA_REGISTRYINDEX, table_ref);
-        lua_getfield(L, -1, name);
+        lua_getfield(L, table_idx, name);
         int ref = LUA_NOREF;
         if (lua_isfunction(L, -1)) {
             lua_pushvalue(L, -1);
             ref = luaL_ref(L, LUA_REGISTRYINDEX);
         }
-        lua_pop(L, 2);
+        lua_pop(L, 1);
         return ref;
     };
 
@@ -80,7 +79,7 @@ void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_p
     tick_ref_ = get_ref("Tick");
     exit_ref_ = get_ref("Exit");
 
-    luaL_unref(L, LUA_REGISTRYINDEX, table_ref);
+    lua_pop(L, 1);  // pop table
 
     if (tick_ref_ == LUA_NOREF) {
         spdlog::error("ActiveSensor::Init: '{}' missing required 'Tick' function",
@@ -93,12 +92,19 @@ void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_p
                  exit_ref_ != LUA_NOREF);
 }
 
-void ActiveSensor::CallSync(int fn_ref) {
-    lua_rawgeti(main_L_, LUA_REGISTRYINDEX, fn_ref);
-    if (lua_pcall(main_L_, 0, 0, 0) != LUA_OK) {
-        const char* err = lua_tostring(main_L_, -1);
-        spdlog::error("ActiveSensor::CallSync: error: {}", err ? err : "unknown");
-        lua_pop(main_L_, 1);
+void ActiveSensor::CallMethod(lua_State* L, int fn_ref, int extra_args) {
+    int base = lua_gettop(L) - extra_args + 1;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, fn_ref);
+    lua_insert(L, base);
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, script_table_ref_);
+    lua_insert(L, base + 1);
+
+    if (lua_pcall(L, 1 + extra_args, 0, 0) != LUA_OK) {
+        const char* err = lua_tostring(L, -1);
+        spdlog::error("ActiveSensor::CallMethod: error: {}", err ? err : "unknown");
+        lua_pop(L, 1);
     }
 }
 
@@ -111,18 +117,10 @@ void ActiveSensor::HandleResult(const std::vector<LuaValue>& values, Blackboard&
 void ActiveSensor::Activate(Blackboard& bb) {
     if (active_) return;
     active_ = true;
-    next_run_ms_ = 0;  // run immediately
+    next_run_ms_ = 0;
 
-    // Call Enter (synchronous, no yield)
     if (enter_ref_ != LUA_NOREF && main_L_) {
-        bb.PushAsTable(main_L_);
-        lua_rawgeti(main_L_, LUA_REGISTRYINDEX, enter_ref_);
-        lua_insert(main_L_, -2);
-        if (lua_pcall(main_L_, 1, 0, 0) != LUA_OK) {
-            const char* err = lua_tostring(main_L_, -1);
-            spdlog::error("ActiveSensor::Activate: Enter error: {}", err ? err : "unknown");
-            lua_pop(main_L_, 1);
-        }
+        CallMethod(main_L_, enter_ref_);
     }
 
     RunOnce(bb);
@@ -138,16 +136,8 @@ void ActiveSensor::Deactivate(Blackboard* bb) {
         yielded_co_ = nullptr;
     }
 
-    // Call Exit with blackboard (synchronous, no yield)
-    if (exit_ref_ != LUA_NOREF && main_L_ && bb) {
-        bb->PushAsTable(main_L_);
-        lua_rawgeti(main_L_, LUA_REGISTRYINDEX, exit_ref_);
-        lua_insert(main_L_, -2);
-        if (lua_pcall(main_L_, 1, 0, 0) != LUA_OK) {
-            const char* err = lua_tostring(main_L_, -1);
-            spdlog::error("ActiveSensor::Deactivate: Exit error: {}", err ? err : "unknown");
-            lua_pop(main_L_, 1);
-        }
+    if (exit_ref_ != LUA_NOREF && main_L_) {
+        CallMethod(main_L_, exit_ref_);
     }
 }
 
@@ -161,19 +151,13 @@ void ActiveSensor::ScheduleNext(int64_t now_ms) {
 
 void ActiveSensor::RunOnce(Blackboard& bb) {
     if (!is_loaded() || !main_L_ || !lua_context_) return;
-
-    // Still waiting for previous coroutine
     if (yielded_co_ != nullptr) return;
 
     lua_State* co = lua_context_->AcquireCoroutine();
 
-    // Push Tick function
     lua_rawgeti(co, LUA_REGISTRYINDEX, tick_ref_);
+    lua_rawgeti(co, LUA_REGISTRYINDEX, script_table_ref_);
 
-    // Push blackboard as table argument
-    bb.PushAsTable(co);
-
-    // Register completion callback
     auto* self = this;
     lua_context_->SetCoCompleteCallback(co, [self, &bb](ScriptResult r) {
         if (r.status == LUA_OK) {
@@ -183,14 +167,13 @@ void ActiveSensor::RunOnce(Blackboard& bb) {
     });
 
     int nresults = 0;
-    int status = lua_resume(co, main_L_, 1, &nresults);
+    int status = lua_resume(co, main_L_, 1, &nresults);  // 1 arg = self
 
     if (status == LUA_YIELD) {
         yielded_co_ = co;
         return;
     }
 
-    // Completed immediately (no yield)
     lua_context_->RemoveCoCompleteCallback(co);
 
     if (status == LUA_OK) {

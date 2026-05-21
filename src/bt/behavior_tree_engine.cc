@@ -400,6 +400,9 @@ void BehaviorTreeEngine::StopLoop() {
     if (root_ && bt_context_) {
         ReleaseScriptNodeRefsRecursive(root_.get());
     }
+    for (auto& [name, sensor] : active_sensors_) {
+        sensor->ReleaseRefs();
+    }
 
     bt_context_.reset();
 }

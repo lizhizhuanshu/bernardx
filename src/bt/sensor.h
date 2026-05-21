@@ -23,28 +23,19 @@ public:
     explicit ActiveSensor(SensorSpec spec);
     ~ActiveSensor();
 
-    // Non-copyable
     ActiveSensor(const ActiveSensor&) = delete;
     ActiveSensor& operator=(const ActiveSensor&) = delete;
 
-    // Initialize: load sensor script and extract Enter/Tick/Exit refs (BT thread only)
-    // base_path is the BT project root for resolving relative script paths
     void Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
 
-    // Activate: call Enter, mark active, run first Tick
-    void Activate(Blackboard& bb);
+    // Release Lua registry refs while the Lua state is still alive.
+    void ReleaseRefs();
 
-    // Deactivate: cancel coroutine, call Exit(bb), mark inactive
-    // bb is optional — if null, Exit is not called (used during destruction)
+    void Activate(Blackboard& bb);
     void Deactivate(Blackboard* bb = nullptr);
 
-    // Check if sensor interval has elapsed and not currently yielding
     bool TickReady(int64_t now_ms) const;
-
-    // Execute sensor Tick in coroutine
     void RunOnce(Blackboard& bb);
-
-    // Update next run time
     void ScheduleNext(int64_t now_ms);
 
     const std::string& name() const { return spec_.name; }
@@ -53,16 +44,16 @@ public:
     bool is_loaded() const { return tick_ref_ != LUA_NOREF; }
 
 private:
-    // Synchronous call via lua_pcall (for Enter/Exit — no yield)
-    void CallSync(int fn_ref);
+    // Colon-method call: push fn, push self, extra_args → pcall(L, 1+extra_args, 0, 0)
+    void CallMethod(lua_State* L, int fn_ref, int extra_args = 0);
 
-    // Parse return value from coroutine, write to blackboard
     void HandleResult(const std::vector<LuaValue>& values, Blackboard& bb);
 
     SensorSpec spec_;
     lua_State* main_L_ = nullptr;
     LuaRuntime* lua_context_ = nullptr;
 
+    int script_table_ref_ = LUA_NOREF;
     int enter_ref_ = LUA_NOREF;
     int tick_ref_ = LUA_NOREF;
     int exit_ref_ = LUA_NOREF;
