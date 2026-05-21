@@ -13,16 +13,20 @@ extern "C" {
 #include "leaf.h"
 #include "lua_runtime.h"
 
-using ArgsMap = std::unordered_map<std::string, LuaValue>;
-
 class ScriptNode : public Leaf {
 public:
+    using ArgsMap = std::unordered_map<std::string, LuaValue>;
+
     ScriptNode(uint32_t id, std::string name, std::string script_path, ArgsMap args = {});
     ~ScriptNode() override;
 
     const std::string& script_path() const { return script_path_; }
 
     async_simple::coro::Lazy<void> Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
+
+    // Release Lua registry refs while the Lua state is still alive.
+    // Must be called before the owning LuaRuntime is destroyed.
+    void ReleaseRefs();
 
     bool is_loaded() const { return tick_ref_ != LUA_NOREF; }
 
@@ -33,12 +37,8 @@ public:
     bool is_active() const { return active_; }
 
 private:
-    // Colon-method call: push fn, push self, push extra_args, lua_pcall(L, 1+extra_args, 0, 0)
     void CallMethod(lua_State* L, int fn_ref, int extra_args = 0);
-
-    // Push args_ as a Lua table onto the stack
-    void PushArgsTable(lua_State* L);
-
+    void PushArgsTable(lua_State* L) const;
     NodeStatus ParseReturnValues(const std::vector<LuaValue>& values, bool& deactivate);
 
     std::string script_path_;

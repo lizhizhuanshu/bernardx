@@ -215,11 +215,15 @@ std::unique_ptr<Node> TreeParser::ParseScriptLeaf(const nlohmann::json& j, uint3
     std::string name = j.value("name", path);
     uint32_t id = next_id++;
 
-    ArgsMap args;
+    ScriptNode::ArgsMap args;
     if (j.contains("args") && j["args"].is_object()) {
         for (auto it = j["args"].begin(); it != j["args"].end(); ++it) {
             auto val = ParseLuaValue(it.value());
-            if (val) args[it.key()] = std::move(*val);
+            if (val) {
+                args[it.key()] = std::move(*val);
+            } else {
+                spdlog::error("TreeParser: Script node 'args' key '{}' has unsupported type", it.key());
+            }
         }
     }
 

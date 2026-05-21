@@ -104,6 +104,17 @@ async_simple::coro::Lazy<void> BehaviorTreeEngine::InitScriptNodesRecursiveAsync
     }
 }
 
+void BehaviorTreeEngine::ReleaseScriptNodeRefsRecursive(Node* node) {
+    if (auto* script = dynamic_cast<ScriptNode*>(node)) {
+        script->ReleaseRefs();
+    }
+    if (auto* composite = dynamic_cast<Composite*>(node)) {
+        for (auto& child : composite->children()) {
+            ReleaseScriptNodeRefsRecursive(child.get());
+        }
+    }
+}
+
 NodeStatus BehaviorTreeEngine::TickOnce() {
     // Returns kRunning when paused/no-root so the BT event loop doesn't break.
     // Only success/failure cause the event loop to stop and resume the bt.run() coroutine.
@@ -383,6 +394,11 @@ void BehaviorTreeEngine::StopLoop() {
     {
         std::unique_lock lock(tick_loop_mu_);
         tick_loop_cv_.wait(lock, [this] { return tick_loop_exited_; });
+    }
+
+    // Release Lua registry refs while the Lua state is still alive
+    if (root_ && bt_context_) {
+        ReleaseScriptNodeRefsRecursive(root_.get());
     }
 
     bt_context_.reset();
