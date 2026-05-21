@@ -120,7 +120,11 @@ local status = bt.run("trees/ai_main")  -- 解析为 /path/to/bt_project/trees/a
 {
   "type": "Script",
   "path": "scripts/attack.lua",
-  "name": "可选名称（默认为 path）"
+  "name": "可选名称（默认为 path）",
+  "args": {
+    "target": "enemy",
+    "damage": 100
+  }
 }
 ```
 
@@ -128,68 +132,92 @@ local status = bt.run("trees/ai_main")  -- 解析为 /path/to/bt_project/trees/a
 |------|------|------|
 | `path` | **是** | Lua 脚本文件路径（相对路径基于项目根目录解析） |
 | `name` | 否 | 节点名称，默认等于 path |
+| `args` | 否 | 传递给 `Enter` 回调的参数对象 |
+
+`args` 值支持类型：`bool`、`int`（int64）、`double`、`string`。
 
 #### 脚本格式
 
-脚本文件必须 **return 一个 table**，包含回调函数：
+脚本文件必须 **return 一个 table**，使用冒号语法定义回调函数。`self` 是脚本 table 本身，用于存储跨 tick 的用户状态：
 
 ```lua
 -- scripts/attack.lua
-return {
-    Enter = function(bb)
-        -- 节点首次被 tick 前调用（同步，不可 yield）
-        print("enter attack")
-    end,
 
-    Tick = function(bb)
-        -- 每次 tick 调用（协程，可 yield）
-        -- 这是**必需**的回调
-        if bb.target then
-            return "success"
-        end
-        return "failure"
-    end,
+local M = {}
 
-    Exit = function(bb, reason)
-        -- 节点完成/中止时调用（同步，不可 yield）
-        -- reason: "success" | "failure" | "aborted" | "reset"
-        print("exit:", reason)
-    end,
+function M:Enter(args)
+  -- args = JSON 中的 "args" 对象
+  -- self = 脚本 table，可自由存储状态
+  self.target = args.target
+  self.damage = args.damage
+end
 
-    Abort = function()
-        -- 节点被强制中止时调用，在 Exit 之前（同步，不可 yield）
-        -- 无参数
-        print("aborted")
-    end
-}
+function M:Tick()
+  -- 每次 tick 调用（协程，可 yield）
+  -- 这是**必需**的回调
+  if self.target then
+    return "success"
+  end
+  return "failure"
+end
+
+function M:Exit(reason)
+  -- reason = "success" | "failure" | "aborted" | "reset"
+  print("exit:", reason)
+end
+
+function M:Abort()
+  print("aborted")
+end
+
+return M
 ```
 
-| 回调 | 参数 | 必需 | 可否 yield | 说明 |
+| 回调 | 签名 | 必需 | 可否 yield | 说明 |
 |------|------|------|-----------|------|
-| `Enter` | `bb` (table) | 否 | 否 | 节点进入活跃状态时调用一次 |
-| `Tick` | `bb` (table) | **是** | **是** | 每次 tick 调用，返回状态字符串 |
-| `Exit` | `bb` (table), `reason` (string) | 否 | 否 | 节点离开活跃状态时调用 |
-| `Abort` | 无 | 否 | 否 | 节点被强制中止时调用（在 Exit 之前） |
+| `Enter` | `self:Enter(args)` | 否 | 否 | 节点进入活跃状态时调用一次 |
+| `Tick` | `self:Tick()` | **是** | **是** | 每次 tick 调用，返回状态字符串 |
+| `Exit` | `self:Exit(reason)` | 否 | 否 | 节点离开活跃状态时调用 |
+| `Abort` | `self:Abort()` | 否 | 否 | 节点被强制中止时调用（在 Exit 之前） |
 
 **注意：** 脚本必须返回 **table**。如果脚本未返回 table 或缺少 `Tick` 函数，节点将加载失败，tick 时直接返回 Failure。
 
-#### bb 参数（黑板）
+#### self — 脚本状态
 
-所有回调的第一个参数 `bb` 是黑板 table，可直接读写：
+`self` 是脚本返回的 table 本身，可自由存储跨 tick 的状态：
 
 ```lua
-return {
-    Tick = function(bb)
-        -- 读取黑板
-        local hp = bb.hp
-        local name = bb.name
+local M = {}
+function M:Enter(args)
+  self.counter = 0
+end
+function M:Tick()
+  self.counter = self.counter + 1
+  if self.counter >= 3 then
+    return "success"
+  end
+  return "running"
+end
+return M
+```
 
-        -- 写入黑板（可被其他节点的 BlackboardCondition 装饰器感知）
-        bb.last_attack_time = now()
+#### 黑板访问
 
-        return "success"
-    end
-}
+通过 `bt.get` / `bt.set` 读写黑板：
+
+```lua
+local bt = require('bt')
+
+local M = {}
+function M:Tick()
+  local hp = bt.get("hp")
+  if hp and hp > 50 then
+    bt.set("last_attack_time", os.time())
+    return "success"
+  end
+  return "failure"
+end
+return M
 ```
 
 黑板值支持类型：`nil`、`boolean`、`integer`（int64）、`double`、`string`。
@@ -211,33 +239,31 @@ return {
 `Tick` 在协程中执行，可以使用所有异步 API（`sleep`、`await`、`http.get` 等）：
 
 ```lua
-return {
-    Tick = function(bb)
-        -- 等待 500ms
-        sleep(500)
+local M = {}
+function M:Tick()
+  sleep(500)
 
-        -- 异步 HTTP 请求
-        local status, body, err = http.get("https://api.example.com/target")
-        if err then
-            return "failure"
-        end
+  local status, body, err = http.get("https://api.example.com/target")
+  if err then
+    return "failure"
+  end
 
-        bb.target = body
-        return "success"
-    end
-}
+  bt.set("target", body)
+  return "success"
+end
+return M
 ```
 
 当 Tick 中执行异步操作时，节点返回 `Running` 状态挂起，异步操作完成后自动恢复 Tick 执行。
 
 #### 生命周期
 
-1. **首次 Tick** → 调用 `Enter(bb)` → 调用 `Tick(bb)` → 根据返回值：
-   - `"success"` / `"failure"` → 调用 `Exit(bb, reason)` → 节点完成
+1. **首次 Tick** → 调用 `self:Enter(args)` → 调用 `self:Tick()` → 根据返回值：
+   - `"success"` / `"failure"` → 调用 `self:Exit(reason)` → 节点完成
    - `"running"` → 保持活跃，下次 tick 直接调用 `Tick`（不再调 Enter）
-2. **后续 Tick**（仍为活跃状态）→ 直接调用 `Tick(bb)`
-3. **被中止**（如 BlackboardCondition 中断）→ 调用 `Abort()` → 调用 `Exit(bb, "aborted")`
-4. **被重置**（Reset）→ 调用 `Exit(bb, "reset")` → 节点回到非活跃状态
+2. **后续 Tick**（仍为活跃状态）→ 直接调用 `self:Tick()`
+3. **被中止**（如 BlackboardCondition 中断）→ 调用 `self:Abort()` → 调用 `self:Exit("aborted")`
+4. **被重置**（Reset）→ 调用 `self:Exit("reset")` → 节点回到非活跃状态
 
 ### Subtree - 子树节点
 
@@ -593,7 +619,7 @@ trees/ai_main/
 | `Selector` | 复合 | `type` | `children` | OR 逻辑，任一成功即成功 |
 | `Sequence` | 复合 | `type` | `children` | AND 逻辑，全部成功才成功 |
 | `Parallel` | 复合 | `type` | `children` | 并行执行，策略控制结果 |
-| `Script` | 叶子 | `type`, `path` | 无 | 执行 Lua 脚本 |
+| `Script` | 叶子 | `type`, `path` | 无 | 执行 Lua 脚本，支持 `args` 传参 |
 | `Subtree` | 叶子 | `type`, `subtree` | 无 | 引用 subtrees 中定义的子树 |
 | `BlackboardCondition` | 装饰器 | `type`, `key` | N/A | 黑板条件判断 |
 | `Inverter` | 装饰器 | `type` | N/A | 反转结果 |

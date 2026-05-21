@@ -19,6 +19,7 @@
 #include "lua_runtime.h"
 #include "node.h"
 #include "parallel.h"
+#include "script_node.h"
 #include "selector.h"
 #include "sequence.h"
 #include "sensor.h"
@@ -1604,4 +1605,161 @@ TEST_F(LoadTreeFromDirectoryTest, InvalidJsonInSubtree) {
 
     auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
     EXPECT_TRUE(json.empty());
+}
+
+// --- ScriptNode Args Parsing Tests ---
+
+TEST(TreeParserArgsTest, ParseScriptNodeWithArgs) {
+    const char* json = R"({
+        "root": {
+            "type": "Script",
+            "path": "scripts/attack.lua",
+            "args": {
+                "target": "enemy",
+                "damage": 100,
+                "use_critical": true
+            }
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->type(), "Script");
+    auto* script = dynamic_cast<ScriptNode*>(root.get());
+    ASSERT_NE(script, nullptr);
+    EXPECT_EQ(script->script_path(), "scripts/attack.lua");
+}
+
+TEST(TreeParserArgsTest, ParseScriptNodeWithNoArgs) {
+    const char* json = R"({
+        "root": {"type": "Script", "path": "test.lua"}
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->type(), "Script");
+}
+
+TEST(TreeParserArgsTest, ParseScriptNodeWithEmptyArgs) {
+    const char* json = R"({
+        "root": {
+            "type": "Script",
+            "path": "test.lua",
+            "args": {}
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->type(), "Script");
+}
+
+TEST(TreeParserArgsTest, ParseScriptNodeWithFloatArg) {
+    const char* json = R"({
+        "root": {
+            "type": "Script",
+            "path": "test.lua",
+            "args": {"ratio": 0.75}
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->type(), "Script");
+}
+
+// --- ScriptNode Colon-Method Integration Tests ---
+
+// Test scripts live in tests/scripts/ alongside this file.
+// bt.set_project_path points to the project tests/ directory.
+
+class ScriptNodeIntegrationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        lib = std::make_shared<BehaviorTreeLibrary>();
+        rt = LuaRuntime::Builder()
+            .RegisterLibrary(lib)
+            .Create();
+
+        // tests/ is the project root for test scripts
+        tests_dir_ = std::filesystem::absolute(
+            std::filesystem::path(__FILE__).parent_path()).string();
+    }
+
+    void TearDown() override {
+        if (lib && lib->engine() && lib->engine()->IsRunning()) {
+            lib->engine()->StopLoop();
+            lib->engine()->Stop();
+        }
+    }
+
+    std::string RunBtScript(const std::string& lua_code) {
+        auto r = AWAIT_BT(rt->RunScript(lua_code));
+        EXPECT_EQ(r.status, LUA_OK);
+        return std::get<std::string>(r.values[0]);
+    }
+
+    std::shared_ptr<BehaviorTreeLibrary> lib;
+    LuaRuntime::Ptr rt;
+    std::string tests_dir_;
+};
+
+TEST_F(ScriptNodeIntegrationTest, SelfStateInEnterAndTick) {
+    lib->SetTickIntervalMs(10);
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.set_project_path(')" + tests_dir_ + R"(')
+        return bt.run('{"root":{"type":"Script","path":"scripts/bt_module.lua"}}')
+    )");
+    EXPECT_EQ(status, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, ExitReasonAsParameter) {
+    lib->SetTickIntervalMs(10);
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.set_project_path(')" + tests_dir_ + R"(')
+        return bt.run('{"root":{"type":"Script","path":"scripts/check_reason.lua"}}')
+    )");
+    EXPECT_EQ(status, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
+    lib->SetTickIntervalMs(10);
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.set_project_path(')" + tests_dir_ + R"(')
+        return bt.run('{"root":{"type":"Script","path":"scripts/with_args.lua","args":{"target":"enemy","damage":100}}}')
+    )");
+    EXPECT_EQ(status, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
+    lib->SetTickIntervalMs(10);
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.set_project_path(')" + tests_dir_ + R"(')
+        return bt.run('{"root":{"type":"Script","path":"scripts/bool_args.lua","args":{"enabled":true}}}')
+    )");
+    EXPECT_EQ(status, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
+    lib->SetTickIntervalMs(10);
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.set_project_path(')" + tests_dir_ + R"(')
+        return bt.run('{"root":{"type":"Script","path":"scripts/counter.lua"}}')
+    )");
+    EXPECT_EQ(status, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, NoArgsStillWorks) {
+    lib->SetTickIntervalMs(10);
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.set_project_path(')" + tests_dir_ + R"(')
+        return bt.run('{"root":{"type":"Script","path":"scripts/no_args.lua"}}')
+    )");
+    EXPECT_EQ(status, "success");
 }

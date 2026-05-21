@@ -7,9 +7,10 @@
 #include "bt_event_queue.h"
 #include "types.h"
 
-ScriptNode::ScriptNode(uint32_t id, std::string name, std::string script_path)
+ScriptNode::ScriptNode(uint32_t id, std::string name, std::string script_path, ArgsMap args)
     : Leaf(id, "Script", std::move(name)),
-      script_path_(std::move(script_path)) {}
+      script_path_(std::move(script_path)),
+      args_(std::move(args)) {}
 
 ScriptNode::~ScriptNode() {
     if (yielded_co_ != nullptr && lua_context_ != nullptr) {
@@ -46,13 +47,16 @@ async_simple::coro::Lazy<void> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, c
         co_return;
     }
 
-    // Access the returned table on main_L_ via shared registry
     lua_rawgeti(main_L_, LUA_REGISTRYINDEX, (*table_ref)->ref);
     if (!lua_istable(main_L_, -1)) {
         spdlog::error("ScriptNode::Init: '{}' did not return a table", full_path);
         lua_pop(main_L_, 1);
         co_return;
     }
+
+    // Save the script table ref for colon-method calls (self)
+    lua_pushvalue(main_L_, -1);
+    script_table_ref_ = luaL_ref(main_L_, LUA_REGISTRYINDEX);
 
     int table_idx = lua_absindex(main_L_, -1);
 
@@ -84,15 +88,32 @@ async_simple::coro::Lazy<void> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, c
                  exit_ref_ != LUA_NOREF, abort_ref_ != LUA_NOREF);
 }
 
-void ScriptNode::CallSync(lua_State* L, int fn_ref, int nargs) {
-    lua_rawgeti(L, LUA_REGISTRYINDEX, fn_ref);
-    if (nargs > 0) {
-        lua_insert(L, -(nargs + 1));
+void ScriptNode::PushArgsTable(lua_State* L) {
+    lua_newtable(L);
+    for (const auto& [key, value] : args_) {
+        lua_pushstring(L, key.c_str());
+        LuaRuntime::PushValues(L, {value});
+        lua_settable(L, -3);
     }
-    int status = lua_pcall(L, nargs, 0, 0);
+}
+
+void ScriptNode::CallMethod(lua_State* L, int fn_ref, int extra_args) {
+    // Stack: [..., extra_arg1, ..., extra_argN]
+    // Rearrange to: [..., fn, self, extra_arg1, ..., extra_argN]
+    // Then pcall(L, 1 + extra_args, 0, 0)
+
+    int base = lua_gettop(L) - extra_args + 1;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, fn_ref);
+    lua_insert(L, base);
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, script_table_ref_);
+    lua_insert(L, base + 1);
+
+    int status = lua_pcall(L, 1 + extra_args, 0, 0);
     if (status != LUA_OK) {
         const char* err = lua_tostring(L, -1);
-        spdlog::error("ScriptNode::CallSync: error: {}", err ? err : "unknown");
+        spdlog::error("ScriptNode::CallMethod: error: {}", err ? err : "unknown");
         lua_pop(L, 1);
     }
 }
@@ -128,7 +149,7 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
     // --- Waiting for a yielded coroutine to complete ---
     if (yielded_co_ != nullptr) {
         if (!has_result_) {
-            return NodeStatus::kRunning;  // Coroutine still yielded
+            return NodeStatus::kRunning;
         }
         auto result = std::move(result_);
         has_result_ = false;
@@ -147,7 +168,7 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
             if (exit_ref_ != LUA_NOREF) {
                 auto* s = std::get_if<std::string>(&result.values[0]);
                 lua_pushstring(main_L_, s ? s->c_str() : "failure");
-                CallSync(main_L_, exit_ref_, 1);
+                CallMethod(main_L_, exit_ref_, 1);
             }
         }
         return ns;
@@ -157,33 +178,31 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
     if (!active_) {
         active_ = true;
         if (enter_ref_ != LUA_NOREF) {
-            bb.PushAsTable(main_L_);
-            CallSync(main_L_, enter_ref_, 1);
+            PushArgsTable(main_L_);
+            CallMethod(main_L_, enter_ref_, 1);
         }
     }
 
     // Create coroutine via LuaRuntime's pool
     lua_State* co = lua_context_->AcquireCoroutine();
 
-    // Push Tick function and blackboard argument on the coroutine
+    // Colon call on coroutine: push fn, push self
     lua_rawgeti(co, LUA_REGISTRYINDEX, tick_ref_);
-    bb.PushAsTable(co);
+    lua_rawgeti(co, LUA_REGISTRYINDEX, script_table_ref_);
 
-    // Register completion callback (fires when coroutine finishes after yield)
     lua_context_->SetCoCompleteCallback(co, [this](ScriptResult r) {
         has_result_ = true;
         result_ = std::move(r);
     });
 
     int nresults = 0;
-    int status = lua_resume(co, main_L_, 1, &nresults);
+    int status = lua_resume(co, main_L_, 1, &nresults);  // 1 arg = self
 
     if (status == LUA_YIELD) {
         yielded_co_ = co;
         return NodeStatus::kRunning;
     }
 
-    // Coroutine finished immediately (no yield)
     lua_context_->RemoveCoCompleteCallback(co);
 
     if (status != LUA_OK) {
@@ -204,7 +223,7 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
         if (exit_ref_ != LUA_NOREF) {
             auto* s = std::get_if<std::string>(&values[0]);
             lua_pushstring(main_L_, s ? s->c_str() : "failure");
-            CallSync(main_L_, exit_ref_, 1);
+            CallMethod(main_L_, exit_ref_, 1);
         }
     }
     return ns;
@@ -219,7 +238,7 @@ void ScriptNode::Reset() {
 
     if (active_ && exit_ref_ != LUA_NOREF && main_L_) {
         lua_pushstring(main_L_, "reset");
-        CallSync(main_L_, exit_ref_, 1);
+        CallMethod(main_L_, exit_ref_, 1);
     }
     active_ = false;
     Leaf::Reset();
@@ -234,11 +253,11 @@ void ScriptNode::OnAborted() {
 
     if (active_ && main_L_) {
         if (abort_ref_ != LUA_NOREF) {
-            CallSync(main_L_, abort_ref_, 0);
+            CallMethod(main_L_, abort_ref_);
         }
         if (exit_ref_ != LUA_NOREF) {
             lua_pushstring(main_L_, "aborted");
-            CallSync(main_L_, exit_ref_, 1);
+            CallMethod(main_L_, exit_ref_, 1);
         }
     }
     active_ = false;

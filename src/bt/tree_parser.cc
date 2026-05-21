@@ -215,7 +215,15 @@ std::unique_ptr<Node> TreeParser::ParseScriptLeaf(const nlohmann::json& j, uint3
     std::string name = j.value("name", path);
     uint32_t id = next_id++;
 
-    auto node = std::make_unique<ScriptNode>(id, std::move(name), std::move(path));
+    ArgsMap args;
+    if (j.contains("args") && j["args"].is_object()) {
+        for (auto it = j["args"].begin(); it != j["args"].end(); ++it) {
+            auto val = ParseLuaValue(it.value());
+            if (val) args[it.key()] = std::move(*val);
+        }
+    }
+
+    auto node = std::make_unique<ScriptNode>(id, std::move(name), std::move(path), std::move(args));
     ApplyDecorators(j, node.get());
     ApplySensors(j, node.get());
     return node;
