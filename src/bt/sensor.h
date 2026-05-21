@@ -11,9 +11,11 @@ extern "C" {
 #include "lua_runtime.h"
 
 struct SensorSpec {
+    using ArgsMap = std::unordered_map<std::string, LuaValue>;
     std::string name;
     std::string script_path;
     int64_t interval_ms;
+    ArgsMap args;
 };
 
 class Blackboard;
@@ -46,6 +48,9 @@ public:
 private:
     // Colon-method call: push fn, push self, extra_args → pcall(L, 1+extra_args, 0, 0)
     void CallMethod(lua_State* L, int fn_ref, int extra_args = 0);
+
+    // Push spec_.args as a Lua table onto the stack
+    void PushArgsTable(lua_State* L) const;
 
     void HandleResult(const std::vector<LuaValue>& values, Blackboard& bb);
 

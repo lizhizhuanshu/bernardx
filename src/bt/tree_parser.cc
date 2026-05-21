@@ -323,6 +323,17 @@ void TreeParser::ApplySensors(const nlohmann::json& j, Node* node) {
         spec.script_path = sen_j["path"].get<std::string>();
         spec.interval_ms = sen_j.value("interval", 100);
 
+        if (sen_j.contains("args") && sen_j["args"].is_object()) {
+            for (auto it = sen_j["args"].begin(); it != sen_j["args"].end(); ++it) {
+                auto val = ParseLuaValue(it.value());
+                if (val) {
+                    spec.args[it.key()] = std::move(*val);
+                } else {
+                    spdlog::error("TreeParser: sensor 'args' key '{}' has unsupported type", it.key());
+                }
+            }
+        }
+
         node->AddSensorSpec(std::move(spec));
     }
 }

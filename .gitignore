@@ -2,3 +2,4 @@ build
 .deps
 .claude
 .cache
+.devcontainer

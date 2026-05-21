@@ -92,6 +92,15 @@ void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_p
                  exit_ref_ != LUA_NOREF);
 }
 
+void ActiveSensor::PushArgsTable(lua_State* L) const {
+    lua_newtable(L);
+    for (const auto& [key, value] : spec_.args) {
+        lua_pushstring(L, key.c_str());
+        LuaRuntime::PushValues(L, {value});
+        lua_settable(L, -3);
+    }
+}
+
 void ActiveSensor::CallMethod(lua_State* L, int fn_ref, int extra_args) {
     int base = lua_gettop(L) - extra_args + 1;
 
@@ -120,7 +129,8 @@ void ActiveSensor::Activate(Blackboard& bb) {
     next_run_ms_ = 0;
 
     if (enter_ref_ != LUA_NOREF && main_L_) {
-        CallMethod(main_L_, enter_ref_);
+        PushArgsTable(main_L_);
+        CallMethod(main_L_, enter_ref_, 1);
     }
 
     RunOnce(bb);

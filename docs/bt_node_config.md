@@ -408,6 +408,9 @@ Subtree 节点支持 `decorators` 和 `sensors`，与普通节点一致。子树
 | `name` | **是** | string | 传感器名称，同时作为黑板键名（Tick 返回值写入 `bb[name]`） |
 | `path` | **是** | string | Lua 脚本路径 |
 | `interval` | **是** | integer | Tick 间隔（毫秒） |
+| `args` | 否 | object | 传递给 `Enter` 回调的参数对象 |
+
+`args` 值支持类型：`bool`、`int`（int64）、`double`、`string`。
 
 ### 传感器脚本格式
 
@@ -418,8 +421,9 @@ Subtree 节点支持 `decorators` 和 `sensors`，与普通节点一致。子树
 
 local M = {}
 
-function M:Enter()
-  -- 激活时调用一次（同步，不可 yield）
+function M:Enter(args)
+  -- args = JSON 中的 "args" 对象（可选）
+  -- self = 脚本 table，可自由存储状态
   print("sensor activated")
 end
 
@@ -439,7 +443,7 @@ return M
 
 | 回调 | 签名 | 必需 | 可否 yield | 说明 |
 |------|------|------|-----------|------|
-| `Enter` | `self:Enter()` | 否 | 否 | 激活时调用一次 |
+| `Enter` | `self:Enter(args)` | 否 | 否 | 激活时调用一次，args 为 JSON 中的 `"args"` 对象 |
 | `Tick` | `self:Tick()` | **是** | **是** | 按 interval 周期调用，返回值写入黑板 |
 | `Exit` | `self:Exit()` | 否 | 否 | 停用时调用一次 |
 
