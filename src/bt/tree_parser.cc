@@ -11,15 +11,21 @@
 #include "blackboard_condition.h"
 #include "composite.h"
 #include "decorator.h"
+#include "force_failure.h"
 #include "force_success.h"
 #include "inverter.h"
 #include "leaf.h"
 #include "node.h"
 #include "parallel.h"
+#include "random_selector.h"
+#include "random_sequence.h"
+#include "repeat.h"
+#include "retry_until_successful.h"
 #include "script_node.h"
 #include "selector.h"
 #include "sequence.h"
 #include "subtree_node.h"
+#include "wait_node.h"
 
 namespace {
 AbortMode ParseAbortMode(const std::string& s) {
@@ -146,7 +152,8 @@ std::unique_ptr<Node> TreeParser::ParseNode(const nlohmann::json& j, uint32_t& n
     std::string type = j["type"].get<std::string>();
     std::string name = j.value("name", type);
 
-    if (type == "Selector" || type == "Sequence" || type == "Parallel") {
+    if (type == "Selector" || type == "Sequence" || type == "Parallel"
+        || type == "RandomSelector" || type == "RandomSequence") {
         return ParseComposite(j, next_id, subtrees, resolving);
     }
     if (type == "Script") {
@@ -154,6 +161,15 @@ std::unique_ptr<Node> TreeParser::ParseNode(const nlohmann::json& j, uint32_t& n
     }
     if (type == "Subtree") {
         return ParseSubtree(j, next_id, subtrees, resolving);
+    }
+    if (type == "Repeat") {
+        return ParseRepeat(j, next_id, subtrees, resolving);
+    }
+    if (type == "RetryUntilSuccessful") {
+        return ParseRetryUntilSuccessful(j, next_id, subtrees, resolving);
+    }
+    if (type == "Wait") {
+        return ParseWait(j, next_id);
     }
 
     spdlog::error("TreeParser: unknown node type '{}'", type);
@@ -193,6 +209,10 @@ std::unique_ptr<Node> TreeParser::ParseComposite(const nlohmann::json& j, uint32
         node = std::make_unique<Parallel>(id, std::move(name),
                                           ParseParallelPolicy(success_policy),
                                           ParseParallelPolicy(failure_policy));
+    } else if (type == "RandomSelector") {
+        node = std::make_unique<RandomSelector>(id, std::move(name));
+    } else if (type == "RandomSequence") {
+        node = std::make_unique<RandomSequence>(id, std::move(name));
     }
 
     auto* composite = static_cast<Composite*>(node.get());
@@ -274,6 +294,56 @@ std::unique_ptr<Node> TreeParser::ParseSubtree(const nlohmann::json& j, uint32_t
     return node;
 }
 
+std::unique_ptr<Node> TreeParser::ParseRepeat(const nlohmann::json& j, uint32_t& next_id,
+                                               const SubtreeRegistry& subtrees,
+                                               std::set<std::string>& resolving) {
+    auto children = ParseChildren(j, next_id, subtrees, resolving);
+    if (children.empty()) {
+        spdlog::error("TreeParser: Repeat node requires at least one child");
+        return nullptr;
+    }
+
+    std::string name = j.value("name", "Repeat");
+    uint32_t id = next_id++;
+    int count = j.value("count", Repeat::kInfinite);
+
+    auto node = std::make_unique<Repeat>(id, std::move(name), count, std::move(children[0]));
+    ApplyDecorators(j, node.get());
+    ApplySensors(j, node.get());
+    return node;
+}
+
+std::unique_ptr<Node> TreeParser::ParseRetryUntilSuccessful(const nlohmann::json& j, uint32_t& next_id,
+                                                            const SubtreeRegistry& subtrees,
+                                                            std::set<std::string>& resolving) {
+    auto children = ParseChildren(j, next_id, subtrees, resolving);
+    if (children.empty()) {
+        spdlog::error("TreeParser: RetryUntilSuccessful node requires at least one child");
+        return nullptr;
+    }
+
+    std::string name = j.value("name", "RetryUntilSuccessful");
+    uint32_t id = next_id++;
+    int max_attempts = j.value("attempts", RetryUntilSuccessful::kInfinite);
+
+    auto node = std::make_unique<RetryUntilSuccessful>(id, std::move(name), max_attempts,
+                                                        std::move(children[0]));
+    ApplyDecorators(j, node.get());
+    ApplySensors(j, node.get());
+    return node;
+}
+
+std::unique_ptr<Node> TreeParser::ParseWait(const nlohmann::json& j, uint32_t& next_id) {
+    std::string name = j.value("name", "Wait");
+    uint32_t id = next_id++;
+    int ms = j.value("ms", 1000);
+
+    auto node = std::make_unique<WaitNode>(id, std::move(name), ms);
+    ApplyDecorators(j, node.get());
+    ApplySensors(j, node.get());
+    return node;
+}
+
 void TreeParser::ApplyDecorators(const nlohmann::json& j, Node* node) {
     if (!j.contains("decorators") || !j["decorators"].is_array()) return;
 
@@ -302,6 +372,9 @@ void TreeParser::ApplyDecorators(const nlohmann::json& j, Node* node) {
             node->AddDecorator(std::move(dec));
         } else if (dec_type == "ForceSuccess") {
             auto dec = std::make_unique<ForceSuccess>(abort);
+            node->AddDecorator(std::move(dec));
+        } else if (dec_type == "ForceFailure") {
+            auto dec = std::make_unique<ForceFailure>(abort);
             node->AddDecorator(std::move(dec));
         } else {
             spdlog::warn("TreeParser: unknown decorator type '{}'", dec_type);

@@ -15,6 +15,7 @@
 #include "composite.h"
 #include "decorator.h"
 #include "force_success.h"
+#include "force_failure.h"
 #include "inverter.h"
 #include "lua_runtime.h"
 #include "node.h"
@@ -24,6 +25,11 @@
 #include "sequence.h"
 #include "sensor.h"
 #include "subtree_node.h"
+#include "repeat.h"
+#include "retry_until_successful.h"
+#include "random_selector.h"
+#include "random_sequence.h"
+#include "wait_node.h"
 #include "tree_parser.h"
 
 // --- Mock node for testing composites without Lua ---
@@ -1762,4 +1768,430 @@ TEST_F(ScriptNodeIntegrationTest, NoArgsStillWorks) {
         return bt.run('{"root":{"type":"Script","path":"scripts/no_args.lua"}}')
     )");
     EXPECT_EQ(status, "success");
+}
+
+// --- ForceFailure Tests ---
+
+TEST(ForceFailureTest, AlwaysFalse) {
+    Blackboard bb;
+    ForceFailure ff;
+    EXPECT_FALSE(ff.Evaluate(bb));
+}
+
+TEST(TreeParserForceFailureTest, ParseForceFailureDecorator) {
+    const char* json = R"({
+        "root": {
+            "type": "Script",
+            "path": "a.lua",
+            "decorators": [
+                {"type": "ForceFailure", "abort": "Self"}
+            ]
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    ASSERT_EQ(root->decorators().size(), 1u);
+    auto* ff = dynamic_cast<ForceFailure*>(root->decorators()[0].get());
+    ASSERT_NE(ff, nullptr);
+    EXPECT_EQ(ff->abort_mode(), AbortMode::kSelf);
+}
+
+// --- Repeat Tests ---
+
+TEST(RepeatTest, FiniteRepeat) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
+    auto repeat = std::make_unique<Repeat>(1, "rep", 3,
+        std::unique_ptr<MockNode>(child));
+
+    // Tick 1: child succeeds, count=1
+    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kRunning);
+    // Tick 2: child succeeds, count=2
+    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kRunning);
+    // Tick 3: child succeeds, count=3 == max
+    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(RepeatTest, RepeatStopsOnChildFailure) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
+    auto repeat = std::make_unique<Repeat>(1, "rep", 5,
+        std::unique_ptr<MockNode>(child));
+
+    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kRunning);
+    child->set_status(NodeStatus::kFailure);
+    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kFailure);
+}
+
+TEST(RepeatTest, InfiniteRepeatStopsOnFailure) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
+    auto repeat = std::make_unique<Repeat>(1, "rep", Repeat::kInfinite,
+        std::unique_ptr<MockNode>(child));
+
+    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kRunning);
+    child->set_status(NodeStatus::kFailure);
+    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kFailure);
+}
+
+TEST(RepeatTest, ResetClearsState) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
+    auto repeat = std::make_unique<Repeat>(1, "rep", 2,
+        std::unique_ptr<MockNode>(child));
+
+    repeat->Tick(bb, events);  // count=1
+    repeat->Reset();
+    // After reset, should restart from count=0
+    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(RepeatTest, RunningChildReturnsRunning) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kRunning);
+    auto repeat = std::make_unique<Repeat>(1, "rep", 2,
+        std::unique_ptr<MockNode>(child));
+
+    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kRunning);
+}
+
+TEST(RepeatTest, AbortPropagatesToChild) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kRunning);
+    auto repeat = std::make_unique<Repeat>(1, "rep", 2,
+        std::unique_ptr<MockNode>(child));
+
+    repeat->Tick(bb, events);
+    repeat->OnAborted();
+    EXPECT_TRUE(child->aborted);
+}
+
+// --- RetryUntilSuccessful Tests ---
+
+TEST(RetryUntilSuccessfulTest, SucceedsImmediately) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
+    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 3,
+        std::unique_ptr<MockNode>(child));
+
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(RetryUntilSuccessfulTest, RetriesOnFailure) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kFailure);
+    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 3,
+        std::unique_ptr<MockNode>(child));
+
+    // Fail 1
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
+    // Fail 2
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
+    // Fail 3: exceeded max attempts
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kFailure);
+}
+
+TEST(RetryUntilSuccessfulTest, SucceedsAfterRetries) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kFailure);
+    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 3,
+        std::unique_ptr<MockNode>(child));
+
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
+    child->set_status(NodeStatus::kSuccess);
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(RetryUntilSuccessfulTest, InfiniteRetryNeverGivesUp) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kFailure);
+    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry",
+        RetryUntilSuccessful::kInfinite,
+        std::unique_ptr<MockNode>(child));
+
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
+    }
+    child->set_status(NodeStatus::kSuccess);
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(RetryUntilSuccessfulTest, RunningChildReturnsRunning) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kRunning);
+    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 3,
+        std::unique_ptr<MockNode>(child));
+
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
+}
+
+TEST(RetryUntilSuccessfulTest, ResetClearsAttempts) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kFailure);
+    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 2,
+        std::unique_ptr<MockNode>(child));
+
+    retry->Tick(bb, events);  // attempt 1
+    retry->Reset();
+    // After reset, get 2 fresh attempts
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kFailure);
+}
+
+// --- RandomSelector Tests ---
+
+TEST(RandomSelectorTest, AllFail) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto rs = std::make_unique<RandomSelector>(1, "rs");
+    rs->AddChild(std::make_unique<MockNode>(2, "a", NodeStatus::kFailure));
+    rs->AddChild(std::make_unique<MockNode>(3, "b", NodeStatus::kFailure));
+
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kFailure);
+}
+
+TEST(RandomSelectorTest, OneSucceeds) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto rs = std::make_unique<RandomSelector>(1, "rs");
+    rs->AddChild(std::make_unique<MockNode>(2, "a", NodeStatus::kFailure));
+    rs->AddChild(std::make_unique<MockNode>(3, "b", NodeStatus::kSuccess));
+
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(RandomSelectorTest, RunningRemembered) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto rs = std::make_unique<RandomSelector>(1, "rs");
+    rs->AddChild(std::make_unique<MockNode>(2, "a", NodeStatus::kFailure));
+    rs->AddChild(std::make_unique<MockNode>(3, "b", NodeStatus::kRunning));
+
+    // First child fails, second is running
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kRunning);
+}
+
+// --- RandomSequence Tests ---
+
+TEST(RandomSequenceTest, AllSucceed) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto rs = std::make_unique<RandomSequence>(1, "rs");
+    rs->AddChild(std::make_unique<MockNode>(2, "a", NodeStatus::kSuccess));
+    rs->AddChild(std::make_unique<MockNode>(3, "b", NodeStatus::kSuccess));
+
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(RandomSequenceTest, OneFails) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto rs = std::make_unique<RandomSequence>(1, "rs");
+    rs->AddChild(std::make_unique<MockNode>(2, "a", NodeStatus::kFailure));
+    rs->AddChild(std::make_unique<MockNode>(3, "b", NodeStatus::kSuccess));
+
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kFailure);
+}
+
+TEST(RandomSequenceTest, RunningRemembered) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto rs = std::make_unique<RandomSequence>(1, "rs");
+    rs->AddChild(std::make_unique<MockNode>(2, "a", NodeStatus::kSuccess));
+    rs->AddChild(std::make_unique<MockNode>(3, "b", NodeStatus::kRunning));
+
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kRunning);
+}
+
+// --- WaitNode Tests ---
+
+TEST(WaitNodeTest, ZeroMsSucceedsImmediately) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto wait = std::make_unique<WaitNode>(1, "wait", 0);
+    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(WaitNodeTest, ReturnsRunningBeforeTimeout) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto wait = std::make_unique<WaitNode>(1, "wait", 1000);
+
+    // First tick starts the timer
+    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
+    // Second tick: not enough time has passed
+    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
+}
+
+TEST(WaitNodeTest, CompletesAfterMs) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto wait = std::make_unique<WaitNode>(1, "wait", 50);
+
+    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(WaitNodeTest, ResetRestartsTimer) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto wait = std::make_unique<WaitNode>(1, "wait", 50);
+
+    wait->Tick(bb, events);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    // Timer expired but haven't ticked yet
+    wait->Reset();
+
+    // After reset, timer starts fresh
+    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
+}
+
+// --- TreeParser new node type tests ---
+
+TEST(TreeParserRepeatTest, ParseRepeat) {
+    const char* json = R"({
+        "root": {
+            "type": "Repeat",
+            "count": 3,
+            "children": [
+                {"type": "Script", "path": "a.lua"}
+            ]
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->type(), "Repeat");
+}
+
+TEST(TreeParserRepeatTest, ParseRepeatNoChildren) {
+    const char* json = R"({
+        "root": {
+            "type": "Repeat",
+            "count": 3
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    EXPECT_EQ(root, nullptr);
+}
+
+TEST(TreeParserRepeatTest, ParseRepeatInfinite) {
+    const char* json = R"({
+        "root": {
+            "type": "Repeat",
+            "count": -1,
+            "children": [
+                {"type": "Script", "path": "a.lua"}
+            ]
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->type(), "Repeat");
+}
+
+TEST(TreeParserRetryTest, ParseRetryUntilSuccessful) {
+    const char* json = R"({
+        "root": {
+            "type": "RetryUntilSuccessful",
+            "attempts": 5,
+            "children": [
+                {"type": "Script", "path": "a.lua"}
+            ]
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->type(), "RetryUntilSuccessful");
+}
+
+TEST(TreeParserRetryTest, ParseRetryNoChildren) {
+    const char* json = R"({
+        "root": {
+            "type": "RetryUntilSuccessful",
+            "attempts": 3
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    EXPECT_EQ(root, nullptr);
+}
+
+TEST(TreeParserRandomTest, ParseRandomSelector) {
+    const char* json = R"({
+        "root": {
+            "type": "RandomSelector",
+            "children": [
+                {"type": "Script", "path": "a.lua"},
+                {"type": "Script", "path": "b.lua"}
+            ]
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->type(), "RandomSelector");
+    auto* sel = dynamic_cast<Composite*>(root.get());
+    ASSERT_NE(sel, nullptr);
+    EXPECT_EQ(sel->children().size(), 2u);
+}
+
+TEST(TreeParserRandomTest, ParseRandomSequence) {
+    const char* json = R"({
+        "root": {
+            "type": "RandomSequence",
+            "children": [
+                {"type": "Script", "path": "a.lua"},
+                {"type": "Script", "path": "b.lua"}
+            ]
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->type(), "RandomSequence");
+    auto* seq = dynamic_cast<Composite*>(root.get());
+    ASSERT_NE(seq, nullptr);
+    EXPECT_EQ(seq->children().size(), 2u);
+}
+
+TEST(TreeParserWaitTest, ParseWait) {
+    const char* json = R"({
+        "root": {
+            "type": "Wait",
+            "ms": 500
+        }
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->type(), "Wait");
+}
+
+TEST(TreeParserWaitTest, ParseWaitDefault) {
+    const char* json = R"({
+        "root": {"type": "Wait"}
+    })";
+
+    auto root = TreeParser::Parse(json);
+    ASSERT_NE(root, nullptr);
+    EXPECT_EQ(root->type(), "Wait");
 }

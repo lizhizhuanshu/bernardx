@@ -34,6 +34,13 @@ private:
     static std::unique_ptr<Node> ParseSubtree(const nlohmann::json& j, uint32_t& next_id,
                                               const SubtreeRegistry& subtrees,
                                               std::set<std::string>& resolving);
+    static std::unique_ptr<Node> ParseRepeat(const nlohmann::json& j, uint32_t& next_id,
+                                             const SubtreeRegistry& subtrees,
+                                             std::set<std::string>& resolving);
+    static std::unique_ptr<Node> ParseRetryUntilSuccessful(const nlohmann::json& j, uint32_t& next_id,
+                                                           const SubtreeRegistry& subtrees,
+                                                           std::set<std::string>& resolving);
+    static std::unique_ptr<Node> ParseWait(const nlohmann::json& j, uint32_t& next_id);
     static void ApplyDecorators(const nlohmann::json& j, Node* node);
     static void ApplySensors(const nlohmann::json& j, Node* node);
 };

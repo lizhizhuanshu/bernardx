@@ -613,8 +613,128 @@ trees/ai_main/
 | `Selector` | 复合 | `type` | `children` | OR 逻辑，任一成功即成功 |
 | `Sequence` | 复合 | `type` | `children` | AND 逻辑，全部成功才成功 |
 | `Parallel` | 复合 | `type` | `children` | 并行执行，策略控制结果 |
+| `RandomSelector` | 复合 | `type` | `children` | 随机顺序 OR 逻辑 |
+| `RandomSequence` | 复合 | `type` | `children` | 随机顺序 AND 逻辑 |
 | `Script` | 叶子 | `type`, `path` | 无 | 执行 Lua 脚本，支持 `args` 传参 |
 | `Subtree` | 叶子 | `type`, `subtree` | 无 | 引用 subtrees 中定义的子树 |
+| `Wait` | 叶子 | `type` | 无 | 等待指定毫秒数 |
+| `Repeat` | 包装 | `type` | `children[0]` | 重复执行子节点 |
+| `RetryUntilSuccessful` | 包装 | `type` | `children[0]` | 失败时重试子节点 |
 | `BlackboardCondition` | 装饰器 | `type`, `key` | N/A | 黑板条件判断 |
 | `Inverter` | 装饰器 | `type` | N/A | 反转结果 |
 | `ForceSuccess` | 装饰器 | `type` | N/A | 强制成功 |
+| `ForceFailure` | 装饰器 | `type` | N/A | 强制失败 |
+
+### ForceFailure - 强制失败装饰器
+
+无论被装饰节点结果如何，始终返回失败。
+
+```json
+{"type": "ForceFailure"}
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `abort` | 否 | 中断模式，默认 `"None"` |
+
+---
+
+## 5b. 包装节点 (Wrapper)
+
+包装单个子节点，修改其执行行为。通过 `"children"` 数组配置（仅取第一个子节点）。
+
+### Repeat - 重复节点
+
+重复执行子节点，直到达到指定次数或子节点失败。
+
+```json
+{
+  "type": "Repeat",
+  "count": 3,
+  "children": [
+    {"type": "Script", "path": "a.lua"}
+  ]
+}
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `count` | 否 | 重复次数，`-1` 表示无限重复（默认 `-1`） |
+| `children` | **是** | 子节点数组（仅使用第一个） |
+
+**行为：**
+- **有限次数**：子节点每成功一次计数 +1，达到 count 返回 Success；子节点失败则立即返回 Failure
+- **无限重复**（`count: -1`）：子节点成功后重置并继续，子节点失败才返回 Failure
+- 子节点 Running 时返回 Running
+
+### RetryUntilSuccessful - 重试节点
+
+子节点失败时自动重试，直到成功或达到最大尝试次数。
+
+```json
+{
+  "type": "RetryUntilSuccessful",
+  "attempts": 5,
+  "children": [
+    {"type": "Script", "path": "retry_action.lua"}
+  ]
+}
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `attempts` | 否 | 最大尝试次数，`-1` 表示无限重试（默认 `-1`） |
+| `children` | **是** | 子节点数组（仅使用第一个） |
+
+**行为：** 子节点成功则立即返回 Success；失败时重置子节点并重试，超过最大次数返回 Failure。子节点 Running 时返回 Running。
+
+### Wait - 等待节点
+
+等待指定时间后返回成功。
+
+```json
+{
+  "type": "Wait",
+  "ms": 500
+}
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `ms` | 否 | 等待时间（毫秒），默认 `1000` |
+
+**行为：** 首次 tick 记录起始时间，在等待时间到达前持续返回 Running，时间到达后返回 Success。
+
+---
+
+## 1b. 随机复合节点
+
+与 Selector/Sequence 行为相同，但每次执行前随机打乱子节点顺序，使 AI 行为更加多样化。
+
+### RandomSelector - 随机选择节点
+
+```json
+{
+  "type": "RandomSelector",
+  "children": [
+    {"type": "Script", "path": "a.lua"},
+    {"type": "Script", "path": "b.lua"}
+  ]
+}
+```
+
+**行为：** 与 Selector 相同（OR 逻辑），但每次 Reset 后重新随机排列子节点执行顺序。
+
+### RandomSequence - 随机顺序节点
+
+```json
+{
+  "type": "RandomSequence",
+  "children": [
+    {"type": "Script", "path": "a.lua"},
+    {"type": "Script", "path": "b.lua"}
+  ]
+}
+```
+
+**行为：** 与 Sequence 相同（AND 逻辑），但每次 Reset 后重新随机排列子节点执行顺序。
