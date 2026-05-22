@@ -990,6 +990,20 @@ LuaRuntime::Builder& LuaRuntime::Builder::RegisterLibrary(std::shared_ptr<LuaLib
     return *this;
 }
 
+LuaRuntime::Builder& LuaRuntime::Builder::InheritFrom(LuaRuntime* parent) {
+    if (!parent) return *this;
+    for (auto& [name, openf] : parent->c_modules_) {
+        c_modules_[name] = openf;
+    }
+    for (auto& [name, lib] : parent->libraries_) {
+        libraries_[name] = lib;  // shared_ptr copy — shared ownership
+    }
+    for (auto& ext : parent->extensions_) {
+        extensions_.push_back(ext);  // shared ownership
+    }
+    return *this;
+}
+
 LuaRuntime::Ptr LuaRuntime::Builder::Create() {
     auto rt = std::shared_ptr<LuaRuntime>(new LuaRuntime());
 

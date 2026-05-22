@@ -48,6 +48,12 @@ public:
     void StartLoop(std::shared_ptr<CodeProvider> code_provider,
                    int64_t tick_interval_ms,
                    CompletionCallback on_complete);
+
+    // StartLoop with inherited libraries from the parent LuaRuntime
+    void StartLoop(std::shared_ptr<CodeProvider> code_provider,
+                   int64_t tick_interval_ms,
+                   CompletionCallback on_complete,
+                   LuaRuntime* parent_runtime);
     void StopLoop();
     bool IsLoopRunning() const { return loop_running_.load(); }
 

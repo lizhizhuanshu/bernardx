@@ -16,6 +16,8 @@ public:
     void Reset() override;
     void OnAborted() override;
 
+    Node* child() const { return child_.get(); }
+
 private:
     std::unique_ptr<Node> child_;
     int max_attempts_;

@@ -8,6 +8,8 @@
 #include "composite.h"
 #include "file_system_code_provider.h"
 #include "lua_runtime.h"
+#include "repeat.h"
+#include "retry_until_successful.h"
 #include "script_node.h"
 #include "tree_parser.h"
 
@@ -102,6 +104,16 @@ async_simple::coro::Lazy<void> BehaviorTreeEngine::InitScriptNodesRecursiveAsync
             co_await InitScriptNodesRecursiveAsync(child.get(), L, ctx);
         }
     }
+    // Handle wrapper nodes (Repeat, RetryUntilSuccessful)
+    if (auto* repeat = dynamic_cast<Repeat*>(node)) {
+        if (repeat->child()) {
+            co_await InitScriptNodesRecursiveAsync(repeat->child(), L, ctx);
+        }
+    } else if (auto* retry = dynamic_cast<RetryUntilSuccessful*>(node)) {
+        if (retry->child()) {
+            co_await InitScriptNodesRecursiveAsync(retry->child(), L, ctx);
+        }
+    }
 }
 
 void BehaviorTreeEngine::ReleaseScriptNodeRefsRecursive(Node* node) {
@@ -112,6 +124,11 @@ void BehaviorTreeEngine::ReleaseScriptNodeRefsRecursive(Node* node) {
         for (auto& child : composite->children()) {
             ReleaseScriptNodeRefsRecursive(child.get());
         }
+    }
+    if (auto* repeat = dynamic_cast<Repeat*>(node)) {
+        if (repeat->child()) ReleaseScriptNodeRefsRecursive(repeat->child());
+    } else if (auto* retry = dynamic_cast<RetryUntilSuccessful*>(node)) {
+        if (retry->child()) ReleaseScriptNodeRefsRecursive(retry->child());
     }
 }
 
@@ -364,9 +381,21 @@ void BehaviorTreeEngine::DeactivateAllSensors() {
 void BehaviorTreeEngine::StartLoop(std::shared_ptr<CodeProvider> code_provider,
                                     int64_t tick_interval_ms,
                                     CompletionCallback on_complete) {
-    bt_context_ = LuaRuntime::Builder()
-        .WithCodeProvider(std::move(code_provider))
-        .Create();
+    StartLoop(std::move(code_provider), tick_interval_ms, std::move(on_complete), nullptr);
+}
+
+void BehaviorTreeEngine::StartLoop(std::shared_ptr<CodeProvider> code_provider,
+                                    int64_t tick_interval_ms,
+                                    CompletionCallback on_complete,
+                                    LuaRuntime* parent_runtime) {
+    auto builder = LuaRuntime::Builder()
+        .WithCodeProvider(std::move(code_provider));
+
+    if (parent_runtime) {
+        builder.InheritFrom(parent_runtime);
+    }
+
+    bt_context_ = builder.Create();
 
     {
         std::lock_guard lock(tick_loop_mu_);

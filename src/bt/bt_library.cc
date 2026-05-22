@@ -33,8 +33,18 @@ LuaValue PopLuaValue(lua_State* L, int idx) {
         size_t len;
         const char* s = lua_tolstring(L, idx, &len);
         return LuaValue(std::string(s, len));
+    } else {
+        // Tables, functions, userdata, threads — store as registry ref
+        int abs_idx = lua_absindex(L, idx);
+        lua_pushvalue(L, abs_idx);
+        int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        auto rt = LuaRuntime::FromLuaState(L);
+        if (rt) {
+            return LuaValue(rt->CreateRef(ref, t));
+        }
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        return LuaValue(nullptr);
     }
-    return LuaValue(nullptr);
 }
 
 void PushLuaValue(lua_State* L, const LuaValue& v) {
@@ -128,7 +138,8 @@ int bt_run(lua_State* L) {
             std::vector<LuaValue> args;
             args.push_back(LuaValue(status));
             rt_ctx->PushResume(handle, std::move(args));
-        });
+        },
+        rt_ctx.get());
 
     return lua_yield(L, 0);
 }

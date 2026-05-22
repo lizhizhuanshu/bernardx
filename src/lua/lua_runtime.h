@@ -152,6 +152,7 @@ public:
         Builder& Register(const std::string& name, lua_CFunction openf);
         Builder& RegisterExtension(std::shared_ptr<LuaExtension> extension);
         Builder& RegisterLibrary(std::shared_ptr<LuaLibrary> library);
+        Builder& InheritFrom(LuaRuntime* parent);
         Ptr Create();
 
     private:
