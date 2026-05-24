@@ -19,7 +19,8 @@ int64_t BehaviorTreeEngine::NowMs() {
         .count();
 }
 
-BehaviorTreeEngine::BehaviorTreeEngine() = default;
+BehaviorTreeEngine::BehaviorTreeEngine(std::shared_ptr<Blackboard> bb)
+    : blackboard_(bb ? std::move(bb) : std::make_shared<Blackboard>()) {}
 
 BehaviorTreeEngine::~BehaviorTreeEngine() {
     Stop();
@@ -33,7 +34,7 @@ bool BehaviorTreeEngine::Load(const std::string& json) {
         return false;
     }
     root_ = std::move(tree);
-    blackboard_.Clear();
+    blackboard_->Clear();
     event_queue_.Drain();
     return true;
 }
@@ -144,7 +145,7 @@ NodeStatus BehaviorTreeEngine::TickOnce() {
         return NodeStatus::kRunning;
     }
 
-    auto status = root_->Tick(blackboard_, event_queue_);
+    auto status = root_->Tick(*blackboard_, event_queue_);
     UpdateActiveSensors();
 
     if (status != NodeStatus::kRunning) {
@@ -156,7 +157,7 @@ NodeStatus BehaviorTreeEngine::TickOnce() {
 
 bool BehaviorTreeEngine::EvaluateDecorators(Node* node) {
     for (auto& dec : node->decorators()) {
-        bool now = dec->Evaluate(blackboard_);
+        bool now = dec->Evaluate(*blackboard_);
         bool was = false;
         auto it = node->prev_decorator_results_.find(dec.get());
         if (it != node->prev_decorator_results_.end()) {
@@ -298,7 +299,7 @@ void BehaviorTreeEngine::TickSensors() {
     int64_t now = NowMs();
     for (auto& [name, sensor] : active_sensors_) {
         if (sensor->TickReady(now)) {
-            sensor->RunOnce(blackboard_);
+            sensor->RunOnce(*blackboard_);
             sensor->ScheduleNext(now);
         }
     }
@@ -340,7 +341,7 @@ void BehaviorTreeEngine::ActivateNodeSensors(Node* node) {
     for (auto& spec : node->sensor_specs()) {
         auto it = active_sensors_.find(spec.name);
         if (it != active_sensors_.end() && !it->second->is_active()) {
-            it->second->Activate(blackboard_);
+            it->second->Activate(*blackboard_);
         }
     }
 }
@@ -364,14 +365,14 @@ void BehaviorTreeEngine::DeactivateNodeSensors(Node* node, const std::set<Node*>
 
         auto it = active_sensors_.find(spec.name);
         if (it != active_sensors_.end() && it->second->is_active()) {
-            it->second->Deactivate(&blackboard_);
+            it->second->Deactivate(blackboard_.get());
         }
     }
 }
 
 void BehaviorTreeEngine::DeactivateAllSensors() {
     for (auto& [name, sensor] : active_sensors_) {
-        sensor->Deactivate(&blackboard_);
+        sensor->Deactivate(blackboard_.get());
     }
     prev_sensor_nodes_.clear();
 }

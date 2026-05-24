@@ -6,6 +6,7 @@
 |------|---------|------|
 | 全局内建 | 无需 require | `now` / `sleep` / `setTimeout` / `clearTimeout` / `await` |
 | `http` | `require('http')` | HTTP 客户端 + WebSocket |
+| `blackboard` | `require('blackboard')` | 黑板键值存储（线程安全） |
 | `bt` | `require('bt')` | 行为树（见 [bt_node_config.md](bt_node_config.md)） |
 
 ---
@@ -374,7 +375,43 @@ end
 
 ---
 
-## 4. bt 模块
+## 4. blackboard 模块
+
+黑板键值存储，线程安全。行为树节点、传感器和 Lua 脚本通过同一个黑板实例共享数据。
+
+```lua
+local bb = require('blackboard')
+```
+
+| 函数 | 说明 |
+|------|------|
+| `bb.set(key, value)` | 设置值 |
+| `bb.get(key)` | 获取值，不存在返回 `nil` |
+| `bb.has(key)` | 检查键是否存在，返回 `boolean` |
+| `bb.remove(key)` | 删除键 |
+| `bb.clear()` | 清空所有键值 |
+| `bb.to_table()` | 返回整个黑板为 table |
+
+**示例：**
+
+```lua
+local bb = require('blackboard')
+
+bb.set("hp", 100)
+bb.set("name", "hero")
+bb.set("alive", true)
+
+local hp = bb.get("hp")       -- 100
+local missing = bb.get("x")   -- nil
+local has_name = bb.has("name") -- true
+
+bb.remove("alive")
+bb.clear()
+```
+
+---
+
+## 5. bt 模块
 
 行为树模块，详见 [bt_node_config.md](bt_node_config.md)。
 
@@ -389,9 +426,6 @@ local bt = require('bt')
 | `bt.stop()` | 停止行为树 |
 | `bt.pause()` | 暂停行为树 |
 | `bt.resume()` | 恢复行为树 |
-| `bt.set(key, value)` | 设置黑板值 |
-| `bt.get(key)` | 获取黑板值 |
-| `bt.get_blackboard()` | 返回整个黑板为 table |
 | `bt.notify(event, data)` | 发送事件到事件队列 |
 | `bt.get_status()` | 获取状态 (`"running"` / `"paused"` / `"stopped"`) |
 | `bt.get_current_node()` | 获取当前执行的节点名称 |

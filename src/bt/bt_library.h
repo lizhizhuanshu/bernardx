@@ -7,9 +7,11 @@
 #include "lua_runtime.h"
 #include "lua_library.h"
 
+class Blackboard;
+
 class BehaviorTreeLibrary : public LuaLibrary {
 public:
-    BehaviorTreeLibrary();
+    explicit BehaviorTreeLibrary(std::shared_ptr<Blackboard> bb);
     ~BehaviorTreeLibrary() override;
 
     BehaviorTreeLibrary(const BehaviorTreeLibrary&) = delete;

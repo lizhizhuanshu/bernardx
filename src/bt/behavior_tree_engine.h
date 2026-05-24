@@ -25,7 +25,7 @@ class BehaviorTreeEngine : public std::enable_shared_from_this<BehaviorTreeEngin
 public:
     using Ptr = std::shared_ptr<BehaviorTreeEngine>;
 
-    BehaviorTreeEngine();
+    explicit BehaviorTreeEngine(std::shared_ptr<Blackboard> bb = {});
     ~BehaviorTreeEngine();
 
     // Non-copyable
@@ -64,7 +64,7 @@ public:
     std::string GetCurrentNode() const;
 
     // Blackboard access (thread-safe)
-    Blackboard& blackboard() { return blackboard_; }
+    Blackboard& blackboard() { return *blackboard_; }
 
     // Event injection (thread-safe)
     void Notify(const std::string& event_name, LuaValue data);
@@ -110,7 +110,7 @@ private:
     static int64_t NowMs();
 
     std::unique_ptr<Node> root_;
-    Blackboard blackboard_;
+    std::shared_ptr<Blackboard> blackboard_;
     BtEventQueue event_queue_;
     std::string project_path_;
 

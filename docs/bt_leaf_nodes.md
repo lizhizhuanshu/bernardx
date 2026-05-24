@@ -95,16 +95,16 @@ return M
 
 ### 黑板访问
 
-通过 `bt.get` / `bt.set` 读写黑板：
+通过 `blackboard` 模块读写黑板：
 
 ```lua
-local bt = require('bt')
+local bb = require('blackboard')
 
 local M = {}
 function M:Tick()
-  local hp = bt.get("hp")
+  local hp = bb.get("hp")
   if hp and hp > 50 then
-    bt.set("last_attack_time", os.time())
+    bb.set("last_attack_time", os.time())
     return "success"
   end
   return "failure"
@@ -140,7 +140,7 @@ function M:Tick()
     return "failure"
   end
 
-  bt.set("target", body)
+  bb.set("target", body)
   return "success"
 end
 return M

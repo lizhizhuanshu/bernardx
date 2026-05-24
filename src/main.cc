@@ -11,8 +11,10 @@
 #include "bt_library.h"
 #include "http_library.h"
 #include "json_library.h"
+#include "blackboard_library.h"
 #include "file_system_code_provider.h"
 #include "lua_runtime.h"
+#include "blackboard.h"
 
 DEFINE_string(dir, ".", "Working directory containing src/ and libs/");
 DEFINE_string(entry, "", "Entry Lua file relative to --dir (default: src/main.lua)");
@@ -27,7 +29,9 @@ int main(int argc, char* argv[]) {
     }
 
     auto code_provider = std::make_shared<FileSystemCodeProvider>(dir);
-    auto bt_lib = std::make_shared<BehaviorTreeLibrary>();
+    auto blackboard = std::make_shared<Blackboard>();
+    auto bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
+    auto bt_lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
     bt_lib->SetMainLibsPath(std::filesystem::absolute(dir).string() + "/libs");
     auto http_lib = std::make_shared<HttpLibrary>();
     auto json_lib = std::make_shared<JsonLibrary>();
@@ -36,6 +40,7 @@ int main(int argc, char* argv[]) {
     auto rt = LuaRuntime::Builder()
                   .WithCodeProvider(code_provider)
                   .WithExecutor(executor)
+                  .RegisterLibrary(bb_lib)
                   .RegisterLibrary(bt_lib)
                   .RegisterLibrary(http_lib)
                   .RegisterLibrary(json_lib)

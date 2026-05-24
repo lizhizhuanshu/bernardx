@@ -70,7 +70,7 @@ return M
 | `Tick` | `self:Tick()` | **是** | **是** | 按 interval 周期调用，返回值写入黑板 |
 | `Exit` | `self:Exit()` | 否 | 否 | 停用时调用一次 |
 
-`self` 是脚本返回的 table，可自由存储跨 tick 的状态。黑板通过 `bt.get`/`bt.set` 访问。
+`self` 是脚本返回的 table，可自由存储跨 tick 的状态。黑板通过 `blackboard` 模块（`bb.get`/`bb.set`）访问。
 
 ---
 

@@ -12,6 +12,7 @@
 #include "blackboard_condition.h"
 #include "bt_event_queue.h"
 #include "bt_library.h"
+#include "blackboard_library.h"
 #include "composite.h"
 #include "decorator.h"
 #include "force_success.h"
@@ -796,8 +797,11 @@ TEST_F(BehaviorTreeEngineTest, EventQueue) {
 class BehaviorTreeLibraryTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        lib = std::make_shared<BehaviorTreeLibrary>();
+        blackboard = std::make_shared<Blackboard>();
+        bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
+        lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
         rt = LuaRuntime::Builder()
+            .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
             .Create();
     }
@@ -809,6 +813,8 @@ protected:
         }
     }
 
+    std::shared_ptr<Blackboard> blackboard;
+    std::shared_ptr<BlackboardLibrary> bb_lib;
     std::shared_ptr<BehaviorTreeLibrary> lib;
     LuaRuntime::Ptr rt;
 };
@@ -831,9 +837,6 @@ TEST_F(BehaviorTreeLibraryTest, HasAllFunctions) {
             and type(bt.pause) == 'function'
             and type(bt.resume) == 'function'
             and type(bt.stop) == 'function'
-            and type(bt.set) == 'function'
-            and type(bt.get) == 'function'
-            and type(bt.get_blackboard) == 'function'
             and type(bt.notify) == 'function'
             and type(bt.get_status) == 'function'
             and type(bt.get_current_node) == 'function'
@@ -870,11 +873,11 @@ TEST_F(BehaviorTreeLibraryTest, RunInvalidJson) {
 
 TEST_F(BehaviorTreeLibraryTest, SetAndGetBlackboard) {
     auto r = AWAIT_BT(rt->RunScript(R"(
-        local bt = require('bt')
-        bt.set("hp", 100)
-        bt.set("name", "hero")
-        bt.set("alive", true)
-        return bt.get("hp"), bt.get("name"), bt.get("alive"), bt.get("missing")
+        local bb = require('blackboard')
+        bb.set("hp", 100)
+        bb.set("name", "hero")
+        bb.set("alive", true)
+        return bb.get("hp"), bb.get("name"), bb.get("alive"), bb.get("missing")
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_EQ(std::get<int64_t>(r.values[0]), 100);
@@ -885,11 +888,11 @@ TEST_F(BehaviorTreeLibraryTest, SetAndGetBlackboard) {
 
 TEST_F(BehaviorTreeLibraryTest, GetBlackboardAsTable) {
     auto r = AWAIT_BT(rt->RunScript(R"(
-        local bt = require('bt')
-        bt.set("a", 1)
-        bt.set("b", "hello")
-        local bb = bt.get_blackboard()
-        return bb.a, bb.b
+        local bb = require('blackboard')
+        bb.set("a", 1)
+        bb.set("b", "hello")
+        local t = bb.to_table()
+        return t.a, t.b
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_EQ(std::get<int64_t>(r.values[0]), 1);
@@ -1682,8 +1685,11 @@ TEST(TreeParserArgsTest, ParseScriptNodeWithFloatArg) {
 class ScriptNodeIntegrationTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        lib = std::make_shared<BehaviorTreeLibrary>();
+        blackboard = std::make_shared<Blackboard>();
+        bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
+        lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
         rt = LuaRuntime::Builder()
+            .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
             .Create();
 
@@ -1705,6 +1711,8 @@ protected:
         return std::get<std::string>(r.values[0]);
     }
 
+    std::shared_ptr<Blackboard> blackboard;
+    std::shared_ptr<BlackboardLibrary> bb_lib;
     std::shared_ptr<BehaviorTreeLibrary> lib;
     LuaRuntime::Ptr rt;
     std::string tests_dir_;

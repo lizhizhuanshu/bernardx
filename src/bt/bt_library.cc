@@ -10,46 +10,13 @@ extern "C" {
 #include <spdlog/spdlog.h>
 #include <sol/sol.hpp>
 
-#include "blackboard.h"
 #include "file_system_code_provider.h"
 #include "lua_runtime.h"
+#include "lua_value_utils.h"
 #include "tree_parser.h"
 #include "types.h"
 
 namespace {
-
-LuaValue PopLuaValue(lua_State* L, int idx) {
-    int t = lua_type(L, idx);
-    if (t == LUA_TNIL) {
-        return LuaValue(nullptr);
-    } else if (t == LUA_TBOOLEAN) {
-        return LuaValue(static_cast<bool>(lua_toboolean(L, idx)));
-    } else if (t == LUA_TNUMBER) {
-        if (lua_isinteger(L, idx)) {
-            return LuaValue(static_cast<int64_t>(lua_tointeger(L, idx)));
-        }
-        return LuaValue(lua_tonumber(L, idx));
-    } else if (t == LUA_TSTRING) {
-        size_t len;
-        const char* s = lua_tolstring(L, idx, &len);
-        return LuaValue(std::string(s, len));
-    } else {
-        // Tables, functions, userdata, threads — store as registry ref
-        int abs_idx = lua_absindex(L, idx);
-        lua_pushvalue(L, abs_idx);
-        int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-        auto rt = LuaRuntime::FromLuaState(L);
-        if (rt) {
-            return LuaValue(rt->CreateRef(ref, t));
-        }
-        luaL_unref(L, LUA_REGISTRYINDEX, ref);
-        return LuaValue(nullptr);
-    }
-}
-
-void PushLuaValue(lua_State* L, const LuaValue& v) {
-    LuaRuntime::PushValues(L, {v});
-}
 
 BehaviorTreeEngine* GetEngine(lua_State* L) {
     return static_cast<BehaviorTreeEngine*>(lua_touserdata(L, lua_upvalueindex(1)));
@@ -163,31 +130,6 @@ int bt_stop(lua_State* L) {
     return 0;
 }
 
-int bt_set(lua_State* L) {
-    auto* engine = GetEngine(L);
-    const char* key = luaL_checkstring(L, 1);
-    auto value = PopLuaValue(L, 2);
-    engine->blackboard().Set(key, std::move(value));
-    return 0;
-}
-
-int bt_get(lua_State* L) {
-    auto* engine = GetEngine(L);
-    const char* key = luaL_checkstring(L, 1);
-    auto value = engine->blackboard().Get(key);
-    if (value.has_value()) {
-        PushLuaValue(L, *value);
-    } else {
-        lua_pushnil(L);
-    }
-    return 1;
-}
-
-int bt_get_blackboard(lua_State* L) {
-    GetEngine(L)->blackboard().PushAsTable(L);
-    return 1;
-}
-
 int bt_notify(lua_State* L) {
     auto* engine = GetEngine(L);
     const char* name = luaL_checkstring(L, 1);
@@ -217,8 +159,8 @@ int bt_set_project_path(lua_State* L) {
 
 }  // namespace
 
-BehaviorTreeLibrary::BehaviorTreeLibrary()
-    : engine_(std::make_shared<BehaviorTreeEngine>()) {}
+BehaviorTreeLibrary::BehaviorTreeLibrary(std::shared_ptr<Blackboard> bb)
+    : engine_(std::make_shared<BehaviorTreeEngine>(std::move(bb))) {}
 
 BehaviorTreeLibrary::~BehaviorTreeLibrary() {
     engine_->StopLoop();
@@ -235,9 +177,6 @@ void BehaviorTreeLibrary::Open(lua_State* L) {
         {"pause", bt_pause},
         {"resume", bt_resume},
         {"stop", bt_stop},
-        {"set", bt_set},
-        {"get", bt_get},
-        {"get_blackboard", bt_get_blackboard},
         {"notify", bt_notify},
         {"get_status", bt_get_status},
         {"get_current_node", bt_get_current_node},
