@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bt_utils.h"
 #include "composite.h"
 
 class RandomSelector : public Composite {
@@ -10,7 +11,5 @@ public:
     void Reset() override;
 
 private:
-    void ShuffleIndices();
-    std::vector<size_t> order_;
-    bool shuffled_ = false;
+    ShuffledIndexTracker shuffled_tracker_;
 };

@@ -155,12 +155,6 @@ int bt_get_status(lua_State* L) {
     return 1;
 }
 
-int bt_get_current_node(lua_State* L) {
-    auto node = GetEngine(L)->GetCurrentNode();
-    lua_pushstring(L, node.c_str());
-    return 1;
-}
-
 int bt_set_project_path(lua_State* L) {
     auto* lib = GetLibrary(L);
     const char* path = luaL_checkstring(L, 1);
@@ -190,7 +184,6 @@ void BehaviorTreeLibrary::Open(lua_State* L) {
         {"stop", bt_stop},
         {"notify", bt_notify},
         {"get_status", bt_get_status},
-        {"get_current_node", bt_get_current_node},
         {"set_project_path", bt_set_project_path},
         {nullptr, nullptr}
     };

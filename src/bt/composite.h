@@ -19,7 +19,7 @@ public:
 
     const std::vector<std::unique_ptr<Node>>& children() const { return children_; }
 
-    bool is_mid_sequence() const { return current_child_index_ > 0; }
+    bool has_started() const { return current_child_index_ > 0; }
     size_t current_child_index() const { return current_child_index_; }
 
     void Reset() override;

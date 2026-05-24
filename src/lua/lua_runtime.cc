@@ -7,6 +7,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include "lua_value_utils.h"
+#include "time_utils.h"
+
 namespace {
 template <class... Ts>
 struct overloaded : Ts... {
@@ -14,12 +17,6 @@ struct overloaded : Ts... {
 };
 template <class... Ts>
 overloaded(Ts...) -> overloaded<Ts...>;
-
-int64_t NowMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
 
 async_simple::coro::Lazy<void> ResumeModuleLoad(
     std::shared_ptr<LuaRuntime> rt,
@@ -694,27 +691,7 @@ std::vector<LuaValue> LuaRuntime::PeekValues(lua_State* L, int nresults) {
     std::vector<LuaValue> result;
     result.reserve(nresults);
     for (int i = -nresults; i < 0; ++i) {
-        int t = lua_type(L, i);
-        if (t == LUA_TNIL) {
-            result.push_back(nullptr);
-        } else if (t == LUA_TBOOLEAN) {
-            result.push_back(static_cast<bool>(lua_toboolean(L, i)));
-        } else if (t == LUA_TNUMBER) {
-            if (lua_isinteger(L, i)) {
-                result.push_back(static_cast<int64_t>(lua_tointeger(L, i)));
-            } else {
-                result.push_back(static_cast<double>(lua_tonumber(L, i)));
-            }
-        } else if (t == LUA_TSTRING) {
-            size_t len;
-            const char* s = lua_tolstring(L, i, &len);
-            result.push_back(std::string(s, len));
-        } else {
-            lua_pushvalue(L, i);
-            int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-            auto rt = FromLuaState(L);
-            result.push_back(rt->CreateRef(ref, t));
-        }
+        result.push_back(LuaValueFromStack(L, i));
     }
     return result;
 }

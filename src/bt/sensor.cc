@@ -14,16 +14,10 @@ ActiveSensor::~ActiveSensor() {
 
 void ActiveSensor::ReleaseRefs() {
     if (!main_L_) return;
-    auto unref = [&](int& ref) {
-        if (ref != LUA_NOREF) {
-            luaL_unref(main_L_, LUA_REGISTRYINDEX, ref);
-            ref = LUA_NOREF;
-        }
-    };
-    unref(script_table_ref_);
-    unref(enter_ref_);
-    unref(tick_ref_);
-    unref(exit_ref_);
+    ReleaseLuaRef(main_L_, script_table_ref_);
+    ReleaseLuaRef(main_L_, enter_ref_);
+    ReleaseLuaRef(main_L_, tick_ref_);
+    ReleaseLuaRef(main_L_, exit_ref_);
 }
 
 void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
@@ -58,7 +52,6 @@ void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_p
         return;
     }
 
-    // Save script table ref for colon-method calls (self)
     lua_pushvalue(L, -1);
     script_table_ref_ = luaL_ref(L, LUA_REGISTRYINDEX);
 
@@ -79,7 +72,7 @@ void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_p
     tick_ref_ = get_ref("Tick");
     exit_ref_ = get_ref("Exit");
 
-    lua_pop(L, 1);  // pop table
+    lua_pop(L, 1);
 
     if (tick_ref_ == LUA_NOREF) {
         spdlog::error("ActiveSensor::Init: '{}' missing required 'Tick' function",
@@ -90,31 +83,6 @@ void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_p
                  spec_.script_path, spec_.name,
                  enter_ref_ != LUA_NOREF, tick_ref_ != LUA_NOREF,
                  exit_ref_ != LUA_NOREF);
-}
-
-void ActiveSensor::PushArgsTable(lua_State* L) const {
-    lua_newtable(L);
-    for (const auto& [key, value] : spec_.args) {
-        lua_pushstring(L, key.c_str());
-        LuaRuntime::PushValues(L, {value});
-        lua_settable(L, -3);
-    }
-}
-
-void ActiveSensor::CallMethod(lua_State* L, int fn_ref, int extra_args) {
-    int base = lua_gettop(L) - extra_args + 1;
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, fn_ref);
-    lua_insert(L, base);
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, script_table_ref_);
-    lua_insert(L, base + 1);
-
-    if (lua_pcall(L, 1 + extra_args, 0, 0) != LUA_OK) {
-        const char* err = lua_tostring(L, -1);
-        spdlog::error("ActiveSensor::CallMethod: error: {}", err ? err : "unknown");
-        lua_pop(L, 1);
-    }
 }
 
 void ActiveSensor::HandleResult(const std::vector<LuaValue>& values, Blackboard& bb) {
@@ -129,8 +97,8 @@ void ActiveSensor::Activate(Blackboard& bb) {
     next_run_ms_ = 0;
 
     if (enter_ref_ != LUA_NOREF && main_L_) {
-        PushArgsTable(main_L_);
-        CallMethod(main_L_, enter_ref_, 1);
+        PushArgsTable(main_L_, spec_.args);
+        LuaCallMethod(main_L_, enter_ref_, script_table_ref_, 1);
     }
 
     RunOnce(bb);
@@ -147,7 +115,7 @@ void ActiveSensor::Deactivate(Blackboard* bb) {
     }
 
     if (exit_ref_ != LUA_NOREF && main_L_) {
-        CallMethod(main_L_, exit_ref_);
+        LuaCallMethod(main_L_, exit_ref_, script_table_ref_, 0);
     }
 }
 
@@ -177,7 +145,7 @@ void ActiveSensor::RunOnce(Blackboard& bb) {
     });
 
     int nresults = 0;
-    int status = lua_resume(co, main_L_, 1, &nresults);  // 1 arg = self
+    int status = lua_resume(co, main_L_, 1, &nresults);
 
     if (status == LUA_YIELD) {
         yielded_co_ = co;

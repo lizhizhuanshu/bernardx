@@ -14,22 +14,18 @@
 class FileSystemCodeProvider : public CodeProvider {
 public:
     // Search {base}/src/ then {base}/libs/
-    explicit FileSystemCodeProvider(const std::string& base_dir)
-        : base_dir_(std::filesystem::absolute(base_dir).string()) {
+    explicit FileSystemCodeProvider(const std::string& base_dir) {
+        auto abs = std::filesystem::absolute(base_dir).string();
         search_paths_ = {
-            base_dir_ + "/src",
-            base_dir_ + "/libs",
+            abs + "/src",
+            abs + "/libs",
         };
     }
 
-    // Use explicit search paths (first match wins, resolved to absolute)
     explicit FileSystemCodeProvider(std::vector<std::string> search_paths) {
         search_paths_.reserve(search_paths.size());
         for (auto& p : search_paths) {
             search_paths_.push_back(std::filesystem::absolute(p).string());
-        }
-        if (!search_paths_.empty()) {
-            base_dir_ = search_paths_.front();
         }
     }
 
@@ -67,6 +63,5 @@ private:
         return std::nullopt;
     }
 
-    std::string base_dir_;
     std::vector<std::string> search_paths_;
 };

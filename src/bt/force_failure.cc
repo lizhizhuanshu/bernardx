@@ -3,6 +3,6 @@
 ForceFailure::ForceFailure(AbortMode abort_mode)
     : Decorator("ForceFailure", abort_mode) {}
 
-bool ForceFailure::Evaluate(Blackboard& bb) {
+bool ForceFailure::Evaluate(Blackboard& /*bb*/) {
     return false;
 }

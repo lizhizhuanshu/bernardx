@@ -8,6 +8,7 @@ extern "C" {
 #include "lua.h"
 }
 
+#include "bt_utils.h"
 #include "lua_runtime.h"
 
 struct SensorSpec {
@@ -30,7 +31,6 @@ public:
 
     void Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
 
-    // Release Lua registry refs while the Lua state is still alive.
     void ReleaseRefs();
 
     void Activate(Blackboard& bb);
@@ -41,17 +41,10 @@ public:
     void ScheduleNext(int64_t now_ms);
 
     const std::string& name() const { return spec_.name; }
-    int64_t interval_ms() const { return spec_.interval_ms; }
     bool is_active() const { return active_; }
     bool is_loaded() const { return tick_ref_ != LUA_NOREF; }
 
 private:
-    // Colon-method call: push fn, push self, extra_args → pcall(L, 1+extra_args, 0, 0)
-    void CallMethod(lua_State* L, int fn_ref, int extra_args = 0);
-
-    // Push spec_.args as a Lua table onto the stack
-    void PushArgsTable(lua_State* L) const;
-
     void HandleResult(const std::vector<LuaValue>& values, Blackboard& bb);
 
     SensorSpec spec_;

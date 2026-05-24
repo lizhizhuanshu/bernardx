@@ -21,17 +21,11 @@ ScriptNode::~ScriptNode() {
 
 void ScriptNode::ReleaseRefs() {
     if (!main_L_) return;
-    auto unref = [&](int& ref) {
-        if (ref != LUA_NOREF) {
-            luaL_unref(main_L_, LUA_REGISTRYINDEX, ref);
-            ref = LUA_NOREF;
-        }
-    };
-    unref(script_table_ref_);
-    unref(enter_ref_);
-    unref(tick_ref_);
-    unref(exit_ref_);
-    unref(abort_ref_);
+    ReleaseLuaRef(main_L_, script_table_ref_);
+    ReleaseLuaRef(main_L_, enter_ref_);
+    ReleaseLuaRef(main_L_, tick_ref_);
+    ReleaseLuaRef(main_L_, exit_ref_);
+    ReleaseLuaRef(main_L_, abort_ref_);
 }
 
 async_simple::coro::Lazy<bool> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
@@ -114,35 +108,6 @@ async_simple::coro::Lazy<bool> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, c
     co_return true;
 }
 
-void ScriptNode::PushArgsTable(lua_State* L) const {
-    lua_newtable(L);
-    for (const auto& [key, value] : args_) {
-        lua_pushstring(L, key.c_str());
-        LuaRuntime::PushValues(L, {value});
-        lua_settable(L, -3);
-    }
-}
-
-void ScriptNode::CallMethod(lua_State* L, int fn_ref, int extra_args) {
-    // Stack before: [..., extra_arg1, ..., extra_argN]
-    // We need:     [..., fn, self, extra_arg1, ..., extra_argN]
-    int base = lua_gettop(L) - extra_args + 1;  // first extra_arg position
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, fn_ref);
-    lua_insert(L, base);  // fn at base
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, script_table_ref_);
-    lua_insert(L, base + 1);  // self at base+1
-    // Stack now: [..., fn, self, extra_arg1, ..., extra_argN]
-
-    int status = lua_pcall(L, 1 + extra_args, 0, 0);
-    if (status != LUA_OK) {
-        const char* err = lua_tostring(L, -1);
-        spdlog::error("ScriptNode::CallMethod: error: {}", err ? err : "unknown");
-        lua_pop(L, 1);
-    }
-}
-
 NodeStatus ScriptNode::ParseReturnValues(const std::vector<LuaValue>& values, bool& deactivate) {
     if (values.empty()) {
         deactivate = true;
@@ -192,7 +157,7 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
             active_ = false;
             if (exit_ref_ != LUA_NOREF) {
                 lua_pushstring(main_L_, "failure");
-                CallMethod(main_L_, exit_ref_, 1);
+                LuaCallMethod(main_L_, exit_ref_, script_table_ref_, 1);
             }
             return NodeStatus::kFailure;
         }
@@ -204,7 +169,7 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
             if (exit_ref_ != LUA_NOREF) {
                 auto* s = std::get_if<std::string>(&result.values[0]);
                 lua_pushstring(main_L_, s ? s->c_str() : "failure");
-                CallMethod(main_L_, exit_ref_, 1);
+                LuaCallMethod(main_L_, exit_ref_, script_table_ref_, 1);
             }
         }
         return ns;
@@ -212,11 +177,11 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
 
     // --- Start a new tick ---
     if (!active_) {
-        active_ = true;
-        if (enter_ref_ != LUA_NOREF) {
-            PushArgsTable(main_L_);
-            CallMethod(main_L_, enter_ref_, 1);
-        }
+    active_ = true;
+    if (enter_ref_ != LUA_NOREF) {
+        PushArgsTable(main_L_, args_);
+        LuaCallMethod(main_L_, enter_ref_, script_table_ref_, 1);
+    }
     }
 
     // Create coroutine via LuaRuntime's pool
@@ -250,7 +215,7 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
         active_ = false;
         if (exit_ref_ != LUA_NOREF) {
             lua_pushstring(main_L_, "failure");
-            CallMethod(main_L_, exit_ref_, 1);
+            LuaCallMethod(main_L_, exit_ref_, script_table_ref_, 1);
         }
         return NodeStatus::kFailure;
     }
@@ -265,7 +230,7 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
         if (exit_ref_ != LUA_NOREF) {
             auto* s = std::get_if<std::string>(&values[0]);
             lua_pushstring(main_L_, s ? s->c_str() : "failure");
-            CallMethod(main_L_, exit_ref_, 1);
+            LuaCallMethod(main_L_, exit_ref_, script_table_ref_, 1);
         }
     }
     return ns;
@@ -280,7 +245,7 @@ void ScriptNode::Reset() {
 
     if (active_ && exit_ref_ != LUA_NOREF && main_L_) {
         lua_pushstring(main_L_, "reset");
-        CallMethod(main_L_, exit_ref_, 1);
+        LuaCallMethod(main_L_, exit_ref_, script_table_ref_, 1);
     }
     active_ = false;
     Leaf::Reset();
@@ -295,11 +260,11 @@ void ScriptNode::OnAborted() {
 
     if (active_ && main_L_) {
         if (abort_ref_ != LUA_NOREF) {
-            CallMethod(main_L_, abort_ref_);
+            LuaCallMethod(main_L_, abort_ref_, script_table_ref_, 0);
         }
         if (exit_ref_ != LUA_NOREF) {
             lua_pushstring(main_L_, "aborted");
-            CallMethod(main_L_, exit_ref_, 1);
+            LuaCallMethod(main_L_, exit_ref_, script_table_ref_, 1);
         }
     }
     active_ = false;

@@ -1,8 +1,5 @@
 #include "random_selector.h"
 
-#include <algorithm>
-#include <random>
-
 #include "blackboard.h"
 #include "bt_event_queue.h"
 #include "node.h"
@@ -11,13 +8,11 @@ RandomSelector::RandomSelector(uint32_t id, std::string name)
     : Composite(id, "RandomSelector", std::move(name)) {}
 
 NodeStatus RandomSelector::Tick(Blackboard& bb, BtEventQueue& events) {
-    if (!shuffled_) {
-        ShuffleIndices();
-        shuffled_ = true;
-    }
+    shuffled_tracker_.EnsureShuffled(children_.size());
 
-    for (size_t i = current_child_index_; i < order_.size(); ++i) {
-        auto status = children_[order_[i]]->Tick(bb, events);
+    const auto& order = shuffled_tracker_.order();
+    for (size_t i = current_child_index_; i < order.size(); ++i) {
+        auto status = children_[order[i]]->Tick(bb, events);
         switch (status) {
             case NodeStatus::kRunning:
                 current_child_index_ = i;
@@ -26,7 +21,7 @@ NodeStatus RandomSelector::Tick(Blackboard& bb, BtEventQueue& events) {
                 current_child_index_ = 0;
                 return NodeStatus::kSuccess;
             case NodeStatus::kFailure:
-                set_last_error(children_[order_[i]]->last_error());
+                set_last_error(children_[order[i]]->last_error());
                 continue;
         }
     }
@@ -35,17 +30,6 @@ NodeStatus RandomSelector::Tick(Blackboard& bb, BtEventQueue& events) {
 }
 
 void RandomSelector::Reset() {
-    shuffled_ = false;
-    order_.clear();
+    shuffled_tracker_.Reset();
     Composite::Reset();
-}
-
-void RandomSelector::ShuffleIndices() {
-    order_.resize(children_.size());
-    for (size_t i = 0; i < order_.size(); ++i) {
-        order_[i] = i;
-    }
-    std::random_device rd;
-    std::mt19937 g(rd());
-    std::shuffle(order_.begin(), order_.end(), g);
 }

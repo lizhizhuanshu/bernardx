@@ -10,6 +10,7 @@ extern "C" {
 
 #include <async_simple/coro/Lazy.h>
 
+#include "bt_utils.h"
 #include "leaf.h"
 #include "lua_runtime.h"
 
@@ -24,8 +25,6 @@ public:
 
     async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) override;
 
-    // Release Lua registry refs while the Lua state is still alive.
-    // Must be called before the owning LuaRuntime is destroyed.
     void ReleaseRefs() override;
 
     bool is_loaded() const { return tick_ref_ != LUA_NOREF; }
@@ -34,11 +33,7 @@ public:
     void Reset() override;
     void OnAborted() override;
 
-    bool is_active() const { return active_; }
-
 private:
-    void CallMethod(lua_State* L, int fn_ref, int extra_args = 0);
-    void PushArgsTable(lua_State* L) const;
     NodeStatus ParseReturnValues(const std::vector<LuaValue>& values, bool& deactivate);
 
     std::string script_path_;

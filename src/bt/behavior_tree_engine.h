@@ -56,9 +56,7 @@ public:
     bool IsRunning() const { return running_.load(); }
     bool IsPaused() const { return paused_.load(); }
     std::string GetStatus() const;
-    std::string GetCurrentNode() const;
 
-    // Blackboard access (thread-safe)
     Blackboard& blackboard() { return *blackboard_; }
 
     // Event injection (thread-safe)
@@ -88,7 +86,7 @@ private:
     void PropagateAbort(Node* source, AbortMode mode);
     void HandleEvents();
     void ResetTree();
-    void ReleaseScriptNodeRefsRecursive(Node* node);
+    void ReleaseScriptNodeRefs(Node* node);
     void CollectRunningNodes(Node* node, std::vector<Node*>& out);
     bool IsDescendantOf(Node* node, Node* ancestor) const;
 
@@ -100,8 +98,6 @@ private:
     void DeactivateNodeSensors(Node* node, const std::set<Node*>& still_active);
     void InitSensorsRecursive(Node* node, lua_State* L, LuaRuntime* ctx);
 
-    static int64_t NowMs();
-
     std::unique_ptr<Node> root_;
     std::shared_ptr<Blackboard> blackboard_;
     BtEventQueue event_queue_;
@@ -110,10 +106,6 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> paused_{false};
 
-    mutable std::mutex current_node_mutex_;
-    std::string current_node_path_;
-
-    // Active sensors (keyed by sensor name)
     std::map<std::string, std::unique_ptr<ActiveSensor>> active_sensors_;
     // Nodes that had sensors activated last tick
     std::set<Node*> prev_sensor_nodes_;

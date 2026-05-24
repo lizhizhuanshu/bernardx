@@ -251,16 +251,6 @@ static WsConn* ws_check(lua_State* L, int idx) {
 
 // Unref callbacks on a specific lua_State.
 // Called from the Lua event loop thread when the shared_ptr ref count drops.
-struct WsConnCleanup {
-    lua_State* main_L;
-    std::shared_ptr<WsConn> conn;
-    ~WsConnCleanup() {
-        if (conn && main_L) {
-            conn->UnrefCallbacks(main_L);
-        }
-    }
-};
-
 static int ws_gc(lua_State* L) {
     auto* slot = static_cast<std::shared_ptr<WsConn>*>(luaL_testudata(L, 1, kWsMetatable));
     if (slot && *slot) {

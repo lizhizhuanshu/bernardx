@@ -154,12 +154,7 @@ static int json_decode(lua_State* L) {
 static int json_encode(lua_State* L) {
     auto j = lua_to_json(L, 1);
     int indent = lua_isinteger(L, 2) ? static_cast<int>(lua_tointeger(L, 2)) : -1;
-    std::string output;
-    if (indent >= 0) {
-        output = j.dump(indent);
-    } else {
-        output = j.dump();
-    }
+    std::string output = (indent >= 0) ? j.dump(indent) : j.dump();
     lua_pushlstring(L, output.data(), output.size());
     return 1;
 }

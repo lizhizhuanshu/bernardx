@@ -189,12 +189,12 @@ TEST(SelectorTest, RunningRemembersPosition) {
     sel->AddChild(std::unique_ptr<MockNode>(mock_b));
 
     EXPECT_EQ(sel->Tick(bb, events), NodeStatus::kRunning);
-    EXPECT_TRUE(sel->is_mid_sequence());
+    EXPECT_TRUE(sel->has_started());
 
     // Second tick should start from child B, not A
     static_cast<MockNode*>(sel->children()[1].get())->set_status(NodeStatus::kSuccess);
     EXPECT_EQ(sel->Tick(bb, events), NodeStatus::kSuccess);
-    EXPECT_FALSE(sel->is_mid_sequence());
+    EXPECT_FALSE(sel->has_started());
 }
 
 TEST(SelectorTest, ResetClearsState) {
@@ -205,10 +205,10 @@ TEST(SelectorTest, ResetClearsState) {
     sel->AddChild(std::make_unique<MockNode>(3, "b", NodeStatus::kRunning));
 
     sel->Tick(bb, events);  // Running
-    EXPECT_TRUE(sel->is_mid_sequence());
+    EXPECT_TRUE(sel->has_started());
 
     sel->Reset();
-    EXPECT_FALSE(sel->is_mid_sequence());
+    EXPECT_FALSE(sel->has_started());
 }
 
 // --- Sequence Tests ---
@@ -252,13 +252,13 @@ TEST(SequenceTest, RunningResumesFromSameChild) {
     seq->AddChild(std::unique_ptr<MockNode>(mock_b));
 
     EXPECT_EQ(seq->Tick(bb, events), NodeStatus::kRunning);
-    EXPECT_TRUE(seq->is_mid_sequence());
+    EXPECT_TRUE(seq->has_started());
     EXPECT_EQ(seq->current_child_index(), 1u);
 
     // Next tick: child B succeeds
     static_cast<MockNode*>(seq->children()[1].get())->set_status(NodeStatus::kSuccess);
     EXPECT_EQ(seq->Tick(bb, events), NodeStatus::kSuccess);
-    EXPECT_FALSE(seq->is_mid_sequence());
+    EXPECT_FALSE(seq->has_started());
 }
 
 // --- Parallel Tests ---
@@ -839,7 +839,6 @@ TEST_F(BehaviorTreeLibraryTest, HasAllFunctions) {
             and type(bt.stop) == 'function'
             and type(bt.notify) == 'function'
             and type(bt.get_status) == 'function'
-            and type(bt.get_current_node) == 'function'
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 1u);
@@ -973,7 +972,7 @@ TEST(AbortTest, CollectRunningNodesFromSequence) {
 
     // Tick once: child A succeeds, child B runs
     seq->Tick(bb, events);
-    EXPECT_TRUE(seq->is_mid_sequence());
+    EXPECT_TRUE(seq->has_started());
 
     // Simulate abort
     auto* b_node = dynamic_cast<MockNode*>(seq->children()[1].get());

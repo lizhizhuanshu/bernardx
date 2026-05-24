@@ -139,7 +139,7 @@ public:
     AsyncHandle PreYield(lua_State* co);
     static int Yield(lua_State* L);
 
-    static std::vector<LuaValue> PeekValues(lua_State* L, int nresults);
+    [[nodiscard]] static std::vector<LuaValue> PeekValues(lua_State* L, int nresults);
     static void PushValues(lua_State* L, const std::vector<LuaValue>& values);
 
     // --- Builder ---

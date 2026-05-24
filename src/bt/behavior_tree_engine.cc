@@ -1,20 +1,14 @@
 #include "behavior_tree_engine.h"
 
 #include <algorithm>
-#include <chrono>
 
 #include <spdlog/spdlog.h>
 
+#include "bt_utils.h"
 #include "composite.h"
 #include "lua_runtime.h"
 #include "subtree_node.h"
 #include "tree_parser.h"
-
-int64_t BehaviorTreeEngine::NowMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
 
 BehaviorTreeEngine::BehaviorTreeEngine(std::shared_ptr<Blackboard> bb)
     : blackboard_(bb ? std::move(bb) : std::make_shared<Blackboard>()) {}
@@ -81,11 +75,6 @@ std::string BehaviorTreeEngine::GetStatus() const {
     return "running";
 }
 
-std::string BehaviorTreeEngine::GetCurrentNode() const {
-    std::lock_guard<std::mutex> lock(current_node_mutex_);
-    return current_node_path_;
-}
-
 async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx) {
     if (root_) {
         if (!co_await root_->Init(L, ctx, project_path_)) {
@@ -95,7 +84,7 @@ async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitScriptNodesAsync(l
     co_return std::string();
 }
 
-void BehaviorTreeEngine::ReleaseScriptNodeRefsRecursive(Node* node) {
+void BehaviorTreeEngine::ReleaseScriptNodeRefs(Node* node) {
     node->ReleaseRefs();
 }
 
@@ -202,6 +191,7 @@ void BehaviorTreeEngine::PropagateAbort(Node* source, AbortMode mode) {
 }
 
 void BehaviorTreeEngine::HandleEvents() {
+    // TODO: Process events (e.g., route to blackboard, trigger decorator re-evaluation)
     event_queue_.Drain();
 }
 
@@ -214,7 +204,7 @@ void BehaviorTreeEngine::ResetTree() {
 void BehaviorTreeEngine::CollectRunningNodes(Node* node, std::vector<Node*>& out) {
     auto* composite = dynamic_cast<Composite*>(node);
     if (composite) {
-        if (composite->is_mid_sequence()) {
+        if (composite->has_started()) {
             out.push_back(node);
         }
         for (auto& child : composite->children()) {
@@ -395,7 +385,7 @@ void BehaviorTreeEngine::StopLoop() {
 
     // Release Lua registry refs while the Lua state is still alive
     if (root_ && bt_context_) {
-        ReleaseScriptNodeRefsRecursive(root_.get());
+        ReleaseScriptNodeRefs(root_.get());
     }
     for (auto& [name, sensor] : active_sensors_) {
         sensor->ReleaseRefs();

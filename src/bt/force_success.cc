@@ -3,6 +3,6 @@
 ForceSuccess::ForceSuccess(AbortMode abort_mode)
     : Decorator("ForceSuccess", abort_mode) {}
 
-bool ForceSuccess::Evaluate(Blackboard& bb) {
+bool ForceSuccess::Evaluate(Blackboard& /*bb*/) {
     return true;
 }

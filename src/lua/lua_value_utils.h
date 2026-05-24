@@ -7,7 +7,7 @@ extern "C" {
 
 #include "lua_runtime.h"
 
-inline LuaValue PopLuaValue(lua_State* L, int idx) {
+[[nodiscard]] inline LuaValue LuaValueFromStack(lua_State* L, int idx) {
     int t = lua_type(L, idx);
     if (t == LUA_TNIL) {
         return LuaValue(nullptr);
@@ -33,6 +33,10 @@ inline LuaValue PopLuaValue(lua_State* L, int idx) {
         luaL_unref(L, LUA_REGISTRYINDEX, ref);
         return LuaValue(nullptr);
     }
+}
+
+[[nodiscard]] inline LuaValue PopLuaValue(lua_State* L, int idx) {
+    return LuaValueFromStack(L, idx);
 }
 
 inline void PushLuaValue(lua_State* L, const LuaValue& v) {
