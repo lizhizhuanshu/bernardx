@@ -101,7 +101,10 @@ NodeStatus BehaviorTreeEngine::TickOnce() {
     }
 
     auto status = root_->Tick(*blackboard_, event_queue_);
-    UpdateActiveSensors();
+
+    if (status == NodeStatus::kRunning) {
+        UpdateActiveSensors();
+    }
 
     if (status != NodeStatus::kRunning) {
         DeactivateAllSensors();
@@ -223,29 +226,35 @@ bool BehaviorTreeEngine::IsDescendantOf(Node* node, Node* ancestor) const {
 
 // --- Sensor management ---
 
-void BehaviorTreeEngine::InitSensors(lua_State* L, LuaRuntime* ctx) {
-    if (!root_) return;
-    InitSensorsRecursive(root_.get(), L, ctx);
+async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitSensorsAsync(lua_State* L, LuaRuntime* ctx) {
+    if (!root_) co_return std::string();
+    auto error = co_await InitSensorsRecursive(root_.get(), L, ctx);
+    co_return error;
 }
 
-void BehaviorTreeEngine::InitSensorsRecursive(Node* node, lua_State* L, LuaRuntime* ctx) {
+async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitSensorsRecursive(Node* node, lua_State* L, LuaRuntime* ctx) {
     for (auto& spec : node->sensor_specs()) {
         if (active_sensors_.count(spec.name)) {
             spdlog::warn("BehaviorTreeEngine: duplicate sensor name '{}', overwriting", spec.name);
         }
         auto sensor = std::make_unique<ActiveSensor>(spec);
-        sensor->Init(L, ctx, project_path_);
+        if (!co_await sensor->Init(L, ctx, project_path_)) {
+            co_return "failed to init sensor '" + spec.name + "'";
+        }
         active_sensors_[spec.name] = std::move(sensor);
     }
     if (auto* composite = dynamic_cast<Composite*>(node)) {
         for (auto& child : composite->children()) {
-            InitSensorsRecursive(child.get(), L, ctx);
+            auto error = co_await InitSensorsRecursive(child.get(), L, ctx);
+            if (!error.empty()) co_return error;
         }
     } else if (auto* sub = dynamic_cast<SubtreeNode*>(node)) {
         if (sub->subtree_root()) {
-            InitSensorsRecursive(sub->subtree_root(), L, ctx);
+            auto error = co_await InitSensorsRecursive(sub->subtree_root(), L, ctx);
+            if (!error.empty()) co_return error;
         }
     }
+    co_return std::string();
 }
 
 void BehaviorTreeEngine::ActivateInitialSensors() {
@@ -273,6 +282,7 @@ void BehaviorTreeEngine::UpdateActiveSensors() {
 
     std::set<Node*> active_nodes;
     CollectActiveNodes(root_.get(), active_nodes);
+    CollectAbortMonitoringNodes(root_.get(), active_nodes);
 
     // Activate sensors for newly active nodes
     for (auto* node : active_nodes) {
@@ -297,6 +307,39 @@ void BehaviorTreeEngine::CollectActiveNodes(Node* node, std::set<Node*>& out) {
     auto* composite = dynamic_cast<Composite*>(node);
     if (composite && composite->current_child_index() < composite->children().size()) {
         CollectActiveNodes(composite->children()[composite->current_child_index()].get(), out);
+    }
+}
+
+bool BehaviorTreeEngine::HasAbortLowerPriority(const Node* node) {
+    for (const auto& dec : node->decorators()) {
+        auto mode = dec->abort_mode();
+        if (mode == AbortMode::kLowerPriority || mode == AbortMode::kBoth) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void BehaviorTreeEngine::CollectAbortMonitoringNodes(Node* node, std::set<Node*>& out) {
+    auto* composite = dynamic_cast<Composite*>(node);
+    if (!composite) {
+        auto* sub = dynamic_cast<SubtreeNode*>(node);
+        if (sub && sub->subtree_root()) {
+            CollectAbortMonitoringNodes(sub->subtree_root(), out);
+        }
+        return;
+    }
+    if (!out.count(node)) return;
+
+    for (size_t i = 0; i < composite->current_child_index() && i < composite->children().size(); ++i) {
+        auto* child = composite->children()[i].get();
+        if (HasAbortLowerPriority(child)) {
+            out.insert(child);
+        }
+    }
+
+    if (composite->current_child_index() < composite->children().size()) {
+        CollectAbortMonitoringNodes(composite->children()[composite->current_child_index()].get(), out);
     }
 }
 
@@ -414,7 +457,15 @@ async_simple::coro::Lazy<void> BehaviorTreeEngine::TickLoop(
         co_return;
     }
 
-    InitSensors(ctx->main_state(), ctx.get());
+    auto sensor_error = co_await InitSensorsAsync(ctx->main_state(), ctx.get());
+    if (!sensor_error.empty()) {
+        if (on_complete) {
+            on_complete("failure", sensor_error);
+        }
+        done_guard();
+        co_return;
+    }
+
     ActivateInitialSensors();
     Run();
 

@@ -8,6 +8,8 @@ extern "C" {
 #include "lua.h"
 }
 
+#include <async_simple/coro/Lazy.h>
+
 #include "bt_utils.h"
 #include "lua_runtime.h"
 
@@ -29,7 +31,7 @@ public:
     ActiveSensor(const ActiveSensor&) = delete;
     ActiveSensor& operator=(const ActiveSensor&) = delete;
 
-    void Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
+    async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
 
     void ReleaseRefs();
 

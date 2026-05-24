@@ -20,7 +20,7 @@ void ActiveSensor::ReleaseRefs() {
     ReleaseLuaRef(main_L_, exit_ref_);
 }
 
-void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
+async_simple::coro::Lazy<bool> ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
     main_L_ = L;
     lua_context_ = ctx;
 
@@ -29,27 +29,31 @@ void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_p
         full_path = std::filesystem::absolute(base_path + "/" + spec_.script_path).string();
     }
 
-    if (luaL_loadfile(L, full_path.c_str()) != LUA_OK) {
-        const char* err = lua_tostring(L, -1);
-        spdlog::error("ActiveSensor::Init: failed to load '{}': {}",
-                       spec_.script_path, err ? err : "unknown");
-        lua_pop(L, 1);
-        return;
+    auto result = co_await ctx->DoFileAsync(full_path);
+
+    if (result.status != LUA_OK) {
+        std::string msg = "failed to execute '" + spec_.script_path + "': " +
+                      (result.error.empty() ? "unknown error" : result.error);
+        spdlog::error("ActiveSensor::Init: {}", msg);
+        co_return false;
     }
 
-    if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
-        const char* err = lua_tostring(L, -1);
-        spdlog::error("ActiveSensor::Init: failed to execute '{}': {}",
-                       spec_.script_path, err ? err : "unknown");
-        lua_pop(L, 1);
-        return;
+    if (result.values.empty()) {
+        spdlog::error("ActiveSensor::Init: '{}' did not return a value", spec_.script_path);
+        co_return false;
     }
 
+    auto* table_ref = std::get_if<LuaRef>(&result.values[0]);
+    if (!table_ref) {
+        spdlog::error("ActiveSensor::Init: '{}' did not return a table", spec_.script_path);
+        co_return false;
+    }
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, (*table_ref)->ref);
     if (!lua_istable(L, -1)) {
-        spdlog::error("ActiveSensor::Init: '{}' did not return a table",
-                       spec_.script_path);
+        spdlog::error("ActiveSensor::Init: '{}' did not return a table", spec_.script_path);
         lua_pop(L, 1);
-        return;
+        co_return false;
     }
 
     lua_pushvalue(L, -1);
@@ -77,12 +81,14 @@ void ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_p
     if (tick_ref_ == LUA_NOREF) {
         spdlog::error("ActiveSensor::Init: '{}' missing required 'Tick' function",
                        spec_.script_path);
+        co_return false;
     }
 
     spdlog::info("ActiveSensor::Init: loaded '{}' → sensor '{}' (Enter={}, Tick={}, Exit={})",
                  spec_.script_path, spec_.name,
                  enter_ref_ != LUA_NOREF, tick_ref_ != LUA_NOREF,
                  exit_ref_ != LUA_NOREF);
+    co_return true;
 }
 
 void ActiveSensor::HandleResult(const std::vector<LuaValue>& values, Blackboard& bb) {

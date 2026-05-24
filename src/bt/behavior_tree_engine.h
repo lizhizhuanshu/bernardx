@@ -69,7 +69,7 @@ public:
     void SetProjectPath(std::string path) { project_path_ = std::move(path); }
     const std::string& project_path() const { return project_path_; }
 
-    void InitSensors(lua_State* L, LuaRuntime* ctx);
+    async_simple::coro::Lazy<std::string> InitSensorsAsync(lua_State* L, LuaRuntime* ctx);
 
     // Activate sensors for the initial active path (root → first child → ...)
     void ActivateInitialSensors();
@@ -94,9 +94,11 @@ private:
     void TickSensors();
     void UpdateActiveSensors();
     void CollectActiveNodes(Node* node, std::set<Node*>& out);
+    void CollectAbortMonitoringNodes(Node* node, std::set<Node*>& out);
     void ActivateNodeSensors(Node* node);
     void DeactivateNodeSensors(Node* node, const std::set<Node*>& still_active);
-    void InitSensorsRecursive(Node* node, lua_State* L, LuaRuntime* ctx);
+    async_simple::coro::Lazy<std::string> InitSensorsRecursive(Node* node, lua_State* L, LuaRuntime* ctx);
+    static bool HasAbortLowerPriority(const Node* node);
 
     std::unique_ptr<Node> root_;
     std::shared_ptr<Blackboard> blackboard_;
