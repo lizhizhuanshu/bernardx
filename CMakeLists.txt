@@ -177,6 +177,7 @@ target_link_libraries(bernardx_test PRIVATE bernardx_lib GTest::gtest_main)
 target_include_directories(bernardx_test PRIVATE ${CMAKE_SOURCE_DIR}/src/lua ${CMAKE_SOURCE_DIR}/src/bt)
 target_include_directories(bernardx_test SYSTEM PRIVATE ${cinatra_SOURCE_DIR}/include)
 cinatra_use_third_party_headers(bernardx_test)
+
 include(GoogleTest)
 gtest_discover_tests(bernardx_test)
 
