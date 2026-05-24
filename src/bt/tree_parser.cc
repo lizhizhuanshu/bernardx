@@ -28,6 +28,20 @@
 #include "wait_node.h"
 
 namespace {
+
+thread_local std::string tl_parse_error;
+
+void SetParseError(std::string err) {
+    tl_parse_error = std::move(err);
+    spdlog::error("TreeParser: {}", tl_parse_error);
+}
+
+std::string DrainParseError() {
+    auto err = std::move(tl_parse_error);
+    tl_parse_error.clear();
+    return err;
+}
+
 AbortMode ParseAbortMode(const std::string& s) {
     if (s == "Self") return AbortMode::kSelf;
     if (s == "LowerPriority") return AbortMode::kLowerPriority;
@@ -56,20 +70,20 @@ std::string TreeParser::LoadTreeFromDirectory(const std::string& dir_path) {
 
     fs::path dir(dir_path);
     if (!fs::is_directory(dir)) {
-        spdlog::error("TreeParser: '{}' is not a directory", dir_path);
+        SetParseError("'" + dir_path + "' is not a directory");
         return {};
     }
 
     // Read root.json
     auto root_file = dir / "root.json";
     if (!fs::exists(root_file)) {
-        spdlog::error("TreeParser: '{}' not found", root_file.string());
+        SetParseError("'" + root_file.string() + "' not found");
         return {};
     }
 
     std::ifstream rf(root_file);
     if (!rf.is_open()) {
-        spdlog::error("TreeParser: failed to open '{}'", root_file.string());
+        SetParseError("failed to open '" + root_file.string() + "'");
         return {};
     }
 
@@ -77,7 +91,7 @@ std::string TreeParser::LoadTreeFromDirectory(const std::string& dir_path) {
     try {
         rf >> root_j;
     } catch (const nlohmann::json::parse_error& e) {
-        spdlog::error("TreeParser: failed to parse '{}': {}", root_file.string(), e.what());
+        SetParseError("failed to parse '" + root_file.string() + "': " + e.what());
         return {};
     }
 
@@ -92,14 +106,14 @@ std::string TreeParser::LoadTreeFromDirectory(const std::string& dir_path) {
         auto name = path.stem().string();
         std::ifstream sf(path);
         if (!sf.is_open()) {
-            spdlog::error("TreeParser: failed to open '{}'", path.string());
+            SetParseError("failed to open '" + path.string() + "'");
             return {};
         }
 
         try {
             sf >> subtrees_j[name];
         } catch (const nlohmann::json::parse_error& e) {
-            spdlog::error("TreeParser: failed to parse '{}': {}", path.string(), e.what());
+            SetParseError("failed to parse '" + path.string() + "': " + e.what());
             return {};
         }
     }
@@ -114,14 +128,14 @@ std::string TreeParser::LoadTreeFromDirectory(const std::string& dir_path) {
 }
 
 std::unique_ptr<Node> TreeParser::Parse(const std::string& json_str) {
+    tl_parse_error.clear();
     try {
         auto j = nlohmann::json::parse(json_str);
         if (!j.contains("root")) {
-            spdlog::error("TreeParser: JSON must have 'root' field");
+            SetParseError("JSON must have 'root' field");
             return nullptr;
         }
 
-        // Parse top-level "subtrees" definitions
         SubtreeRegistry subtrees;
         if (j.contains("subtrees") && j["subtrees"].is_object()) {
             for (auto it = j["subtrees"].begin(); it != j["subtrees"].end(); ++it) {
@@ -131,21 +145,29 @@ std::unique_ptr<Node> TreeParser::Parse(const std::string& json_str) {
 
         uint32_t next_id = 1;
         std::set<std::string> resolving;
-        return ParseNode(j["root"], next_id, subtrees, resolving);
+        auto node = ParseNode(j["root"], next_id, subtrees, resolving);
+        if (!node && tl_parse_error.empty()) {
+            SetParseError("failed to parse root node");
+        }
+        return node;
     } catch (const nlohmann::json::parse_error& e) {
-        spdlog::error("TreeParser: JSON parse error: {}", e.what());
+        SetParseError(std::string("JSON parse error: ") + e.what());
         return nullptr;
     } catch (const std::exception& e) {
-        spdlog::error("TreeParser: error: {}", e.what());
+        SetParseError(std::string("parse error: ") + e.what());
         return nullptr;
     }
+}
+
+std::string TreeParser::GetLastError() {
+    return DrainParseError();
 }
 
 std::unique_ptr<Node> TreeParser::ParseNode(const nlohmann::json& j, uint32_t& next_id,
                                             const SubtreeRegistry& subtrees,
                                             std::set<std::string>& resolving) {
     if (!j.contains("type")) {
-        spdlog::error("TreeParser: node missing 'type' field");
+        SetParseError("node missing 'type' field");
         return nullptr;
     }
 
@@ -172,7 +194,7 @@ std::unique_ptr<Node> TreeParser::ParseNode(const nlohmann::json& j, uint32_t& n
         return ParseWait(j, next_id);
     }
 
-    spdlog::error("TreeParser: unknown node type '{}'", type);
+    SetParseError("unknown node type '" + type + "'");
     return nullptr;
 }
 
@@ -227,7 +249,7 @@ std::unique_ptr<Node> TreeParser::ParseComposite(const nlohmann::json& j, uint32
 
 std::unique_ptr<Node> TreeParser::ParseScriptLeaf(const nlohmann::json& j, uint32_t& next_id) {
     if (!j.contains("path")) {
-        spdlog::error("TreeParser: Script node missing 'path' field");
+        SetParseError("Script node missing 'path' field");
         return nullptr;
     }
 
@@ -257,7 +279,7 @@ std::unique_ptr<Node> TreeParser::ParseSubtree(const nlohmann::json& j, uint32_t
                                                const SubtreeRegistry& subtrees,
                                                std::set<std::string>& resolving) {
     if (!j.contains("subtree")) {
-        spdlog::error("TreeParser: Subtree node missing 'subtree' field");
+        SetParseError("Subtree node missing 'subtree' field");
         return nullptr;
     }
 
@@ -265,13 +287,13 @@ std::unique_ptr<Node> TreeParser::ParseSubtree(const nlohmann::json& j, uint32_t
 
     // Cycle detection
     if (resolving.count(subtree_name)) {
-        spdlog::error("TreeParser: circular subtree reference '{}'", subtree_name);
+        SetParseError("circular subtree reference '" + subtree_name + "'");
         return nullptr;
     }
 
     auto it = subtrees.find(subtree_name);
     if (it == subtrees.end()) {
-        spdlog::error("TreeParser: unknown subtree '{}'", subtree_name);
+        SetParseError("unknown subtree '" + subtree_name + "'");
         return nullptr;
     }
 
@@ -281,7 +303,7 @@ std::unique_ptr<Node> TreeParser::ParseSubtree(const nlohmann::json& j, uint32_t
     auto subtree_root = ParseNode(it->second, next_id, subtrees, resolving);
     resolving.erase(subtree_name);
     if (!subtree_root) {
-        spdlog::error("TreeParser: failed to parse subtree '{}'", subtree_name);
+        SetParseError("failed to parse subtree '" + subtree_name + "'");
         return nullptr;
     }
 
@@ -299,7 +321,7 @@ std::unique_ptr<Node> TreeParser::ParseRepeat(const nlohmann::json& j, uint32_t&
                                                std::set<std::string>& resolving) {
     auto children = ParseChildren(j, next_id, subtrees, resolving);
     if (children.empty()) {
-        spdlog::error("TreeParser: Repeat node requires at least one child");
+        SetParseError("Repeat node requires at least one child");
         return nullptr;
     }
 
@@ -318,7 +340,7 @@ std::unique_ptr<Node> TreeParser::ParseRetryUntilSuccessful(const nlohmann::json
                                                             std::set<std::string>& resolving) {
     auto children = ParseChildren(j, next_id, subtrees, resolving);
     if (children.empty()) {
-        spdlog::error("TreeParser: RetryUntilSuccessful node requires at least one child");
+        SetParseError("RetryUntilSuccessful node requires at least one child");
         return nullptr;
     }
 

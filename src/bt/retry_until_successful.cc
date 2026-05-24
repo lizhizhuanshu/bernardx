@@ -10,7 +10,10 @@ RetryUntilSuccessful::RetryUntilSuccessful(uint32_t id, std::string name,
 }
 
 NodeStatus RetryUntilSuccessful::Tick(Blackboard& bb, BtEventQueue& events) {
-    if (!child_) return NodeStatus::kFailure;
+    if (!child_) {
+        set_last_error("no child node");
+        return NodeStatus::kFailure;
+    }
 
     auto status = child_->Tick(bb, events);
     if (status == NodeStatus::kSuccess) {
@@ -23,6 +26,7 @@ NodeStatus RetryUntilSuccessful::Tick(Blackboard& bb, BtEventQueue& events) {
     // Child failed: retry
     ++attempt_count_;
     if (max_attempts_ != kInfinite && attempt_count_ >= max_attempts_) {
+        set_last_error(child_->last_error());
         return NodeStatus::kFailure;
     }
 

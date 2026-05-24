@@ -43,7 +43,7 @@ public:
 
     // Tick loop management — creates a dedicated LuaRuntime and runs TickOnce
     // in a loop on its executor until the tree completes or StopLoop is called.
-    using CompletionCallback = std::function<void(const std::string& status)>;
+    using CompletionCallback = std::function<void(const std::string& status, const std::string& error)>;
 
     void StartLoop(std::shared_ptr<CodeProvider> code_provider,
                    int64_t tick_interval_ms,
@@ -71,7 +71,7 @@ public:
 
     // Initialize script nodes with lua_State and LuaRuntime (called on event loop thread)
     // Async — each script's Init can yield (e.g., for async require)
-    async_simple::coro::Lazy<void> InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx);
+    async_simple::coro::Lazy<std::string> InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx);
 
     void SetProjectPath(std::string path) { project_path_ = std::move(path); }
     const std::string& project_path() const { return project_path_; }

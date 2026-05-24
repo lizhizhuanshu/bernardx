@@ -458,14 +458,14 @@ local status = bt.run("trees/ai_main")
 
 ```lua
 -- 方式1: JSON 字符串（以 { 或 [ 开头）
-local status = bt.run('{"root": {"type": "Selector", "children": [...]}}')
+local ok, err = bt.run('{"root": {"type": "Selector", "children": [...]}}')
 
 -- 方式2: 目录路径
-local status = bt.run("path/to/tree_dir")
+local ok, err = bt.run("path/to/tree_dir")
 
 -- 方式3: 结合项目路径使用（推荐）
 bt.set_project_path("/path/to/bt_project")
-local status = bt.run("trees/ai_main")  -- 解析为 /path/to/bt_project/trees/ai_main
+local ok = bt.run("trees/ai_main")  -- 解析为 /path/to/bt_project/trees/ai_main
 ```
 
 设置了项目路径时，目录路径会相对于项目根目录解析；未设置时，路径相对于当前工作目录。
@@ -483,4 +483,18 @@ tree_dir/
 - 其他 `.json` 文件：文件名（去掉扩展名）作为子树名称，可在 root 中通过 `{"type": "Subtree", "subtree": "combat"}` 引用
 - 非 `.json` 文件会被忽略
 
-**返回值：** `string` — `"success"` / `"failure"` / `"stopped"`
+**返回值：**
+
+| 返回值 | 类型 | 说明 |
+|--------|------|------|
+| `ok` | `boolean` | `true` = 正常完成，`false` = 出错 |
+| `status` | `string` | 正常时为 `"success"` / `"stopped"`；出错时为错误信息 |
+
+```lua
+local ok, status = bt.run(json)
+if ok then
+    print("result: " .. status)   -- "success" or "stopped"
+else
+    print("failed: " .. status)   -- 错误信息
+end
+```

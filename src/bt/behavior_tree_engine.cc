@@ -89,30 +89,49 @@ std::string BehaviorTreeEngine::GetCurrentNode() const {
     return current_node_path_;
 }
 
-async_simple::coro::Lazy<void> BehaviorTreeEngine::InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx) {
+async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx) {
     if (root_) {
         co_await InitScriptNodesRecursiveAsync(root_.get(), L, ctx);
+        if (!root_->last_error().empty()) {
+            co_return root_->last_error();
+        }
     }
+    co_return std::string();
 }
 
 async_simple::coro::Lazy<void> BehaviorTreeEngine::InitScriptNodesRecursiveAsync(
     Node* node, lua_State* L, LuaRuntime* ctx) {
     if (auto* script = dynamic_cast<ScriptNode*>(node)) {
         co_await script->Init(L, ctx, project_path_);
+        if (!script->last_error().empty()) {
+            node->set_last_error(script->last_error());
+            co_return;
+        }
     }
     if (auto* composite = dynamic_cast<Composite*>(node)) {
         for (auto& child : composite->children()) {
             co_await InitScriptNodesRecursiveAsync(child.get(), L, ctx);
+            if (!child->last_error().empty()) {
+                node->set_last_error(child->last_error());
+                co_return;
+            }
         }
     }
-    // Handle wrapper nodes (Repeat, RetryUntilSuccessful)
     if (auto* repeat = dynamic_cast<Repeat*>(node)) {
         if (repeat->child()) {
             co_await InitScriptNodesRecursiveAsync(repeat->child(), L, ctx);
+            if (!repeat->child()->last_error().empty()) {
+                node->set_last_error(repeat->child()->last_error());
+                co_return;
+            }
         }
     } else if (auto* retry = dynamic_cast<RetryUntilSuccessful*>(node)) {
         if (retry->child()) {
             co_await InitScriptNodesRecursiveAsync(retry->child(), L, ctx);
+            if (!retry->child()->last_error().empty()) {
+                node->set_last_error(retry->child()->last_error());
+                co_return;
+            }
         }
     }
 }
@@ -448,7 +467,14 @@ async_simple::coro::Lazy<void> BehaviorTreeEngine::TickLoop(
         tick_loop_cv_.notify_all();
     };
 
-    co_await InitScriptNodesAsync(ctx->main_state(), ctx.get());
+    auto init_error = co_await InitScriptNodesAsync(ctx->main_state(), ctx.get());
+    if (!init_error.empty()) {
+        if (on_complete) {
+            on_complete("failure", init_error);
+        }
+        done_guard();
+        co_return;
+    }
 
     InitSensors(ctx->main_state(), ctx.get());
     ActivateInitialSensors();
@@ -458,10 +484,14 @@ async_simple::coro::Lazy<void> BehaviorTreeEngine::TickLoop(
         auto status = TickOnce();
 
         if (status == NodeStatus::kSuccess || status == NodeStatus::kFailure) {
+            std::string s = (status == NodeStatus::kSuccess) ? "success" : "failure";
+            std::string err;
+            if (status == NodeStatus::kFailure && root_ && !root_->last_error().empty()) {
+                err = root_->last_error();
+            }
             Stop();
             if (on_complete) {
-                std::string s = (status == NodeStatus::kSuccess) ? "success" : "failure";
-                on_complete(s);
+                on_complete(s, err);
             }
             done_guard();
             co_return;

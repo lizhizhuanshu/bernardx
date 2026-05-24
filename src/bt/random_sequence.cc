@@ -23,6 +23,7 @@ NodeStatus RandomSequence::Tick(Blackboard& bb, BtEventQueue& events) {
                 current_child_index_ = i;
                 return NodeStatus::kRunning;
             case NodeStatus::kFailure:
+                set_last_error(children_[order_[i]]->last_error());
                 current_child_index_ = 0;
                 return NodeStatus::kFailure;
             case NodeStatus::kSuccess:

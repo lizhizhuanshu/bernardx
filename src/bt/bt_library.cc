@@ -16,6 +16,20 @@ extern "C" {
 #include "tree_parser.h"
 #include "types.h"
 
+using ResultArgs = std::vector<LuaValue>;
+
+ResultArgs MakeRunResult(const std::string& status, const std::string& error) {
+    ResultArgs args;
+    if (!error.empty()) {
+        args.push_back(false);
+        args.push_back(error);
+    } else {
+        args.push_back(true);
+        args.push_back(status);
+    }
+    return args;
+}
+
 namespace {
 
 BehaviorTreeEngine* GetEngine(lua_State* L) {
@@ -29,15 +43,13 @@ BehaviorTreeLibrary* GetLibrary(lua_State* L) {
 void StopAndResumePending(BehaviorTreeEngine* engine, BehaviorTreeLibrary* lib) {
     engine->StopLoop();
     if (!lib->run_completed_.load() && lib->pending_run_ctx_) {
-        std::vector<LuaValue> args;
-        args.push_back(std::string("stopped"));
-        lib->pending_run_ctx_->PushResume(lib->pending_run_handle_, std::move(args));
+        lib->pending_run_ctx_->PushResume(lib->pending_run_handle_,
+            MakeRunResult("stopped", {}));
     }
     lib->run_completed_.store(false);
     lib->pending_run_ctx_.reset();
     lib->pending_run_handle_ = 0;
 }
-
 int bt_run(lua_State* L) {
     auto* engine = GetEngine(L);
     auto* lib = GetLibrary(L);
@@ -64,7 +76,8 @@ int bt_run(lua_State* L) {
 
     if (!engine->Load(json_str)) {
         lua_pushboolean(L, 0);
-        lua_pushstring(L, "failed to parse JSON");
+        auto parse_err = TreeParser::GetLastError();
+        lua_pushstring(L, parse_err.empty() ? "failed to parse JSON" : parse_err.c_str());
         return 2;
     }
 
@@ -100,11 +113,9 @@ int bt_run(lua_State* L) {
     lib->run_completed_.store(false);
 
     engine->StartLoop(code_provider, lib->tick_interval_ms(),
-        [rt_ctx, handle, lib](const std::string& status) {
+        [rt_ctx, handle, lib](const std::string& status, const std::string& error) {
             lib->run_completed_.store(true);
-            std::vector<LuaValue> args;
-            args.push_back(LuaValue(status));
-            rt_ctx->PushResume(handle, std::move(args));
+            rt_ctx->PushResume(handle, MakeRunResult(status, error));
         },
         rt_ctx.get());
 

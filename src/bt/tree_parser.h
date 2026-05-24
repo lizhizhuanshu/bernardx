@@ -15,6 +15,7 @@ using SubtreeRegistry = std::unordered_map<std::string, nlohmann::json>;
 class TreeParser {
 public:
     static std::unique_ptr<Node> Parse(const std::string& json_str);
+    static std::string GetLastError();
 
     // Load tree from a directory: root.json + other .json files as subtrees
     // Returns combined JSON string, or empty string on error

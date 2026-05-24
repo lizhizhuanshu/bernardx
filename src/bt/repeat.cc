@@ -9,12 +9,15 @@ Repeat::Repeat(uint32_t id, std::string name, int count,
 }
 
 NodeStatus Repeat::Tick(Blackboard& bb, BtEventQueue& events) {
-    if (!child_) return NodeStatus::kFailure;
+    if (!child_) {
+        set_last_error("no child node");
+        return NodeStatus::kFailure;
+    }
 
-    // Infinite repeat: stop on child failure
     if (max_count_ == kInfinite) {
         auto status = child_->Tick(bb, events);
         if (status == NodeStatus::kFailure) {
+            set_last_error(child_->last_error());
             return NodeStatus::kFailure;
         }
         if (status == NodeStatus::kRunning) {
@@ -35,6 +38,7 @@ NodeStatus Repeat::Tick(Blackboard& bb, BtEventQueue& events) {
         return NodeStatus::kRunning;
     }
     if (status == NodeStatus::kFailure) {
+        set_last_error(child_->last_error());
         return NodeStatus::kFailure;
     }
 

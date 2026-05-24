@@ -46,25 +46,33 @@ async_simple::coro::Lazy<void> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, c
     auto result = co_await ctx->DoFileAsync(full_path);
 
     if (result.status != LUA_OK) {
-        spdlog::error("ScriptNode::Init: failed to execute '{}': {}", full_path,
-                      result.error.empty() ? "unknown error" : result.error);
+        std::string msg = "failed to execute '" + full_path + "': " +
+                      (result.error.empty() ? "unknown error" : result.error);
+        spdlog::error("ScriptNode::Init: {}", msg);
+        set_last_error(std::move(msg));
         co_return;
     }
 
     if (result.values.empty()) {
-        spdlog::error("ScriptNode::Init: '{}' did not return a value", full_path);
+        std::string msg = "'" + full_path + "' did not return a value";
+        spdlog::error("ScriptNode::Init: {}", msg);
+        set_last_error(std::move(msg));
         co_return;
     }
 
     auto* table_ref = std::get_if<LuaRef>(&result.values[0]);
     if (!table_ref) {
-        spdlog::error("ScriptNode::Init: '{}' did not return a table", full_path);
+        std::string msg = "'" + full_path + "' did not return a table";
+        spdlog::error("ScriptNode::Init: {}", msg);
+        set_last_error(std::move(msg));
         co_return;
     }
 
     lua_rawgeti(main_L_, LUA_REGISTRYINDEX, (*table_ref)->ref);
     if (!lua_istable(main_L_, -1)) {
-        spdlog::error("ScriptNode::Init: '{}' did not return a table", full_path);
+        std::string msg = "'" + full_path + "' did not return a table";
+        spdlog::error("ScriptNode::Init: {}", msg);
+        set_last_error(std::move(msg));
         lua_pop(main_L_, 1);
         co_return;
     }
@@ -94,7 +102,9 @@ async_simple::coro::Lazy<void> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, c
     lua_pop(main_L_, 1);  // pop table
 
     if (tick_ref_ == LUA_NOREF) {
-        spdlog::error("ScriptNode::Init: '{}' missing required 'Tick' function", script_path_);
+        std::string msg = "'" + script_path_ + "' missing required 'Tick' function";
+        spdlog::error("ScriptNode::Init: {}", msg);
+        set_last_error(std::move(msg));
     }
 
     spdlog::info("ScriptNode::Init: loaded '{}' (Enter={}, Tick={}, Exit={}, Abort={})",
@@ -139,7 +149,9 @@ NodeStatus ScriptNode::ParseReturnValues(const std::vector<LuaValue>& values, bo
     }
     auto* s = std::get_if<std::string>(&values[0]);
     if (!s) {
-        spdlog::error("ScriptNode::Tick: '{}' returned unexpected value", name_);
+        std::string msg = "'" + name_ + "' returned unexpected value";
+        spdlog::error("ScriptNode::Tick: {}", msg);
+        set_last_error(std::move(msg));
         deactivate = true;
         return NodeStatus::kFailure;
     }
@@ -150,13 +162,16 @@ NodeStatus ScriptNode::ParseReturnValues(const std::vector<LuaValue>& values, bo
     if (*s == "running") {
         return NodeStatus::kRunning;
     }
-    spdlog::error("ScriptNode::Tick: '{}' returned unexpected value", name_);
+    std::string msg = "'" + name_ + "' returned unexpected value: '" + *s + "'";
+    spdlog::error("ScriptNode::Tick: {}", msg);
+    set_last_error(std::move(msg));
     deactivate = true;
     return NodeStatus::kFailure;
 }
 
 NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
     if (!is_loaded() || !main_L_ || !lua_context_) {
+        set_last_error("'" + name_ + "' not loaded");
         return NodeStatus::kFailure;
     }
 
@@ -170,7 +185,9 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
         yielded_co_ = nullptr;
 
         if (result.status != LUA_OK) {
-            spdlog::error("ScriptNode::Tick: '{}' coroutine error: {}", name_, result.error);
+            std::string msg = "'" + name_ + "' coroutine error: " + result.error;
+            spdlog::error("ScriptNode::Tick: {}", msg);
+            set_last_error(std::move(msg));
             active_ = false;
             if (exit_ref_ != LUA_NOREF) {
                 lua_pushstring(main_L_, "failure");
@@ -225,7 +242,9 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
 
     if (status != LUA_OK) {
         const char* err = lua_tostring(co, -1);
-        spdlog::error("ScriptNode::Tick: '{}' error: {}", name_, err ? err : "unknown");
+        std::string msg = "'" + name_ + "' error: " + (err ? err : "unknown");
+        spdlog::error("ScriptNode::Tick: {}", msg);
+        set_last_error(std::move(msg));
         lua_pop(co, 1);
         active_ = false;
         if (exit_ref_ != LUA_NOREF) {

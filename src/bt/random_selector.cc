@@ -26,6 +26,7 @@ NodeStatus RandomSelector::Tick(Blackboard& bb, BtEventQueue& events) {
                 current_child_index_ = 0;
                 return NodeStatus::kSuccess;
             case NodeStatus::kFailure:
+                set_last_error(children_[order_[i]]->last_error());
                 continue;
         }
     }
