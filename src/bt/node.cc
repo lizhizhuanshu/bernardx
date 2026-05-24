@@ -7,6 +7,7 @@ Node::Node(uint32_t id, std::string type, std::string name)
 
 void Node::Reset() {
     prev_decorator_results_.clear();
+    last_error_.clear();
 }
 
 void Node::OnAborted() {

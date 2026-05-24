@@ -26,7 +26,7 @@ public:
 
     // Release Lua registry refs while the Lua state is still alive.
     // Must be called before the owning LuaRuntime is destroyed.
-    void ReleaseRefs();
+    void ReleaseRefs() override;
 
     bool is_loaded() const { return tick_ref_ != LUA_NOREF; }
 

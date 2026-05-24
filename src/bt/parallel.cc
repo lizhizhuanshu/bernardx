@@ -24,7 +24,7 @@ NodeStatus Parallel::Tick(Blackboard& bb, BtEventQueue& events) {
                 ++success_count;
                 break;
             case NodeStatus::kFailure:
-                if (child->last_error().length() > last_error().length()) {
+                if (!child->last_error().empty() && last_error().empty()) {
                     set_last_error(child->last_error());
                 }
                 ++failure_count;

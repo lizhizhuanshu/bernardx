@@ -6,8 +6,8 @@
 #include <spdlog/spdlog.h>
 
 #include "composite.h"
-#include "file_system_code_provider.h"
 #include "lua_runtime.h"
+#include "subtree_node.h"
 #include "tree_parser.h"
 
 int64_t BehaviorTreeEngine::NowMs() {
@@ -116,6 +116,9 @@ NodeStatus BehaviorTreeEngine::TickOnce() {
 
     if (status != NodeStatus::kRunning) {
         DeactivateAllSensors();
+        if (status == NodeStatus::kFailure) {
+            last_error_ = root_->last_error();
+        }
         ResetTree();
     }
     return status;
@@ -247,6 +250,10 @@ void BehaviorTreeEngine::InitSensorsRecursive(Node* node, lua_State* L, LuaRunti
     if (auto* composite = dynamic_cast<Composite*>(node)) {
         for (auto& child : composite->children()) {
             InitSensorsRecursive(child.get(), L, ctx);
+        }
+    } else if (auto* sub = dynamic_cast<SubtreeNode*>(node)) {
+        if (sub->subtree_root()) {
+            InitSensorsRecursive(sub->subtree_root(), L, ctx);
         }
     }
 }
@@ -433,8 +440,8 @@ async_simple::coro::Lazy<void> BehaviorTreeEngine::TickLoop(
         if (status == NodeStatus::kSuccess || status == NodeStatus::kFailure) {
             std::string s = (status == NodeStatus::kSuccess) ? "success" : "failure";
             std::string err;
-            if (status == NodeStatus::kFailure && root_ && !root_->last_error().empty()) {
-                err = root_->last_error();
+            if (status == NodeStatus::kFailure && !last_error_.empty()) {
+                err = last_error_;
             }
             Stop();
             if (on_complete) {

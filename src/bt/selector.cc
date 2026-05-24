@@ -18,7 +18,9 @@ NodeStatus Selector::Tick(Blackboard& bb, BtEventQueue& events) {
                 current_child_index_ = 0;
                 return NodeStatus::kSuccess;
             case NodeStatus::kFailure:
-                set_last_error(children_[i]->last_error());
+                if (!children_[i]->last_error().empty()) {
+                    set_last_error(children_[i]->last_error());
+                }
                 continue;
         }
     }

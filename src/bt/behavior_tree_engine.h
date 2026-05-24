@@ -128,6 +128,7 @@ private:
     async_simple::coro::Lazy<void> TickLoop(LuaRuntime::Ptr ctx,
                                              int64_t tick_interval_ms,
                                              CompletionCallback on_complete);
+    std::string last_error_;
 
     std::atomic<bool> loop_running_{false};
     std::mutex tick_loop_mu_;

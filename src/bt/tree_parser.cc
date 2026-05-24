@@ -205,9 +205,10 @@ std::vector<std::unique_ptr<Node>> TreeParser::ParseChildren(const nlohmann::jso
     if (j.contains("children") && j["children"].is_array()) {
         for (const auto& child_j : j["children"]) {
             auto child = ParseNode(child_j, next_id, subtrees, resolving);
-            if (child) {
-                children.push_back(std::move(child));
+            if (!child) {
+                return {};
             }
+            children.push_back(std::move(child));
         }
     }
     return children;
