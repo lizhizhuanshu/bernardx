@@ -17,17 +17,18 @@ BehaviorTreeEngine::~BehaviorTreeEngine() {
     Stop();
 }
 
-bool BehaviorTreeEngine::Load(const std::string& json) {
+std::pair<bool, std::string> BehaviorTreeEngine::Load(const std::string& json) {
     DeactivateAllSensors();
-    auto tree = TreeParser::Parse(json);
-    if (!tree) {
-        spdlog::error("BehaviorTreeEngine: failed to parse JSON");
-        return false;
+    auto result = TreeParser::Parse(json);
+    if (!result.root) {
+        auto err = result.error.empty() ? "failed to parse JSON" : result.error;
+        spdlog::error("BehaviorTreeEngine: {}", err);
+        return {false, std::move(err)};
     }
-    root_ = std::move(tree);
+    root_ = std::move(result.root);
     blackboard_->Clear();
     event_queue_.Drain();
-    return true;
+    return {true, {}};
 }
 
 void BehaviorTreeEngine::Run() {
@@ -117,11 +118,12 @@ NodeStatus BehaviorTreeEngine::TickOnce() {
 }
 
 bool BehaviorTreeEngine::EvaluateDecorators(Node* node) {
+    auto& node_state = decorator_state_[node];
     for (auto& dec : node->decorators()) {
         bool now = dec->Evaluate(*blackboard_);
         bool was = false;
-        auto it = node->prev_decorator_results_.find(dec.get());
-        if (it != node->prev_decorator_results_.end()) {
+        auto it = node_state.find(dec.get());
+        if (it != node_state.end()) {
             was = it->second;
         }
 
@@ -134,7 +136,7 @@ bool BehaviorTreeEngine::EvaluateDecorators(Node* node) {
                     PropagateAbort(node, AbortMode::kLowerPriority);
                 }
             }
-            node->prev_decorator_results_[dec.get()] = now;
+            node_state[dec.get()] = now;
         }
 
         if (!now) {
@@ -142,6 +144,16 @@ bool BehaviorTreeEngine::EvaluateDecorators(Node* node) {
         }
     }
     return true;
+}
+
+void BehaviorTreeEngine::EvaluateDecoratorsRecursive(Node* node) {
+    EvaluateDecorators(node);
+    auto* composite = dynamic_cast<Composite*>(node);
+    if (composite) {
+        for (auto& child : composite->children()) {
+            EvaluateDecoratorsRecursive(child.get());
+        }
+    }
 }
 
 void BehaviorTreeEngine::PropagateAbort(Node* source, AbortMode mode) {
@@ -194,14 +206,21 @@ void BehaviorTreeEngine::PropagateAbort(Node* source, AbortMode mode) {
 }
 
 void BehaviorTreeEngine::HandleEvents() {
-    // TODO: Process events (e.g., route to blackboard, trigger decorator re-evaluation)
-    event_queue_.Drain();
+    auto events = event_queue_.Drain();
+    for (auto& evt : events) {
+        blackboard_->Set("_event_" + evt.name, std::move(evt.data));
+    }
 }
 
 void BehaviorTreeEngine::ResetTree() {
     if (root_) {
         root_->Reset();
     }
+    ClearDecoratorState();
+}
+
+void BehaviorTreeEngine::ClearDecoratorState() {
+    decorator_state_.clear();
 }
 
 void BehaviorTreeEngine::CollectRunningNodes(Node* node, std::vector<Node*>& out) {

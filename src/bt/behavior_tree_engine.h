@@ -33,7 +33,7 @@ public:
     BehaviorTreeEngine& operator=(const BehaviorTreeEngine&) = delete;
 
     // Load tree from JSON string
-    bool Load(const std::string& json);
+    std::pair<bool, std::string> Load(const std::string& json);
 
     // Lifecycle (thread-safe)
     void Run();
@@ -71,21 +71,21 @@ public:
 
     async_simple::coro::Lazy<std::string> InitSensorsAsync(lua_State* L, LuaRuntime* ctx);
 
-    // Activate sensors for the initial active path (root → first child → ...)
     void ActivateInitialSensors();
 
-    // Deactivate all active sensors
     void DeactivateAllSensors();
 
-    // Tick once (called by BT event loop thread)
-    // Returns the tree status after tick (kRunning if tree is still executing)
     NodeStatus TickOnce();
 
 private:
+    using DecoratorState = std::unordered_map<Node*, std::unordered_map<Decorator*, bool>>;
+
     bool EvaluateDecorators(Node* node);
+    void EvaluateDecoratorsRecursive(Node* node);
     void PropagateAbort(Node* source, AbortMode mode);
     void HandleEvents();
     void ResetTree();
+    void ClearDecoratorState();
     void ReleaseScriptNodeRefs(Node* node);
     void CollectRunningNodes(Node* node, std::vector<Node*>& out);
     bool IsDescendantOf(Node* node, Node* ancestor) const;
@@ -104,6 +104,7 @@ private:
     std::shared_ptr<Blackboard> blackboard_;
     BtEventQueue event_queue_;
     std::string project_path_;
+    DecoratorState decorator_state_;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> paused_{false};

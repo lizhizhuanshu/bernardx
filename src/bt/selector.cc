@@ -27,7 +27,3 @@ NodeStatus Selector::Tick(Blackboard& bb, BtEventQueue& events) {
     current_child_index_ = 0;
     return NodeStatus::kFailure;
 }
-
-void Selector::Reset() {
-    Composite::Reset();
-}

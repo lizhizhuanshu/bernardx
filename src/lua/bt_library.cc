@@ -43,13 +43,12 @@ BehaviorTreeLibrary* GetLibrary(lua_State* L) {
 
 void StopAndResumePending(BehaviorTreeEngine* engine, BehaviorTreeLibrary* lib) {
     engine->StopLoop();
-    if (!lib->run_completed_.load() && lib->pending_run_ctx_) {
-        lib->pending_run_ctx_->PushResume(lib->pending_run_handle_,
+    if (!lib->run_completed() && lib->pending_run_ctx()) {
+        lib->pending_run_ctx()->PushResume(lib->pending_run_handle(),
             MakeRunResult("stopped", {}));
     }
-    lib->run_completed_.store(false);
-    lib->pending_run_ctx_.reset();
-    lib->pending_run_handle_ = 0;
+    lib->set_run_completed(false);
+    lib->clear_pending_run();
 }
 int bt_run(lua_State* L) {
     auto* engine = GetEngine(L);
@@ -75,10 +74,10 @@ int bt_run(lua_State* L) {
         }
     }
 
-    if (!engine->Load(json_str)) {
+    auto [loaded, load_err] = engine->Load(json_str);
+    if (!loaded) {
         lua_pushboolean(L, 0);
-        auto parse_err = TreeParser::GetLastError();
-        lua_pushstring(L, parse_err.empty() ? "failed to parse JSON" : parse_err.c_str());
+        lua_pushstring(L, load_err.empty() ? "failed to parse JSON" : load_err.c_str());
         return 2;
     }
 
@@ -109,13 +108,13 @@ int bt_run(lua_State* L) {
         code_provider = rt_ctx->shared_code_provider();
     }
 
-    lib->pending_run_handle_ = handle;
-    lib->pending_run_ctx_ = rt_ctx;
-    lib->run_completed_.store(false);
+    lib->set_pending_run_handle(handle);
+    lib->set_pending_run_ctx(rt_ctx);
+    lib->set_run_completed(false);
 
     engine->StartLoop(code_provider, lib->tick_interval_ms(),
         [rt_ctx, handle, lib](const std::string& status, const std::string& error) {
-            lib->run_completed_.store(true);
+            lib->set_run_completed(true);
             rt_ctx->PushResume(handle, MakeRunResult(status, error));
         },
         rt_ctx.get());

@@ -423,7 +423,8 @@ TEST(TreeParserTest, ParseSimpleSelector) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Selector");
     auto* sel = dynamic_cast<Composite*>(root.get());
@@ -441,7 +442,8 @@ TEST(TreeParserTest, ParseSequence) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Sequence");
 }
@@ -459,7 +461,8 @@ TEST(TreeParserTest, ParseParallel) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Parallel");
 }
@@ -469,7 +472,8 @@ TEST(TreeParserTest, ParseScriptNode) {
         "root": {"type": "Script", "path": "scripts/test.lua"}
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Script");
 }
@@ -492,7 +496,8 @@ TEST(TreeParserTest, ParseDecorators) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->decorators().size(), 1u);
     auto* bc = dynamic_cast<BlackboardCondition*>(root->decorators()[0].get());
@@ -517,7 +522,8 @@ TEST(TreeParserTest, ParseNestedTree) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     auto* sel = dynamic_cast<Composite*>(root.get());
     ASSERT_NE(sel, nullptr);
@@ -529,12 +535,14 @@ TEST(TreeParserTest, ParseNestedTree) {
 }
 
 TEST(TreeParserTest, ParseInvalidJson) {
-    auto root = TreeParser::Parse("{invalid json");
+    auto _parse_result = TreeParser::Parse("{invalid json");
+    auto root = std::move(_parse_result.root);
     EXPECT_EQ(root, nullptr);
 }
 
 TEST(TreeParserTest, ParseMissingRoot) {
-    auto root = TreeParser::Parse("{}");
+    auto _parse_result = TreeParser::Parse("{}");
+    auto root = std::move(_parse_result.root);
     EXPECT_EQ(root, nullptr);
 }
 
@@ -543,7 +551,8 @@ TEST(TreeParserTest, ParseUnknownNodeType) {
         "root": {"type": "UnknownType"}
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     EXPECT_EQ(root, nullptr);
 }
 
@@ -552,7 +561,8 @@ TEST(TreeParserTest, ParseScriptMissingPath) {
         "root": {"type": "Script"}
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     EXPECT_EQ(root, nullptr);
 }
 
@@ -567,7 +577,8 @@ TEST(TreeParserTest, ParseNodeNames) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->name(), "root_sel");
 
@@ -586,7 +597,8 @@ TEST(TreeParserTest, ParseInverterDecorator) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     ASSERT_EQ(root->decorators().size(), 1u);
     auto* inv = dynamic_cast<Inverter*>(root->decorators()[0].get());
@@ -605,7 +617,8 @@ TEST(TreeParserTest, ParseForceSuccessDecorator) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     ASSERT_EQ(root->decorators().size(), 1u);
     auto* fs = dynamic_cast<ForceSuccess*>(root->decorators()[0].get());
@@ -631,11 +644,11 @@ protected:
 };
 
 TEST_F(BehaviorTreeEngineTest, LoadInvalidJson) {
-    EXPECT_FALSE(engine->Load("not json"));
+    EXPECT_FALSE(engine->Load("not json").first);
 }
 
 TEST_F(BehaviorTreeEngineTest, LoadMissingRoot) {
-    EXPECT_FALSE(engine->Load("{}"));
+    EXPECT_FALSE(engine->Load("{}").first);
 }
 
 TEST_F(BehaviorTreeEngineTest, LoadValidTree) {
@@ -648,7 +661,7 @@ TEST_F(BehaviorTreeEngineTest, LoadValidTree) {
             ]
         }
     })";
-    EXPECT_TRUE(engine->Load(json));
+    EXPECT_TRUE(engine->Load(json).first);
 }
 
 TEST_F(BehaviorTreeEngineTest, StatusBeforeRun) {
@@ -666,7 +679,7 @@ TEST_F(BehaviorTreeEngineTest, RunAndStop) {
             ]
         }
     })";
-    ASSERT_TRUE(engine->Load(json));
+    ASSERT_TRUE(engine->Load(json).first);
     engine->Run();
     EXPECT_TRUE(engine->IsRunning());
 
@@ -686,7 +699,7 @@ TEST_F(BehaviorTreeEngineTest, PauseAndResume) {
             ]
         }
     })";
-    ASSERT_TRUE(engine->Load(json));
+    ASSERT_TRUE(engine->Load(json).first);
     engine->Run();
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
 
@@ -972,17 +985,18 @@ TEST(DecoratorOnNodeTest, AddDecorator) {
     EXPECT_EQ(node.decorators().size(), 1u);
 }
 
-TEST(DecoratorOnNodeTest, ResetClearsDecoratorResults) {
-    MockNode node(1, "test");
-    auto* cond = new BlackboardCondition("hp", "is_set");
-    node.AddDecorator(std::unique_ptr<BlackboardCondition>(cond));
-
-    Blackboard bb;
-    node.prev_decorator_results_[cond] = true;
-    EXPECT_FALSE(node.prev_decorator_results_.empty());
-
-    node.Reset();
-    EXPECT_TRUE(node.prev_decorator_results_.empty());
+TEST(DecoratorOnNodeTest, EngineManagesDecoratorState) {
+    auto engine = std::make_shared<BehaviorTreeEngine>();
+    const char* json = R"({
+        "root": {
+            "type": "Selector",
+            "decorators": [
+                {"type": "BlackboardCondition", "key": "hp", "operator": "is_set"}
+            ],
+            "children": [{"type": "Script", "path": "a.lua"}]
+        }
+    })";
+    EXPECT_TRUE(engine->Load(json).first);
 }
 
 // --- AbortMode Parsing Tests ---
@@ -997,7 +1011,8 @@ TEST(AbortModeTest, TreeParserParseAbortNone) {
             "children": [{"type": "Script", "path": "a.lua"}]
         }
     })";
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     ASSERT_EQ(root->decorators().size(), 1u);
     auto* bc = dynamic_cast<BlackboardCondition*>(root->decorators()[0].get());
@@ -1015,7 +1030,8 @@ TEST(AbortModeTest, TreeParserParseAbortSelf) {
             "children": [{"type": "Script", "path": "a.lua"}]
         }
     })";
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     auto* bc = dynamic_cast<BlackboardCondition*>(root->decorators()[0].get());
     ASSERT_NE(bc, nullptr);
@@ -1032,7 +1048,8 @@ TEST(AbortModeTest, TreeParserParseAbortLowerPriority) {
             "children": [{"type": "Script", "path": "a.lua"}]
         }
     })";
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     auto* bc = dynamic_cast<BlackboardCondition*>(root->decorators()[0].get());
     ASSERT_NE(bc, nullptr);
@@ -1083,7 +1100,8 @@ TEST(SubtreeTest, ParseSubtree) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Subtree");
     auto* sub = dynamic_cast<SubtreeNode*>(root.get());
@@ -1101,7 +1119,8 @@ TEST(SubtreeTest, ParseSubtreeMissingName) {
         "root": {"type": "Subtree"}
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     EXPECT_EQ(root, nullptr);
 }
 
@@ -1110,7 +1129,8 @@ TEST(SubtreeTest, ParseSubtreeUnknownName) {
         "root": {"type": "Subtree", "subtree": "nonexistent"}
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     EXPECT_EQ(root, nullptr);
 }
 
@@ -1135,7 +1155,8 @@ TEST(SubtreeTest, ParseNestedSubtree) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Subtree");
 
@@ -1168,7 +1189,8 @@ TEST(SubtreeTest, SubtreeWithDecorators) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->decorators().size(), 1u);
 }
@@ -1190,7 +1212,8 @@ TEST(SubtreeTest, SubtreeWithSensors) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->sensor_specs().size(), 1u);
     EXPECT_EQ(root->sensor_specs()[0].name, "nearby");
@@ -1213,7 +1236,8 @@ TEST(SubtreeTest, SubtreeUsedMultipleTimes) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     auto* seq = dynamic_cast<Composite*>(root.get());
     ASSERT_NE(seq, nullptr);
@@ -1245,7 +1269,8 @@ TEST(SubtreeTest, SubtreeInSelector) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     auto* sel = dynamic_cast<Composite*>(root.get());
     ASSERT_NE(sel, nullptr);
@@ -1270,7 +1295,8 @@ TEST(SubtreeTest, SubtreeParentPointer) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     auto* sub = dynamic_cast<SubtreeNode*>(root.get());
     ASSERT_NE(sub, nullptr);
@@ -1287,7 +1313,8 @@ TEST(SubtreeTest, CircularSubtreeReference) {
         "root": {"type": "Subtree", "subtree": "a"}
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     EXPECT_EQ(root, nullptr);
 }
 
@@ -1300,7 +1327,8 @@ TEST(SubtreeTest, IndirectCircularReference) {
         "root": {"type": "Subtree", "subtree": "a"}
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     EXPECT_EQ(root, nullptr);
 }
 
@@ -1332,7 +1360,8 @@ TEST_F(LoadTreeFromDirectoryTest, LoadsRootOnly) {
     auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
     ASSERT_FALSE(json.empty());
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Selector");
 }
@@ -1350,7 +1379,8 @@ TEST_F(LoadTreeFromDirectoryTest, LoadsRootWithSubtrees) {
     auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
     ASSERT_FALSE(json.empty());
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     auto* sel = dynamic_cast<Composite*>(root.get());
     ASSERT_NE(sel, nullptr);
@@ -1375,7 +1405,8 @@ TEST_F(LoadTreeFromDirectoryTest, MultipleSubtrees) {
     auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
     ASSERT_FALSE(json.empty());
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     auto* seq = dynamic_cast<Composite*>(root.get());
     ASSERT_NE(seq, nullptr);
@@ -1392,7 +1423,8 @@ TEST_F(LoadTreeFromDirectoryTest, IgnoresNonJsonFiles) {
     auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
     ASSERT_FALSE(json.empty());
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Script");
 }
@@ -1439,7 +1471,8 @@ TEST(TreeParserArgsTest, ParseScriptNodeWithArgs) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Script");
     auto* script = dynamic_cast<ScriptNode*>(root.get());
@@ -1452,7 +1485,8 @@ TEST(TreeParserArgsTest, ParseScriptNodeWithNoArgs) {
         "root": {"type": "Script", "path": "test.lua"}
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Script");
 }
@@ -1466,7 +1500,8 @@ TEST(TreeParserArgsTest, ParseScriptNodeWithEmptyArgs) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Script");
 }
@@ -1480,7 +1515,8 @@ TEST(TreeParserArgsTest, ParseScriptNodeWithFloatArg) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Script");
 }
@@ -1678,7 +1714,8 @@ TEST(TreeParserForceFailureTest, ParseForceFailureDecorator) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     ASSERT_EQ(root->decorators().size(), 1u);
     auto* ff = dynamic_cast<ForceFailure*>(root->decorators()[0].get());
@@ -1963,7 +2000,8 @@ TEST(TreeParserRepeatTest, ParseRepeat) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Repeat");
 }
@@ -1976,7 +2014,8 @@ TEST(TreeParserRepeatTest, ParseRepeatNoChildren) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     EXPECT_EQ(root, nullptr);
 }
 
@@ -1991,7 +2030,8 @@ TEST(TreeParserRepeatTest, ParseRepeatInfinite) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Repeat");
 }
@@ -2007,7 +2047,8 @@ TEST(TreeParserRetryTest, ParseRetryUntilSuccessful) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "RetryUntilSuccessful");
 }
@@ -2020,7 +2061,8 @@ TEST(TreeParserRetryTest, ParseRetryNoChildren) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     EXPECT_EQ(root, nullptr);
 }
 
@@ -2035,7 +2077,8 @@ TEST(TreeParserRandomTest, ParseRandomSelector) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "RandomSelector");
     auto* sel = dynamic_cast<Composite*>(root.get());
@@ -2054,7 +2097,8 @@ TEST(TreeParserRandomTest, ParseRandomSequence) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "RandomSequence");
     auto* seq = dynamic_cast<Composite*>(root.get());
@@ -2070,7 +2114,8 @@ TEST(TreeParserWaitTest, ParseWait) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_EQ(root->type(), "Wait");
 }
@@ -2080,7 +2125,8 @@ TEST(TreeParserWaitTest, ParseWaitDefault) {
         "root": {"type": "Wait"}
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
      EXPECT_EQ(root->type(), "Wait");
 }

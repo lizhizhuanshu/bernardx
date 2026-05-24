@@ -193,12 +193,12 @@ int custom_loadfile(lua_State* L) {
 
 // --- Built-in functions ---
 
-int lua_now(lua_State* L) {
+int builtin_now(lua_State* L) {
     lua_pushinteger(L, NowMs());
     return 1;
 }
 
-int lua_sleep(lua_State* L) {
+int builtin_sleep(lua_State* L) {
     int ms = static_cast<int>(luaL_checkinteger(L, 1));
     auto rt = LuaRuntime::FromLuaState(L);
     auto handle = rt->PreYield(L);
@@ -206,7 +206,7 @@ int lua_sleep(lua_State* L) {
     return LuaRuntime::Yield(L);
 }
 
-int lua_set_timeout(lua_State* L) {
+int builtin_set_timeout(lua_State* L) {
     int ms = static_cast<int>(luaL_checkinteger(L, 1));
     luaL_checktype(L, 2, LUA_TFUNCTION);
     auto rt = LuaRuntime::FromLuaState(L);
@@ -221,7 +221,7 @@ int lua_set_timeout(lua_State* L) {
     return 1;
 }
 
-int lua_clear_timeout(lua_State* L) {
+int builtin_clear_timeout(lua_State* L) {
     auto rt = LuaRuntime::FromLuaState(L);
     auto handle = static_cast<AsyncHandle>(luaL_checkinteger(L, 1));
     rt->CancelTimer(handle);
@@ -252,7 +252,7 @@ std::shared_ptr<LuaRuntime> get_runtime_ptr(lua_State* L, int upvalue_idx) {
     return *slot;
 }
 
-int lua_await_resolve(lua_State* L) {
+int builtin_await_resolve(lua_State* L) {
     lua_rawgeti(L, lua_upvalueindex(UV_DONE_TABLE), 1);
     bool done = lua_toboolean(L, -1);
     lua_pop(L, 1);
@@ -270,7 +270,7 @@ int lua_await_resolve(lua_State* L) {
     return 0;
 }
 
-int lua_await_reject(lua_State* L) {
+int builtin_await_reject(lua_State* L) {
     lua_rawgeti(L, lua_upvalueindex(UV_DONE_TABLE), 1);
     bool done = lua_toboolean(L, -1);
     lua_pop(L, 1);
@@ -295,7 +295,7 @@ int lua_await_reject(lua_State* L) {
     return 0;
 }
 
-int lua_await(lua_State* L) {
+int builtin_await(lua_State* L) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
     auto rt = LuaRuntime::FromLuaState(L);
 
@@ -306,12 +306,12 @@ int lua_await(lua_State* L) {
     push_runtime_ptr(L, rt);
     lua_pushinteger(L, handle);
     lua_pushvalue(L, 2);
-    lua_pushcclosure(L, lua_await_resolve, 3);
+    lua_pushcclosure(L, builtin_await_resolve, 3);
 
     push_runtime_ptr(L, rt);
     lua_pushinteger(L, handle);
     lua_pushvalue(L, 2);
-    lua_pushcclosure(L, lua_await_reject, 3);
+    lua_pushcclosure(L, builtin_await_reject, 3);
 
     lua_pushvalue(L, 1);
     int fn_ref = luaL_ref(L, LUA_REGISTRYINDEX);
@@ -418,19 +418,19 @@ void LuaRuntime::SetupBuiltins(lua_State* main_L) {
     lua_setfield(main_L, -2, "__gc");
     lua_pop(main_L, 1);
 
-    lua_pushcfunction(main_L, lua_now);
+    lua_pushcfunction(main_L, builtin_now);
     lua_setglobal(main_L, "now");
 
-    lua_pushcfunction(main_L, lua_sleep);
+    lua_pushcfunction(main_L, builtin_sleep);
     lua_setglobal(main_L, "sleep");
 
-    lua_pushcfunction(main_L, lua_set_timeout);
+    lua_pushcfunction(main_L, builtin_set_timeout);
     lua_setglobal(main_L, "setTimeout");
 
-    lua_pushcfunction(main_L, lua_clear_timeout);
+    lua_pushcfunction(main_L, builtin_clear_timeout);
     lua_setglobal(main_L, "clearTimeout");
 
-    lua_pushcfunction(main_L, lua_await);
+    lua_pushcfunction(main_L, builtin_await);
     lua_setglobal(main_L, "await");
 }
 
@@ -630,53 +630,10 @@ void LuaRuntime::ProcessLoadFileRun(std::string source, std::string filename, As
     ReleaseCo(co);
 }
 
-// --- Timer management ---
-
-void LuaRuntime::AddSleepTimer(int64_t deadline_ms, AsyncHandle handle) {
-    int64_t delay = std::max<int64_t>(0, deadline_ms - NowMs());
-    active_timers_[handle] = ActiveTimer{TimerType::kSleep, LUA_NOREF};
-    auto* self = this;
-    executor_->schedule([self, handle]() {
-        if (!self->active_timers_.erase(handle)) return;  // cancelled
-        self->DoResume(handle, {});
-    }, std::chrono::milliseconds(delay));
-}
-
-AsyncHandle LuaRuntime::AddTimeoutTimer(int64_t deadline_ms, int fn_ref) {
-    auto handle = next_handle_.fetch_add(1, std::memory_order_relaxed);
-    int64_t delay = std::max<int64_t>(0, deadline_ms - NowMs());
-    active_timers_[handle] = ActiveTimer{TimerType::kSetTimeout, fn_ref};
-    auto* self = this;
-    executor_->schedule([self, handle, fn_ref]() {
-        if (!self->active_timers_.erase(handle)) return;  // cancelled
-        // Fire the setTimeout callback directly
-        lua_State* co = self->AcquireCo();
-        lua_rawgeti(co, LUA_REGISTRYINDEX, fn_ref);
-        luaL_unref(self->main_L_, LUA_REGISTRYINDEX, fn_ref);
-        int nresults = 0;
-        int status = lua_resume(co, self->main_L_, 0, &nresults);
-        if (status != LUA_YIELD) {
-            self->MaybeRecycleCo(co, status, nresults);
-        }
-    }, std::chrono::milliseconds(delay));
-    return handle;
-}
-
-// CancelTimer: must be called on executor thread (via lua_clear_timeout).
-void LuaRuntime::CancelTimer(AsyncHandle handle) {
-    auto it = active_timers_.find(handle);
-    if (it != active_timers_.end()) {
-        if (it->second.fn_ref != LUA_NOREF) {
-            luaL_unref(main_L_, LUA_REGISTRYINDEX, it->second.fn_ref);
-        }
-        active_timers_.erase(it);
-    }
-}
-
 // --- Yield support ---
 
 AsyncHandle LuaRuntime::PreYield(lua_State* co) {
-    auto handle = next_handle_.fetch_add(1, std::memory_order_relaxed);
+    auto handle = timer_mgr_->NextHandle();
     pending_[handle] = {co};
     return handle;
 }
@@ -725,12 +682,8 @@ void LuaRuntime::Shutdown() {
     if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
 
     decltype(script_promises_) pending_promises;
-    decltype(active_co_refs_) active_refs;
-    decltype(co_pool_) pooled_refs;
 
     std::swap(script_promises_, pending_promises);
-    std::swap(active_co_refs_, active_refs);
-    std::swap(co_pool_, pooled_refs);
     pending_.clear();
     co_complete_callbacks_.clear();
 
@@ -744,19 +697,12 @@ void LuaRuntime::Shutdown() {
     for (auto& [co, promise] : pending_promises) {
         promise.setValue(ScriptResult{LUA_ERRRUN, {}, "runtime shutdown"});
     }
-    for (auto& [handle, timer] : active_timers_) {
-        if (timer.fn_ref != LUA_NOREF) {
-            luaL_unref(main_L_, LUA_REGISTRYINDEX, timer.fn_ref);
-        }
+
+    if (timer_mgr_) {
+        timer_mgr_->CancelAll(main_L_);
     }
-    active_timers_.clear();
-    for (auto& [co, ref] : active_refs) {
-        SetExtraspace(co, nullptr);
-        luaL_unref(main_L_, LUA_REGISTRYINDEX, ref);
-    }
-    for (auto& [co, ref] : pooled_refs) {
-        SetExtraspace(co, nullptr);
-        luaL_unref(main_L_, LUA_REGISTRYINDEX, ref);
+    if (co_pool_) {
+        co_pool_->Shutdown(main_L_);
     }
     SetExtraspace(main_L_, nullptr);
 }
@@ -769,32 +715,6 @@ void LuaRuntime::SetCoCompleteCallback(lua_State* co, CoCompleteCallback cb) {
 
 void LuaRuntime::RemoveCoCompleteCallback(lua_State* co) {
     co_complete_callbacks_.erase(co);
-}
-
-// --- Coroutine pool ---
-
-lua_State* LuaRuntime::AcquireCo() {
-    if (!co_pool_.empty()) {
-        auto [co, ref] = co_pool_.back();
-        co_pool_.pop_back();
-        active_co_refs_[co] = ref;
-        return co;
-    }
-
-    lua_State* co = lua_newthread(main_L_);
-    int ref = luaL_ref(main_L_, LUA_REGISTRYINDEX);
-    SetExtraspace(co, this);
-    active_co_refs_[co] = ref;
-    return co;
-}
-
-void LuaRuntime::ReleaseCo(lua_State* co) {
-    lua_settop(co, 0);
-    auto it = active_co_refs_.find(co);
-    if (it != active_co_refs_.end()) {
-        co_pool_.push_back({co, it->second});
-        active_co_refs_.erase(it);
-    }
 }
 
 void LuaRuntime::MaybeRecycleCo(lua_State* co, int status, int nresults) {
@@ -990,6 +910,26 @@ LuaRuntime::Ptr LuaRuntime::Builder::Create() {
     } else {
         rt->executor_ = executor_;
     }
+
+    auto* self = rt.get();
+    rt->co_pool_ = std::make_unique<CoroutinePool>(rt->main_L_,
+        [self](lua_State* co) { LuaRuntime::SetExtraspace(co, self); });
+    rt->timer_mgr_ = std::make_unique<TimerManager>(
+        rt->executor_,
+        [self](AsyncHandle handle) { self->DoResume(handle, {}); },
+        [self](int fn_ref) {
+            lua_State* co = self->AcquireCo();
+            lua_rawgeti(co, LUA_REGISTRYINDEX, fn_ref);
+            luaL_unref(self->main_L_, LUA_REGISTRYINDEX, fn_ref);
+            int nresults = 0;
+            int status = lua_resume(co, self->main_L_, 0, &nresults);
+            if (status != LUA_YIELD) {
+                self->MaybeRecycleCo(co, status, nresults);
+            }
+        },
+        [self](int fn_ref) {
+            luaL_unref(self->main_L_, LUA_REGISTRYINDEX, fn_ref);
+        });
 
     rt->SetCodeProvider(code_provider_);
     rt->SetExecutor(rt->executor_);

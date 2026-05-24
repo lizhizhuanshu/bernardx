@@ -13,81 +13,13 @@ ActiveSensor::~ActiveSensor() {
 }
 
 void ActiveSensor::ReleaseRefs() {
-    if (!main_L_) return;
-    ReleaseLuaRef(main_L_, script_table_ref_);
-    ReleaseLuaRef(main_L_, enter_ref_);
-    ReleaseLuaRef(main_L_, tick_ref_);
-    ReleaseLuaRef(main_L_, exit_ref_);
+    host_.ReleaseScriptRefs(host_.main_L_);
 }
 
 async_simple::coro::Lazy<bool> ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
-    main_L_ = L;
-    lua_context_ = ctx;
-
-    std::string full_path = spec_.script_path;
-    if (!base_path.empty() && !std::filesystem::path(spec_.script_path).is_absolute()) {
-        full_path = std::filesystem::absolute(base_path + "/" + spec_.script_path).string();
-    }
-
-    auto result = co_await ctx->DoFileAsync(full_path);
-
-    if (result.status != LUA_OK) {
-        std::string msg = "failed to execute '" + spec_.script_path + "': " +
-                      (result.error.empty() ? "unknown error" : result.error);
-        spdlog::error("ActiveSensor::Init: {}", msg);
+    if (!co_await host_.LoadScript(L, ctx, base_path, spec_.script_path, false)) {
         co_return false;
     }
-
-    if (result.values.empty()) {
-        spdlog::error("ActiveSensor::Init: '{}' did not return a value", spec_.script_path);
-        co_return false;
-    }
-
-    auto* table_ref = std::get_if<LuaRef>(&result.values[0]);
-    if (!table_ref) {
-        spdlog::error("ActiveSensor::Init: '{}' did not return a table", spec_.script_path);
-        co_return false;
-    }
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, (*table_ref)->ref);
-    if (!lua_istable(L, -1)) {
-        spdlog::error("ActiveSensor::Init: '{}' did not return a table", spec_.script_path);
-        lua_pop(L, 1);
-        co_return false;
-    }
-
-    lua_pushvalue(L, -1);
-    script_table_ref_ = luaL_ref(L, LUA_REGISTRYINDEX);
-
-    int table_idx = lua_absindex(L, -1);
-
-    auto get_ref = [&](const char* name) -> int {
-        lua_getfield(L, table_idx, name);
-        int ref = LUA_NOREF;
-        if (lua_isfunction(L, -1)) {
-            lua_pushvalue(L, -1);
-            ref = luaL_ref(L, LUA_REGISTRYINDEX);
-        }
-        lua_pop(L, 1);
-        return ref;
-    };
-
-    enter_ref_ = get_ref("Enter");
-    tick_ref_ = get_ref("Tick");
-    exit_ref_ = get_ref("Exit");
-
-    lua_pop(L, 1);
-
-    if (tick_ref_ == LUA_NOREF) {
-        spdlog::error("ActiveSensor::Init: '{}' missing required 'Tick' function",
-                       spec_.script_path);
-        co_return false;
-    }
-
-    spdlog::info("ActiveSensor::Init: loaded '{}' → sensor '{}' (Enter={}, Tick={}, Exit={})",
-                 spec_.script_path, spec_.name,
-                 enter_ref_ != LUA_NOREF, tick_ref_ != LUA_NOREF,
-                 exit_ref_ != LUA_NOREF);
     co_return true;
 }
 
@@ -102,9 +34,9 @@ void ActiveSensor::Activate(Blackboard& bb) {
     active_ = true;
     next_run_ms_ = 0;
 
-    if (enter_ref_ != LUA_NOREF && main_L_) {
-        PushArgsTable(main_L_, spec_.args);
-        LuaCallMethod(main_L_, enter_ref_, script_table_ref_, 1);
+    if (host_.refs_.enter_ref != LUA_NOREF && host_.main_L_) {
+        PushArgsTable(host_.main_L_, spec_.args);
+        LuaCallMethod(host_.main_L_, host_.refs_.enter_ref, host_.refs_.table_ref, 1);
     }
 
     RunOnce(bb);
@@ -114,14 +46,14 @@ void ActiveSensor::Deactivate(Blackboard* bb) {
     if (!active_) return;
     active_ = false;
 
-    if (yielded_co_ != nullptr && lua_context_) {
-        lua_context_->RemoveCoCompleteCallback(yielded_co_);
-        lua_context_->ReleaseCoroutine(yielded_co_);
+    if (yielded_co_ != nullptr && host_.lua_context_) {
+        host_.lua_context_->RemoveCoCompleteCallback(yielded_co_);
+        host_.lua_context_->ReleaseCoroutine(yielded_co_);
         yielded_co_ = nullptr;
     }
 
-    if (exit_ref_ != LUA_NOREF && main_L_) {
-        LuaCallMethod(main_L_, exit_ref_, script_table_ref_, 0);
+    if (host_.refs_.exit_ref != LUA_NOREF && host_.main_L_) {
+        LuaCallMethod(host_.main_L_, host_.refs_.exit_ref, host_.refs_.table_ref, 0);
     }
 }
 
@@ -134,16 +66,16 @@ void ActiveSensor::ScheduleNext(int64_t now_ms) {
 }
 
 void ActiveSensor::RunOnce(Blackboard& bb) {
-    if (!is_loaded() || !main_L_ || !lua_context_) return;
+    if (!is_loaded() || !host_.main_L_ || !host_.lua_context_) return;
     if (yielded_co_ != nullptr) return;
 
-    lua_State* co = lua_context_->AcquireCoroutine();
+    lua_State* co = host_.lua_context_->AcquireCoroutine();
 
-    lua_rawgeti(co, LUA_REGISTRYINDEX, tick_ref_);
-    lua_rawgeti(co, LUA_REGISTRYINDEX, script_table_ref_);
+    lua_rawgeti(co, LUA_REGISTRYINDEX, host_.refs_.tick_ref);
+    lua_rawgeti(co, LUA_REGISTRYINDEX, host_.refs_.table_ref);
 
     auto* self = this;
-    lua_context_->SetCoCompleteCallback(co, [self, &bb](ScriptResult r) {
+    host_.lua_context_->SetCoCompleteCallback(co, [self, &bb](ScriptResult r) {
         if (r.status == LUA_OK) {
             self->HandleResult(r.values, bb);
         }
@@ -151,14 +83,14 @@ void ActiveSensor::RunOnce(Blackboard& bb) {
     });
 
     int nresults = 0;
-    int status = lua_resume(co, main_L_, 1, &nresults);
+    int status = lua_resume(co, host_.main_L_, 1, &nresults);
 
     if (status == LUA_YIELD) {
         yielded_co_ = co;
         return;
     }
 
-    lua_context_->RemoveCoCompleteCallback(co);
+    host_.lua_context_->RemoveCoCompleteCallback(co);
 
     if (status == LUA_OK) {
         auto values = LuaRuntime::PeekValues(co, nresults);
@@ -171,5 +103,5 @@ void ActiveSensor::RunOnce(Blackboard& bb) {
         lua_pop(co, 1);
     }
 
-    lua_context_->ReleaseCoroutine(co);
+    host_.lua_context_->ReleaseCoroutine(co);
 }

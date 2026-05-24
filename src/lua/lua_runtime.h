@@ -21,34 +21,18 @@ extern "C" {
 #include <vector>
 
 #include "code_provider.h"
+#include "coroutine_pool.h"
 #include "lua_extension.h"
 #include "lua_library.h"
+#include "lua_types.h"
+#include "timer_manager.h"
 
 namespace async_simple {
 class Executor;
 }  // namespace async_simple
 
-// --- Value types ---
-
-using AsyncHandle = int64_t;
-
-struct LuaRefBase {
-    const int ref;
-    const int type;
-    virtual ~LuaRefBase() = default;
-protected:
-    LuaRefBase(int r, int t) : ref(r), type(t) {}
-};
-
-using LuaRef = std::shared_ptr<LuaRefBase>;
-
-using LuaValue = std::variant<std::nullptr_t, bool, int64_t, double, std::string, LuaRef>;
-
-struct ScriptResult {
-    int status = LUA_ERRRUN;
-    std::vector<LuaValue> values;
-    std::string error;
-};
+// --- Value types (defined in lua_types.h) ---
+// LuaRefBase, LuaRef, LuaValue
 
 // --- Internal request types (used by LuaRuntime internals) ---
 
@@ -132,9 +116,15 @@ public:
     void PushRequireRun(AsyncHandle handle, std::string source, std::string module_name);
     void PushLoadFileRun(AsyncHandle handle, std::string source, std::string filename);
 
-    void AddSleepTimer(int64_t deadline_ms, AsyncHandle handle);
-    AsyncHandle AddTimeoutTimer(int64_t deadline_ms, int fn_ref);
-    void CancelTimer(AsyncHandle handle);
+    void AddSleepTimer(int64_t deadline_ms, AsyncHandle handle) {
+        timer_mgr_->AddSleepTimer(deadline_ms, handle);
+    }
+    AsyncHandle AddTimeoutTimer(int64_t deadline_ms, int fn_ref) {
+        return timer_mgr_->AddTimeoutTimer(deadline_ms, fn_ref);
+    }
+    void CancelTimer(AsyncHandle handle) {
+        timer_mgr_->CancelTimer(handle);
+    }
 
     AsyncHandle PreYield(lua_State* co);
     static int Yield(lua_State* L);
@@ -169,8 +159,6 @@ private:
     using CoCompleteCallback = std::function<void(ScriptResult)>;
     struct ResumeResult { lua_State* co = nullptr; int status = 0; };
     struct PendingEntry { lua_State* co; };
-    enum class TimerType { kSleep, kSetTimeout };
-    struct ActiveTimer { TimerType type; int fn_ref = LUA_NOREF; };
 
     // Setup / Shutdown
     void Setup(lua_State* main_L);
@@ -197,8 +185,8 @@ private:
     async_simple::coro::Lazy<ScriptResult> AwaitCoroutine(lua_State* co, int status, int nresults);
 
     // Coroutine pool
-    [[nodiscard]] lua_State* AcquireCo();
-    void ReleaseCo(lua_State* co);
+    [[nodiscard]] lua_State* AcquireCo() { return co_pool_->Acquire(); }
+    void ReleaseCo(lua_State* co) { co_pool_->Release(co); }
     void MaybeRecycleCo(lua_State* co, int status, int nresults);
 
     // --- Members ---
@@ -216,12 +204,10 @@ private:
 
     std::atomic<bool> shutting_down_{false};
     std::unordered_map<AsyncHandle, PendingEntry> pending_;
-    std::atomic<AsyncHandle> next_handle_{1};
 
-    std::unordered_map<lua_State*, int> active_co_refs_;
-    std::vector<std::pair<lua_State*, int>> co_pool_;
+    std::unique_ptr<TimerManager> timer_mgr_;
+    std::unique_ptr<CoroutinePool> co_pool_;
 
     std::unordered_map<lua_State*, async_simple::Promise<ScriptResult>> script_promises_;
     std::unordered_map<lua_State*, CoCompleteCallback> co_complete_callbacks_;
-    std::unordered_map<AsyncHandle, ActiveTimer> active_timers_;
 };

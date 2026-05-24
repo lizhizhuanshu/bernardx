@@ -55,7 +55,3 @@ NodeStatus Parallel::Tick(Blackboard& bb, BtEventQueue& events) {
 
     return NodeStatus::kRunning;
 }
-
-void Parallel::Reset() {
-    Composite::Reset();
-}

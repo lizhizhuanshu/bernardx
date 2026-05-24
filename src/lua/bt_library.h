@@ -33,12 +33,18 @@ public:
     void SetProjectPath(std::string path) { project_path_ = std::move(path); }
     const std::string& project_path() const { return project_path_; }
 
-    // Lua coroutine yield/resume state (accessed by bt_run/bt_stop C functions via upvalue)
+    AsyncHandle pending_run_handle() const { return pending_run_handle_; }
+    void set_pending_run_handle(AsyncHandle h) { pending_run_handle_ = h; }
+    LuaRuntime::Ptr pending_run_ctx() const { return pending_run_ctx_; }
+    void set_pending_run_ctx(LuaRuntime::Ptr ctx) { pending_run_ctx_ = std::move(ctx); }
+    bool run_completed() const { return run_completed_.load(); }
+    void set_run_completed(bool v) { run_completed_.store(v); }
+    void clear_pending_run() { pending_run_ctx_.reset(); pending_run_handle_ = 0; }
+
+private:
     AsyncHandle pending_run_handle_ = 0;
     LuaRuntime::Ptr pending_run_ctx_;
     std::atomic<bool> run_completed_{false};
-
-private:
     BehaviorTreeEngine::Ptr engine_;
 
     int64_t tick_interval_ms_{100};

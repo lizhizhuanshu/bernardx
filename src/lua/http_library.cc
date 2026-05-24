@@ -19,7 +19,7 @@ extern "C" {
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <unistd.h>
+#include <thread>
 
 // --- Helpers ---
 
@@ -35,20 +35,19 @@ struct SharedHttpExecutorPool {
 
 SharedHttpExecutorPool* GetSharedHttpExecutorPool(int io_threads) {
     static std::mutex mutex;
-    static pid_t pool_pid = 0;
-    static SharedHttpExecutorPool* pool = nullptr;
+    static std::unique_ptr<SharedHttpExecutorPool> pool;
+    static auto pool_id = std::this_thread::get_id();
 
-    const pid_t current_pid = getpid();
+    auto current_id = std::this_thread::get_id();
     std::lock_guard<std::mutex> lock(mutex);
-    if (!pool || pool_pid != current_pid) {
-        auto* next = new SharedHttpExecutorPool();
-        next->pool = std::make_unique<coro_io::multithread_context_pool>(io_threads);
-        next->pool->run();
-        next->exec = next->pool->get_executor();
-        pool = next;
-        pool_pid = current_pid;
+    if (!pool || pool_id != current_id) {
+        pool = std::make_unique<SharedHttpExecutorPool>();
+        pool->pool = std::make_unique<coro_io::multithread_context_pool>(io_threads);
+        pool->pool->run();
+        pool->exec = pool->pool->get_executor();
+        pool_id = current_id;
     }
-    return pool;
+    return pool.get();
 }
 
 int http_state_gc(lua_State* L) {

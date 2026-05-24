@@ -47,12 +47,8 @@ public:
 
     const std::vector<std::unique_ptr<Decorator>>& decorators() const { return decorators_; }
 
-    // Sensor specs
     const std::vector<SensorSpec>& sensor_specs() const { return sensor_specs_; }
     void AddSensorSpec(SensorSpec spec) { sensor_specs_.push_back(std::move(spec)); }
-
-    // Previous decorator evaluation results (keyed by decorator pointer)
-    std::unordered_map<Decorator*, bool> prev_decorator_results_;
 
 protected:
     Node(uint32_t id, std::string type, std::string name);

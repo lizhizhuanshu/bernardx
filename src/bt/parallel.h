@@ -11,7 +11,6 @@ public:
              Policy failure = Policy::kRequireOne);
 
     NodeStatus Tick(Blackboard& bb, BtEventQueue& events) override;
-    void Reset() override;
 
 private:
     Policy success_policy_;

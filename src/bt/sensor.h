@@ -11,6 +11,7 @@ extern "C" {
 #include <async_simple/coro/Lazy.h>
 
 #include "bt_utils.h"
+#include "lua_script_host.h"
 #include "lua_runtime.h"
 
 struct SensorSpec {
@@ -44,19 +45,13 @@ public:
 
     const std::string& name() const { return spec_.name; }
     bool is_active() const { return active_; }
-    bool is_loaded() const { return tick_ref_ != LUA_NOREF; }
+    bool is_loaded() const { return host_.is_loaded(); }
 
 private:
     void HandleResult(const std::vector<LuaValue>& values, Blackboard& bb);
 
     SensorSpec spec_;
-    lua_State* main_L_ = nullptr;
-    LuaRuntime* lua_context_ = nullptr;
-
-    int script_table_ref_ = LUA_NOREF;
-    int enter_ref_ = LUA_NOREF;
-    int tick_ref_ = LUA_NOREF;
-    int exit_ref_ = LUA_NOREF;
+    LuaScriptHost host_;
 
     lua_State* yielded_co_ = nullptr;
     bool active_ = false;

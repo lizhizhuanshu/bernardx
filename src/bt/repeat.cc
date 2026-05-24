@@ -2,11 +2,8 @@
 
 Repeat::Repeat(uint32_t id, std::string name, int count,
                std::unique_ptr<Node> child)
-    : Node(id, "Repeat", std::move(name)),
-      child_(std::move(child)),
-      max_count_(count) {
-    if (child_) child_->set_parent(this);
-}
+    : SingleChildNode(id, "Repeat", std::move(name), std::move(child)),
+      max_count_(count) {}
 
 NodeStatus Repeat::Tick(Blackboard& bb, BtEventQueue& events) {
     if (!child_) {
@@ -23,12 +20,10 @@ NodeStatus Repeat::Tick(Blackboard& bb, BtEventQueue& events) {
         if (status == NodeStatus::kRunning) {
             return NodeStatus::kRunning;
         }
-        // Success: reset child and keep going
         child_->Reset();
         return NodeStatus::kRunning;
     }
 
-    // Finite repeat: count executions
     if (current_count_ >= max_count_) {
         return NodeStatus::kSuccess;
     }
@@ -42,7 +37,6 @@ NodeStatus Repeat::Tick(Blackboard& bb, BtEventQueue& events) {
         return NodeStatus::kFailure;
     }
 
-    // Child succeeded: increment count, reset child for next iteration
     ++current_count_;
     child_->Reset();
 
@@ -54,24 +48,5 @@ NodeStatus Repeat::Tick(Blackboard& bb, BtEventQueue& events) {
 
 void Repeat::Reset() {
     current_count_ = 0;
-    if (child_) child_->Reset();
-    Node::Reset();
-}
-
-void Repeat::OnAborted() {
-    if (child_) child_->OnAborted();
-    Node::OnAborted();
-}
-
-async_simple::coro::Lazy<bool> Repeat::Init(lua_State* L, LuaRuntime* ctx,
-                                              const std::string& base_path) {
-    if (child_ && !co_await child_->Init(L, ctx, base_path)) {
-        set_last_error(child_->last_error());
-        co_return false;
-    }
-    co_return true;
-}
-
-void Repeat::ReleaseRefs() {
-    if (child_) child_->ReleaseRefs();
+    SingleChildNode::Reset();
 }

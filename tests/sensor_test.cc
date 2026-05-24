@@ -32,7 +32,8 @@ TEST(TreeParserSensorTest, ParseSensorsOnComposite) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     const auto& specs = root->sensor_specs();
     ASSERT_EQ(specs.size(), 2u);
@@ -54,7 +55,8 @@ TEST(TreeParserSensorTest, ParseSensorsOnScriptNode) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     ASSERT_EQ(root->sensor_specs().size(), 1u);
     EXPECT_EQ(root->sensor_specs()[0].name, "check");
@@ -71,7 +73,8 @@ TEST(TreeParserSensorTest, ParseNoSensors) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_TRUE(root->sensor_specs().empty());
 }
@@ -87,7 +90,8 @@ TEST(TreeParserSensorTest, ParseSensorMissingName) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     EXPECT_TRUE(root->sensor_specs().empty());
 }
@@ -121,7 +125,8 @@ TEST(TreeParserSensorTest, ParseSensorsOnNestedNode) {
         }
     })";
 
-    auto root = TreeParser::Parse(json);
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
     auto* sel = dynamic_cast<Composite*>(root.get());
     ASSERT_NE(sel, nullptr);
@@ -148,7 +153,7 @@ TEST(SensorLifecycleTest, DeactivateAllOnLoad) {
         }
     })";
 
-    ASSERT_TRUE(engine->Load(json1));
+    ASSERT_TRUE(engine->Load(json1).first);
 
     const char* json2 = R"({
         "root": {
@@ -157,7 +162,7 @@ TEST(SensorLifecycleTest, DeactivateAllOnLoad) {
         }
     })";
 
-    EXPECT_TRUE(engine->Load(json2));
+    EXPECT_TRUE(engine->Load(json2).first);
     EXPECT_TRUE(engine->blackboard().Has("s1") == false);
 }
 

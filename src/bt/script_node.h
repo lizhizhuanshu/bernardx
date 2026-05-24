@@ -12,6 +12,7 @@ extern "C" {
 
 #include "bt_utils.h"
 #include "leaf.h"
+#include "lua_script_host.h"
 #include "lua_runtime.h"
 
 class ScriptNode : public Leaf {
@@ -27,7 +28,7 @@ public:
 
     void ReleaseRefs() override;
 
-    bool is_loaded() const { return tick_ref_ != LUA_NOREF; }
+    bool is_loaded() const { return host_.is_loaded(); }
 
     NodeStatus Tick(Blackboard& bb, BtEventQueue& events) override;
     void Reset() override;
@@ -38,14 +39,7 @@ private:
 
     std::string script_path_;
     ArgsMap args_;
-    lua_State* main_L_ = nullptr;
-    LuaRuntime* lua_context_ = nullptr;
-
-    int script_table_ref_ = LUA_NOREF;
-    int enter_ref_ = LUA_NOREF;
-    int tick_ref_ = LUA_NOREF;
-    int exit_ref_ = LUA_NOREF;
-    int abort_ref_ = LUA_NOREF;
+    LuaScriptHost host_;
 
     bool active_ = false;
 

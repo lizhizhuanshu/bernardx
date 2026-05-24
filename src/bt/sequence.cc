@@ -25,7 +25,3 @@ NodeStatus Sequence::Tick(Blackboard& bb, BtEventQueue& events) {
     current_child_index_ = 0;
     return NodeStatus::kSuccess;
 }
-
-void Sequence::Reset() {
-    Composite::Reset();
-}

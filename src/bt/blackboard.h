@@ -39,9 +39,13 @@ public:
     }
 
     void PushAsTable(lua_State* L) const {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unordered_map<std::string, LuaValue> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            snapshot = data_;
+        }
         lua_newtable(L);
-        for (const auto& [key, value] : data_) {
+        for (const auto& [key, value] : snapshot) {
             lua_pushstring(L, key.c_str());
             LuaRuntime::PushValues(L, {value});
             lua_settable(L, -3);
