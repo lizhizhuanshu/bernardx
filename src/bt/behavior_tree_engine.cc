@@ -354,12 +354,6 @@ void BehaviorTreeEngine::DeactivateAllSensors() {
 
 void BehaviorTreeEngine::StartLoop(std::shared_ptr<CodeProvider> code_provider,
                                     int64_t tick_interval_ms,
-                                    CompletionCallback on_complete) {
-    StartLoop(std::move(code_provider), tick_interval_ms, std::move(on_complete), nullptr);
-}
-
-void BehaviorTreeEngine::StartLoop(std::shared_ptr<CodeProvider> code_provider,
-                                    int64_t tick_interval_ms,
                                     CompletionCallback on_complete,
                                     LuaRuntime* parent_runtime) {
     auto builder = LuaRuntime::Builder()
