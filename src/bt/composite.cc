@@ -23,3 +23,20 @@ void Composite::OnAborted() {
     }
     Node::OnAborted();
 }
+
+async_simple::coro::Lazy<bool> Composite::Init(lua_State* L, LuaRuntime* ctx,
+                                                 const std::string& base_path) {
+    for (auto& child : children_) {
+        if (!co_await child->Init(L, ctx, base_path)) {
+            set_last_error(child->last_error());
+            co_return false;
+        }
+    }
+    co_return true;
+}
+
+void Composite::ReleaseRefs() {
+    for (auto& child : children_) {
+        child->ReleaseRefs();
+    }
+}

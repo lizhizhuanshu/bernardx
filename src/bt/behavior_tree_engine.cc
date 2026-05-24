@@ -8,9 +8,6 @@
 #include "composite.h"
 #include "file_system_code_provider.h"
 #include "lua_runtime.h"
-#include "repeat.h"
-#include "retry_until_successful.h"
-#include "script_node.h"
 #include "tree_parser.h"
 
 int64_t BehaviorTreeEngine::NowMs() {
@@ -91,65 +88,15 @@ std::string BehaviorTreeEngine::GetCurrentNode() const {
 
 async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx) {
     if (root_) {
-        bool ok = co_await InitScriptNodesRecursiveAsync(root_.get(), L, ctx);
-        if (!ok) {
+        if (!co_await root_->Init(L, ctx, project_path_)) {
             co_return root_->last_error();
         }
     }
     co_return std::string();
 }
 
-async_simple::coro::Lazy<bool> BehaviorTreeEngine::InitScriptNodesRecursiveAsync(
-    Node* node, lua_State* L, LuaRuntime* ctx) {
-    if (auto* script = dynamic_cast<ScriptNode*>(node)) {
-        bool ok = co_await script->Init(L, ctx, project_path_);
-        if (!ok) {
-            co_return false;
-        }
-    }
-    if (auto* composite = dynamic_cast<Composite*>(node)) {
-        for (auto& child : composite->children()) {
-            bool ok = co_await InitScriptNodesRecursiveAsync(child.get(), L, ctx);
-            if (!ok) {
-                node->set_last_error(child->last_error());
-                co_return false;
-            }
-        }
-    }
-    if (auto* repeat = dynamic_cast<Repeat*>(node)) {
-        if (repeat->child()) {
-            bool ok = co_await InitScriptNodesRecursiveAsync(repeat->child(), L, ctx);
-            if (!ok) {
-                node->set_last_error(repeat->child()->last_error());
-                co_return false;
-            }
-        }
-    } else if (auto* retry = dynamic_cast<RetryUntilSuccessful*>(node)) {
-        if (retry->child()) {
-            bool ok = co_await InitScriptNodesRecursiveAsync(retry->child(), L, ctx);
-            if (!ok) {
-                node->set_last_error(retry->child()->last_error());
-                co_return false;
-            }
-        }
-    }
-    co_return true;
-}
-
 void BehaviorTreeEngine::ReleaseScriptNodeRefsRecursive(Node* node) {
-    if (auto* script = dynamic_cast<ScriptNode*>(node)) {
-        script->ReleaseRefs();
-    }
-    if (auto* composite = dynamic_cast<Composite*>(node)) {
-        for (auto& child : composite->children()) {
-            ReleaseScriptNodeRefsRecursive(child.get());
-        }
-    }
-    if (auto* repeat = dynamic_cast<Repeat*>(node)) {
-        if (repeat->child()) ReleaseScriptNodeRefsRecursive(repeat->child());
-    } else if (auto* retry = dynamic_cast<RetryUntilSuccessful*>(node)) {
-        if (retry->child()) ReleaseScriptNodeRefsRecursive(retry->child());
-    }
+    node->ReleaseRefs();
 }
 
 NodeStatus BehaviorTreeEngine::TickOnce() {

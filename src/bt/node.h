@@ -5,12 +5,19 @@
 #include <unordered_map>
 #include <vector>
 
+extern "C" {
+#include "lua.h"
+}
+
+#include <async_simple/coro/Lazy.h>
+
 #include "decorator.h"
 #include "sensor.h"
 #include "types.h"
 
 class Blackboard;
 class BtEventQueue;
+class LuaRuntime;
 
 class Node {
 public:
@@ -18,9 +25,12 @@ public:
 
     virtual NodeStatus Tick(Blackboard& bb, BtEventQueue& events) = 0;
     virtual void Reset();
-
-    // Called when this node (or an ancestor's abort) interrupts execution
     virtual void OnAborted();
+
+    virtual async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx,
+                                                 const std::string& base_path);
+
+    virtual void ReleaseRefs();
 
     // Tree structure
     Node* parent() const { return parent_; }

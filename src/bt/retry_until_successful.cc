@@ -44,3 +44,16 @@ void RetryUntilSuccessful::OnAborted() {
     if (child_) child_->OnAborted();
     Node::OnAborted();
 }
+
+async_simple::coro::Lazy<bool> RetryUntilSuccessful::Init(lua_State* L, LuaRuntime* ctx,
+                                                            const std::string& base_path) {
+    if (child_ && !co_await child_->Init(L, ctx, base_path)) {
+        set_last_error(child_->last_error());
+        co_return false;
+    }
+    co_return true;
+}
+
+void RetryUntilSuccessful::ReleaseRefs() {
+    if (child_) child_->ReleaseRefs();
+}

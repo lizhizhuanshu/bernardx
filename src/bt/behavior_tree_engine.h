@@ -76,7 +76,6 @@ public:
     void SetProjectPath(std::string path) { project_path_ = std::move(path); }
     const std::string& project_path() const { return project_path_; }
 
-    // Initialize sensors with lua_State and LuaRuntime (called on BT thread)
     void InitSensors(lua_State* L, LuaRuntime* ctx);
 
     // Activate sensors for the initial active path (root → first child → ...)
@@ -94,7 +93,6 @@ private:
     void PropagateAbort(Node* source, AbortMode mode);
     void HandleEvents();
     void ResetTree();
-    async_simple::coro::Lazy<bool> InitScriptNodesRecursiveAsync(Node* node, lua_State* L, LuaRuntime* ctx);
     void ReleaseScriptNodeRefsRecursive(Node* node);
     void CollectRunningNodes(Node* node, std::vector<Node*>& out);
     bool IsDescendantOf(Node* node, Node* ancestor) const;
