@@ -14,7 +14,7 @@ struct HttpLibraryState {
 
 class HttpLibrary : public LuaLibrary {
 public:
-    explicit HttpLibrary(int io_threads = 1);
+    explicit HttpLibrary(coro_io::ExecutorWrapper<>& exec);
     ~HttpLibrary() override;
 
     std::string name() const override { return "http"; }
@@ -22,5 +22,5 @@ public:
     void Close(lua_State* L) override;
 
 private:
-    int io_threads_ = 1;
+    coro_io::ExecutorWrapper<>& exec_;
 };

@@ -243,6 +243,9 @@ std::unique_ptr<Node> TreeParser::ParseComposite(const nlohmann::json& j, uint32
 
     ApplyDecorators(j, node.get());
     ApplySensors(j, node.get());
+    if (j.contains("description")) {
+        node->set_description(j["description"].get<std::string>());
+    }
     return node;
 }
 
@@ -272,6 +275,9 @@ std::unique_ptr<Node> TreeParser::ParseScriptLeaf(const nlohmann::json& j, uint3
     auto node = std::make_unique<ScriptNode>(id, std::move(name), std::move(path), std::move(args));
     ApplyDecorators(j, node.get());
     ApplySensors(j, node.get());
+    if (j.contains("description")) {
+        node->set_description(j["description"].get<std::string>());
+    }
     return node;
 }
 
@@ -308,10 +314,13 @@ std::unique_ptr<Node> TreeParser::ParseSubtree(const nlohmann::json& j, uint32_t
 
     auto name = j.value("name", subtree_name);
     auto node = std::make_unique<SubtreeNode>(subtree_id, std::move(name),
-                                               std::move(subtree_name),
-                                               std::move(subtree_root));
+                                                std::move(subtree_name),
+                                                std::move(subtree_root));
     ApplyDecorators(j, node.get());
     ApplySensors(j, node.get());
+    if (j.contains("description")) {
+        node->set_description(j["description"].get<std::string>());
+    }
     return node;
 }
 
@@ -332,6 +341,9 @@ std::unique_ptr<Node> TreeParser::ParseRepeat(const nlohmann::json& j, uint32_t&
     auto node = std::make_unique<Repeat>(id, std::move(name), count, std::move(children[0]));
     ApplyDecorators(j, node.get());
     ApplySensors(j, node.get());
+    if (j.contains("description")) {
+        node->set_description(j["description"].get<std::string>());
+    }
     return node;
 }
 
@@ -353,6 +365,9 @@ std::unique_ptr<Node> TreeParser::ParseRetryUntilSuccessful(const nlohmann::json
                                                         std::move(children[0]));
     ApplyDecorators(j, node.get());
     ApplySensors(j, node.get());
+    if (j.contains("description")) {
+        node->set_description(j["description"].get<std::string>());
+    }
     return node;
 }
 
@@ -365,6 +380,9 @@ std::unique_ptr<Node> TreeParser::ParseWait(const nlohmann::json& j, uint32_t& n
     auto node = std::make_unique<WaitNode>(id, std::move(name), ms);
     ApplyDecorators(j, node.get());
     ApplySensors(j, node.get());
+    if (j.contains("description")) {
+        node->set_description(j["description"].get<std::string>());
+    }
     return node;
 }
 
@@ -439,6 +457,7 @@ void TreeParser::ApplySensors(const nlohmann::json& j, Node* node) {
 
         SensorSpec spec;
         spec.name = sen_j["name"].get<std::string>();
+        spec.description = sen_j.value("description", "");
         spec.script_path = sen_j["path"].get<std::string>();
         spec.interval_ms = sen_j.value("interval", 100);
 

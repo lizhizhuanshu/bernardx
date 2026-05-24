@@ -16,10 +16,8 @@ extern "C" {
 #include <cstring>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <unordered_map>
-#include <thread>
 
 // --- Helpers ---
 
@@ -27,28 +25,6 @@ namespace {
 
 int kHttpStateRegistryKey = 0;
 constexpr const char* kHttpStateMetatable = "http__state";
-
-struct SharedHttpExecutorPool {
-    std::unique_ptr<coro_io::multithread_context_pool> pool;
-    coro_io::ExecutorWrapper<>* exec = nullptr;
-};
-
-SharedHttpExecutorPool* GetSharedHttpExecutorPool(int io_threads) {
-    static std::mutex mutex;
-    static std::unique_ptr<SharedHttpExecutorPool> pool;
-    static auto pool_id = std::this_thread::get_id();
-
-    auto current_id = std::this_thread::get_id();
-    std::lock_guard<std::mutex> lock(mutex);
-    if (!pool || pool_id != current_id) {
-        pool = std::make_unique<SharedHttpExecutorPool>();
-        pool->pool = std::make_unique<coro_io::multithread_context_pool>(io_threads);
-        pool->pool->run();
-        pool->exec = pool->pool->get_executor();
-        pool_id = current_id;
-    }
-    return pool.get();
-}
 
 int http_state_gc(lua_State* L) {
     auto* slot = static_cast<std::shared_ptr<HttpLibraryState>*>(lua_touserdata(L, 1));
@@ -485,9 +461,7 @@ static const luaL_Reg ws_methods[] = {
 
 // --- HttpLibrary ---
 
-HttpLibrary::HttpLibrary(int io_threads) {
-    io_threads_ = io_threads;
-}
+HttpLibrary::HttpLibrary(coro_io::ExecutorWrapper<>& exec) : exec_(exec) {}
 
 HttpLibrary::~HttpLibrary() {
     Close(nullptr);
@@ -518,17 +492,13 @@ void HttpLibrary::Open(lua_State* L) {
         {nullptr, nullptr}
     };
     auto state = std::make_shared<HttpLibraryState>();
-    state->exec = GetSharedHttpExecutorPool(io_threads_)->exec;
+    state->exec = &exec_;
     SetHttpState(L, state);
     luaL_setfuncs(L, funcs, 0);
 }
 
 void HttpLibrary::Close(lua_State* L) {
-    if (!L) {
-        return;
-    }
+    if (!L) return;
     auto state = GetHttpState(L);
-    if (!state || state->shutting_down.exchange(true)) {
-        return;
-    }
+    if (!state || state->shutting_down.exchange(true)) return;
 }

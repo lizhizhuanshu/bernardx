@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <asio.hpp>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
@@ -15,16 +16,29 @@
 
 #define AWAIT(lazy) async_simple::coro::syncAwait(lazy)
 
-// --- HttpLibrary ---
-
 class HttpLibraryTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        work = std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(
+            asio::make_work_guard(ioc));
+        exec = std::make_unique<coro_io::ExecutorWrapper<>>(ioc.get_executor());
+        io_thread = std::thread([this]() { ioc.run(); });
         rt = LuaRuntime::Builder()
-            .RegisterLibrary(std::make_shared<HttpLibrary>())
+            .RegisterLibrary(std::make_shared<HttpLibrary>(*exec))
             .Create();
     }
 
+    void TearDown() override {
+        rt.reset();
+        work.reset();
+        ioc.stop();
+        if (io_thread.joinable()) io_thread.join();
+    }
+
+    asio::io_context ioc{1};
+    std::unique_ptr<asio::executor_work_guard<asio::io_context::executor_type>> work;
+    std::unique_ptr<coro_io::ExecutorWrapper<>> exec;
+    std::thread io_thread;
     LuaRuntime::Ptr rt;
 };
 
@@ -88,7 +102,6 @@ TEST_F(HttpLibraryTest, HttpGetReturnsErrorForInvalidUrl) {
     auto r = AWAIT(rt->RunScript(R"(
         local http = require("http")
         local status, body, err = http.get("http://127.0.0.1:1")
-        -- connection refused: status may be 0 or a non-200 code, err should be non-nil
         assert(err ~= nil, "expected error message for connection refused, got nil")
     )"));
     EXPECT_EQ(r.status, LUA_OK);
@@ -122,9 +135,14 @@ TEST(HttpLibraryStressTest, RecreateRuntimeWithHttpLibrary100TimesWithTimeoutGua
     ASSERT_NE(pid, -1) << "fork failed";
 
     if (pid == 0) {
+        asio::io_context ioc{1};
+        auto work = asio::make_work_guard(ioc);
+        auto exec = std::make_unique<coro_io::ExecutorWrapper<>>(ioc.get_executor());
+        std::thread io_thread([&ioc]() { ioc.run(); });
+
         for (int i = 0; i < kIterations; ++i) {
             auto runtime = LuaRuntime::Builder()
-                .RegisterLibrary(std::make_shared<HttpLibrary>())
+                .RegisterLibrary(std::make_shared<HttpLibrary>(*exec))
                 .Create();
             auto result = AWAIT(runtime->RunScript(R"(
                 local http = require("http")
@@ -138,6 +156,10 @@ TEST(HttpLibraryStressTest, RecreateRuntimeWithHttpLibrary100TimesWithTimeoutGua
                 _exit(2);
             }
         }
+
+        work.reset();
+        ioc.stop();
+        io_thread.join();
         _exit(0);
     }
 

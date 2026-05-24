@@ -1,5 +1,6 @@
 #include <gflags/gflags.h>
 
+#include <asio.hpp>
 #include <async_simple/coro/SyncAwait.h>
 #include <async_simple/executors/SimpleExecutor.h>
 
@@ -7,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <thread>
 
 #include "bt_library.h"
 #include "http_library.h"
@@ -28,12 +30,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    asio::io_context ioc{1};
+    auto ioc_work = asio::make_work_guard(ioc);
+    auto http_exec = std::make_unique<coro_io::ExecutorWrapper<>>(ioc.get_executor());
+    std::thread io_thread([&ioc]() { ioc.run(); });
+
     auto code_provider = std::make_shared<FileSystemCodeProvider>(dir);
     auto blackboard = std::make_shared<Blackboard>();
     auto bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
     auto bt_lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
     bt_lib->SetMainLibsPath(std::filesystem::absolute(dir).string() + "/libs");
-    auto http_lib = std::make_shared<HttpLibrary>();
+    auto http_lib = std::make_shared<HttpLibrary>(*http_exec);
     auto json_lib = std::make_shared<JsonLibrary>();
 
     async_simple::executors::SimpleExecutor executor(1);
@@ -64,6 +71,10 @@ int main(int argc, char* argv[]) {
         bt_lib->engine()->StopLoop();
         bt_lib->engine()->Stop();
     }
+
+    ioc_work.reset();
+    ioc.stop();
+    io_thread.join();
 
     return 0;
 }

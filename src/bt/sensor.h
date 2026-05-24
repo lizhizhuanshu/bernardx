@@ -17,6 +17,7 @@ extern "C" {
 struct SensorSpec {
     using ArgsMap = std::unordered_map<std::string, LuaValue>;
     std::string name;
+    std::string description;
     std::string script_path;
     int64_t interval_ms;
     ArgsMap args;
@@ -42,6 +43,7 @@ public:
     void ScheduleNext(int64_t now_ms);
 
     const std::string& name() const { return spec_.name; }
+    const std::string& description() const { return spec_.description; }
     bool is_active() const { return active_; }
     bool is_loaded() const { return host_.is_loaded(); }
 
