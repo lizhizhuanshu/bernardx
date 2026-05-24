@@ -34,7 +34,7 @@ void ScriptNode::ReleaseRefs() {
     unref(abort_ref_);
 }
 
-async_simple::coro::Lazy<void> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
+async_simple::coro::Lazy<bool> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
     main_L_ = L;
     lua_context_ = ctx;
 
@@ -50,14 +50,14 @@ async_simple::coro::Lazy<void> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, c
                       (result.error.empty() ? "unknown error" : result.error);
         spdlog::error("ScriptNode::Init: {}", msg);
         set_last_error(std::move(msg));
-        co_return;
+        co_return false;
     }
 
     if (result.values.empty()) {
         std::string msg = "'" + full_path + "' did not return a value";
         spdlog::error("ScriptNode::Init: {}", msg);
         set_last_error(std::move(msg));
-        co_return;
+        co_return false;
     }
 
     auto* table_ref = std::get_if<LuaRef>(&result.values[0]);
@@ -65,7 +65,7 @@ async_simple::coro::Lazy<void> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, c
         std::string msg = "'" + full_path + "' did not return a table";
         spdlog::error("ScriptNode::Init: {}", msg);
         set_last_error(std::move(msg));
-        co_return;
+        co_return false;
     }
 
     lua_rawgeti(main_L_, LUA_REGISTRYINDEX, (*table_ref)->ref);
@@ -74,10 +74,9 @@ async_simple::coro::Lazy<void> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, c
         spdlog::error("ScriptNode::Init: {}", msg);
         set_last_error(std::move(msg));
         lua_pop(main_L_, 1);
-        co_return;
+        co_return false;
     }
 
-    // Save the script table ref for colon-method calls (self)
     lua_pushvalue(main_L_, -1);
     script_table_ref_ = luaL_ref(main_L_, LUA_REGISTRYINDEX);
 
@@ -99,18 +98,20 @@ async_simple::coro::Lazy<void> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, c
     exit_ref_ = get_ref("Exit");
     abort_ref_ = get_ref("Abort");
 
-    lua_pop(main_L_, 1);  // pop table
+    lua_pop(main_L_, 1);
 
     if (tick_ref_ == LUA_NOREF) {
         std::string msg = "'" + script_path_ + "' missing required 'Tick' function";
         spdlog::error("ScriptNode::Init: {}", msg);
         set_last_error(std::move(msg));
+        co_return false;
     }
 
     spdlog::info("ScriptNode::Init: loaded '{}' (Enter={}, Tick={}, Exit={}, Abort={})",
                  script_path_,
                  enter_ref_ != LUA_NOREF, tick_ref_ != LUA_NOREF,
-                 exit_ref_ != LUA_NOREF, abort_ref_ != LUA_NOREF);
+                  exit_ref_ != LUA_NOREF, abort_ref_ != LUA_NOREF);
+    co_return true;
 }
 
 void ScriptNode::PushArgsTable(lua_State* L) const {

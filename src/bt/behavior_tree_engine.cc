@@ -91,49 +91,49 @@ std::string BehaviorTreeEngine::GetCurrentNode() const {
 
 async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx) {
     if (root_) {
-        co_await InitScriptNodesRecursiveAsync(root_.get(), L, ctx);
-        if (!root_->last_error().empty()) {
+        bool ok = co_await InitScriptNodesRecursiveAsync(root_.get(), L, ctx);
+        if (!ok) {
             co_return root_->last_error();
         }
     }
     co_return std::string();
 }
 
-async_simple::coro::Lazy<void> BehaviorTreeEngine::InitScriptNodesRecursiveAsync(
+async_simple::coro::Lazy<bool> BehaviorTreeEngine::InitScriptNodesRecursiveAsync(
     Node* node, lua_State* L, LuaRuntime* ctx) {
     if (auto* script = dynamic_cast<ScriptNode*>(node)) {
-        co_await script->Init(L, ctx, project_path_);
-        if (!script->last_error().empty()) {
-            node->set_last_error(script->last_error());
-            co_return;
+        bool ok = co_await script->Init(L, ctx, project_path_);
+        if (!ok) {
+            co_return false;
         }
     }
     if (auto* composite = dynamic_cast<Composite*>(node)) {
         for (auto& child : composite->children()) {
-            co_await InitScriptNodesRecursiveAsync(child.get(), L, ctx);
-            if (!child->last_error().empty()) {
+            bool ok = co_await InitScriptNodesRecursiveAsync(child.get(), L, ctx);
+            if (!ok) {
                 node->set_last_error(child->last_error());
-                co_return;
+                co_return false;
             }
         }
     }
     if (auto* repeat = dynamic_cast<Repeat*>(node)) {
         if (repeat->child()) {
-            co_await InitScriptNodesRecursiveAsync(repeat->child(), L, ctx);
-            if (!repeat->child()->last_error().empty()) {
+            bool ok = co_await InitScriptNodesRecursiveAsync(repeat->child(), L, ctx);
+            if (!ok) {
                 node->set_last_error(repeat->child()->last_error());
-                co_return;
+                co_return false;
             }
         }
     } else if (auto* retry = dynamic_cast<RetryUntilSuccessful*>(node)) {
         if (retry->child()) {
-            co_await InitScriptNodesRecursiveAsync(retry->child(), L, ctx);
-            if (!retry->child()->last_error().empty()) {
+            bool ok = co_await InitScriptNodesRecursiveAsync(retry->child(), L, ctx);
+            if (!ok) {
                 node->set_last_error(retry->child()->last_error());
-                co_return;
+                co_return false;
             }
         }
     }
+    co_return true;
 }
 
 void BehaviorTreeEngine::ReleaseScriptNodeRefsRecursive(Node* node) {

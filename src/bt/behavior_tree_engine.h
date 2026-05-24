@@ -94,7 +94,7 @@ private:
     void PropagateAbort(Node* source, AbortMode mode);
     void HandleEvents();
     void ResetTree();
-    async_simple::coro::Lazy<void> InitScriptNodesRecursiveAsync(Node* node, lua_State* L, LuaRuntime* ctx);
+    async_simple::coro::Lazy<bool> InitScriptNodesRecursiveAsync(Node* node, lua_State* L, LuaRuntime* ctx);
     void ReleaseScriptNodeRefsRecursive(Node* node);
     void CollectRunningNodes(Node* node, std::vector<Node*>& out);
     bool IsDescendantOf(Node* node, Node* ancestor) const;

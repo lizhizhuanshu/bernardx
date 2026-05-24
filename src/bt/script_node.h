@@ -22,7 +22,7 @@ public:
 
     const std::string& script_path() const { return script_path_; }
 
-    async_simple::coro::Lazy<void> Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
+    async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
 
     // Release Lua registry refs while the Lua state is still alive.
     // Must be called before the owning LuaRuntime is destroyed.
