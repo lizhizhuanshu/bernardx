@@ -34,8 +34,6 @@ public:
 
     async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path);
 
-    void ReleaseRefs();
-
     void Activate(Blackboard& bb);
     void Deactivate(Blackboard* bb = nullptr);
 

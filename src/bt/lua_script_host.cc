@@ -86,11 +86,11 @@ async_simple::coro::Lazy<bool> LuaScriptHost::LoadScript(
     co_return true;
 }
 
-void LuaScriptHost::ReleaseScriptRefs(lua_State* L) {
-    if (!L) return;
-    ReleaseLuaRef(L, refs_.table_ref);
-    ReleaseLuaRef(L, refs_.enter_ref);
-    ReleaseLuaRef(L, refs_.tick_ref);
-    ReleaseLuaRef(L, refs_.exit_ref);
-    ReleaseLuaRef(L, refs_.abort_ref);
+LuaScriptHost::~LuaScriptHost() {
+    if (!main_L_) return;
+    ReleaseLuaRef(main_L_, refs_.table_ref);
+    ReleaseLuaRef(main_L_, refs_.enter_ref);
+    ReleaseLuaRef(main_L_, refs_.tick_ref);
+    ReleaseLuaRef(main_L_, refs_.exit_ref);
+    ReleaseLuaRef(main_L_, refs_.abort_ref);
 }

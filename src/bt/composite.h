@@ -26,7 +26,6 @@ public:
     void OnAborted() override;
     async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx,
                                          const std::string& base_path) override;
-    void ReleaseRefs() override;
 
 protected:
     Composite(uint32_t id, std::string type, std::string name);

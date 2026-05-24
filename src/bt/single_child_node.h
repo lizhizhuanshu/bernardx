@@ -18,7 +18,6 @@ public:
     void OnAborted() override;
     async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx,
                                          const std::string& base_path) override;
-    void ReleaseRefs() override;
 
     Node* child() const { return child_.get(); }
 

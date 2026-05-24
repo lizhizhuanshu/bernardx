@@ -34,9 +34,3 @@ async_simple::coro::Lazy<bool> Composite::Init(lua_State* L, LuaRuntime* ctx,
     }
     co_return true;
 }
-
-void Composite::ReleaseRefs() {
-    for (auto& child : children_) {
-        child->ReleaseRefs();
-    }
-}

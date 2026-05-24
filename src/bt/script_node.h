@@ -26,8 +26,6 @@ public:
 
     async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) override;
 
-    void ReleaseRefs() override;
-
     bool is_loaded() const { return host_.is_loaded(); }
 
     NodeStatus Tick(Blackboard& bb, BtEventQueue& events) override;

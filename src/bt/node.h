@@ -30,8 +30,6 @@ public:
     virtual async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx,
                                                  const std::string& base_path);
 
-    virtual void ReleaseRefs();
-
     // Tree structure
     Node* parent() const { return parent_; }
     void set_parent(Node* p) { parent_ = p; }

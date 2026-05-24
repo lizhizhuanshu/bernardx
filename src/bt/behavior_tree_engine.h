@@ -86,7 +86,6 @@ private:
     void HandleEvents();
     void ResetTree();
     void ClearDecoratorState();
-    void ReleaseScriptNodeRefs(Node* node);
     void CollectRunningNodes(Node* node, std::vector<Node*>& out);
     bool IsDescendantOf(Node* node, Node* ancestor) const;
 

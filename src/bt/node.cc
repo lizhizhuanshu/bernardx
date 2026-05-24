@@ -17,8 +17,6 @@ async_simple::coro::Lazy<bool> Node::Init(lua_State* /*L*/, LuaRuntime* /*ctx*/,
     co_return true;
 }
 
-void Node::ReleaseRefs() {}
-
 void Node::AddDecorator(std::unique_ptr<Decorator> dec) {
     decorators_.push_back(std::move(dec));
 }

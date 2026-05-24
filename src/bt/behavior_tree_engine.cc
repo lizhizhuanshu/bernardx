@@ -85,10 +85,6 @@ async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitScriptNodesAsync(l
     co_return std::string();
 }
 
-void BehaviorTreeEngine::ReleaseScriptNodeRefs(Node* node) {
-    node->ReleaseRefs();
-}
-
 NodeStatus BehaviorTreeEngine::TickOnce() {
     // Returns kRunning when paused/no-root so the BT event loop doesn't break.
     // Only success/failure cause the event loop to stop and resume the bt.run() coroutine.
@@ -443,14 +439,6 @@ void BehaviorTreeEngine::StopLoop() {
     {
         std::unique_lock lock(tick_loop_mu_);
         tick_loop_cv_.wait(lock, [this] { return tick_loop_exited_; });
-    }
-
-    // Release Lua registry refs while the Lua state is still alive
-    if (root_ && bt_context_) {
-        ReleaseScriptNodeRefs(root_.get());
-    }
-    for (auto& [name, sensor] : active_sensors_) {
-        sensor->ReleaseRefs();
     }
 
     bt_context_.reset();

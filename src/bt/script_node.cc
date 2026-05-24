@@ -19,10 +19,6 @@ ScriptNode::~ScriptNode() {
     }
 }
 
-void ScriptNode::ReleaseRefs() {
-    host_.ReleaseScriptRefs(host_.main_L_);
-}
-
 async_simple::coro::Lazy<bool> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
     if (!co_await host_.LoadScript(L, ctx, base_path, script_path_, true)) {
         set_last_error(host_.last_error_);

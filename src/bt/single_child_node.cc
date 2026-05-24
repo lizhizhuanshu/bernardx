@@ -24,7 +24,3 @@ async_simple::coro::Lazy<bool> SingleChildNode::Init(lua_State* L, LuaRuntime* c
     }
     co_return true;
 }
-
-void SingleChildNode::ReleaseRefs() {
-    if (child_) child_->ReleaseRefs();
-}

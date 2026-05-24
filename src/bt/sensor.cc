@@ -12,10 +12,6 @@ ActiveSensor::~ActiveSensor() {
     Deactivate();
 }
 
-void ActiveSensor::ReleaseRefs() {
-    host_.ReleaseScriptRefs(host_.main_L_);
-}
-
 async_simple::coro::Lazy<bool> ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
     if (!co_await host_.LoadScript(L, ctx, base_path, spec_.script_path, false)) {
         co_return false;

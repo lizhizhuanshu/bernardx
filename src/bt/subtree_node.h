@@ -58,10 +58,6 @@ public:
         co_return true;
     }
 
-    void ReleaseRefs() override {
-        if (subtree_root_) subtree_root_->ReleaseRefs();
-    }
-
 private:
     std::string subtree_name_;
     std::unique_ptr<Node> subtree_root_;
