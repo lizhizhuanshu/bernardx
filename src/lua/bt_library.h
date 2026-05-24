@@ -4,8 +4,8 @@
 #include <memory>
 
 #include "behavior_tree_engine.h"
-#include "lua_runtime.h"
 #include "lua_library.h"
+#include "lua_runtime.h"
 
 class Blackboard;
 

@@ -10,6 +10,7 @@ extern "C" {
 #include <spdlog/spdlog.h>
 #include <sol/sol.hpp>
 
+#include "behavior_tree_engine.h"
 #include "file_system_code_provider.h"
 #include "lua_runtime.h"
 #include "lua_value_utils.h"

@@ -102,7 +102,7 @@ add_library(bernardx_lib STATIC
     src/lua/http_library.cc
     src/lua/json_library.cc
     src/lua/blackboard_library.cc
-    src/bt/bt_library.cc
+    src/lua/bt_library.cc
     src/bt/behavior_tree_engine.cc
     src/bt/tree_parser.cc
     src/bt/script_node.cc
