@@ -103,6 +103,7 @@ add_library(bernardx_lib STATIC
     src/lua/coroutine_pool.cc
     src/lua/http_library.cc
     src/lua/json_library.cc
+    src/lua/fs_library.cc
     src/lua/blackboard_library.cc
     src/lua/bt_library.cc
     src/bt/behavior_tree_engine.cc

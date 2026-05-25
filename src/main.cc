@@ -13,6 +13,7 @@
 #include "bt_library.h"
 #include "http_library.h"
 #include "json_library.h"
+#include "fs_library.h"
 #include "blackboard_library.h"
 #include "file_system_code_provider.h"
 #include "lua_runtime.h"
@@ -42,6 +43,7 @@ int main(int argc, char* argv[]) {
     bt_lib->SetMainLibsPath(std::filesystem::absolute(dir).string() + "/libs");
     auto http_lib = std::make_shared<HttpLibrary>(*http_exec);
     auto json_lib = std::make_shared<JsonLibrary>();
+    auto fs_lib = std::make_shared<FileSystemLibrary>();
 
     async_simple::executors::SimpleExecutor executor(1);
     auto rt = LuaRuntime::Builder()
@@ -51,6 +53,7 @@ int main(int argc, char* argv[]) {
                   .RegisterLibrary(bt_lib)
                   .RegisterLibrary(http_lib)
                   .RegisterLibrary(json_lib)
+                  .RegisterLibrary(fs_lib)
                   .Create();
 
     std::string entry = FLAGS_entry.empty() ? "src/main.lua" : FLAGS_entry;
