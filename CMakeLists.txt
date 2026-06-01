@@ -70,9 +70,6 @@ set(ENABLE_SSL ON CACHE BOOL "" FORCE)
 set(BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_PRESS_TOOL OFF CACHE BOOL "" FORCE)
-# Prevent cinatra from fetching asio/async_simple again
-set(asio_POPULATED ON CACHE BOOL "" FORCE)
-set(async_simple_POPULATED ON CACHE BOOL "" FORCE)
 add_subdirectory(${CINATRA_DIR})
 
 # ── nlohmann/json ────────────────────────────────────────────────────────────
