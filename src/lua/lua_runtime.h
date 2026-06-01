@@ -126,6 +126,8 @@ public:
         timer_mgr_->CancelTimer(handle);
     }
 
+    void Interrupt();
+
     AsyncHandle PreYield(lua_State* co);
     static int Yield(lua_State* L);
 
@@ -203,6 +205,7 @@ private:
     std::unordered_map<std::string, std::shared_ptr<LuaLibrary>> libraries_;
 
     std::atomic<bool> shutting_down_{false};
+    std::atomic<bool> interrupted_{false};
     std::unordered_map<AsyncHandle, PendingEntry> pending_;
 
     std::unique_ptr<TimerManager> timer_mgr_;

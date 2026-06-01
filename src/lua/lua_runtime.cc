@@ -454,13 +454,13 @@ void LuaRuntime::SetupCustomRequire(lua_State* main_L) {
 // --- Thread-safe submission via executor ---
 
 void LuaRuntime::PushTask(TaskRequest task) {
-    if (shutting_down_.load(std::memory_order_acquire)) {
+    if (shutting_down_.load(std::memory_order_acquire) || interrupted_.load(std::memory_order_acquire)) {
         task.promise.setValue(ScriptResult{LUA_ERRRUN, {}, "runtime shutdown"});
         return;
     }
     auto* self = this;
     executor_->schedule([self, task = std::move(task)]() mutable {
-        if (self->shutting_down_.load(std::memory_order_acquire)) {
+        if (self->shutting_down_.load(std::memory_order_acquire) || self->interrupted_.load(std::memory_order_acquire)) {
             task.promise.setValue(ScriptResult{LUA_ERRRUN, {}, "runtime shutdown"});
             return;
         }
@@ -469,10 +469,10 @@ void LuaRuntime::PushTask(TaskRequest task) {
 }
 
 void LuaRuntime::PushResume(AsyncHandle handle, std::vector<LuaValue> args) {
-    if (shutting_down_.load(std::memory_order_acquire)) return;
+    if (shutting_down_.load(std::memory_order_acquire) || interrupted_.load(std::memory_order_acquire)) return;
     auto* self = this;
     executor_->schedule([self, handle, args = std::move(args)]() mutable {
-        if (self->shutting_down_.load(std::memory_order_acquire)) return;
+        if (self->shutting_down_.load(std::memory_order_acquire) || self->interrupted_.load(std::memory_order_acquire)) return;
         self->DoResume(handle, std::move(args));
     });
 }
@@ -488,19 +488,19 @@ void LuaRuntime::PushRelease(std::vector<int> refs) {
 }
 
 void LuaRuntime::PushRequireRun(AsyncHandle handle, std::string source, std::string module_name) {
-    if (shutting_down_.load(std::memory_order_acquire)) return;
+    if (shutting_down_.load(std::memory_order_acquire) || interrupted_.load(std::memory_order_acquire)) return;
     auto* self = this;
     executor_->schedule([self, handle, source = std::move(source), module_name = std::move(module_name)]() mutable {
-        if (self->shutting_down_.load(std::memory_order_acquire)) return;
+        if (self->shutting_down_.load(std::memory_order_acquire) || self->interrupted_.load(std::memory_order_acquire)) return;
         self->ProcessRequireRun(std::move(source), std::move(module_name), handle);
     });
 }
 
 void LuaRuntime::PushLoadFileRun(AsyncHandle handle, std::string source, std::string filename) {
-    if (shutting_down_.load(std::memory_order_acquire)) return;
+    if (shutting_down_.load(std::memory_order_acquire) || interrupted_.load(std::memory_order_acquire)) return;
     auto* self = this;
     executor_->schedule([self, handle, source = std::move(source), filename = std::move(filename)]() mutable {
-        if (self->shutting_down_.load(std::memory_order_acquire)) return;
+        if (self->shutting_down_.load(std::memory_order_acquire) || self->interrupted_.load(std::memory_order_acquire)) return;
         self->ProcessLoadFileRun(std::move(source), std::move(filename), handle);
     });
 }
@@ -674,6 +674,28 @@ void LuaRuntime::PushValues(lua_State* L, const std::vector<LuaValue>& values) {
             },
             v);
     }
+}
+
+// --- Interrupt ---
+
+void LuaRuntime::Interrupt() {
+    if (shutting_down_.load(std::memory_order_acquire)) return;
+    if (interrupted_.exchange(true, std::memory_order_acq_rel)) return;
+    auto* self = this;
+    executor_->schedule([self]() {
+        if (self->shutting_down_.load(std::memory_order_acquire)) return;
+
+        decltype(script_promises_) promises;
+        std::swap(self->script_promises_, promises);
+        self->pending_.clear();
+        self->co_complete_callbacks_.clear();
+
+        self->timer_mgr_->CancelAll(self->main_L_);
+
+        for (auto& [co, promise] : promises) {
+            promise.setValue(ScriptResult{LUA_ERRRUN, {}, "interrupted"});
+        }
+    });
 }
 
 // --- Shutdown ---
