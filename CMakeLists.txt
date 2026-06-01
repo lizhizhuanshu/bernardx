@@ -5,97 +5,85 @@ project(bernardx LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include(FetchContent)
+# ── Third-party dependency paths ──────────────────────────────────────────────
+# Defaults point to git submodules under 3rd/.
+# Parent projects can override any path via cache variable.
 
-# ── Dependencies ────────────────────────────────────────────────────────────
+set(BERNARDX_3RD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rd" CACHE PATH "Third-party deps root")
 
-# asio (header-only, needed by async_simple and cinatra)
+set(ASIO_DIR        "${BERNARDX_3RD_DIR}/asio"           CACHE PATH "asio source dir")
+set(ASYNC_SIMPLE_DIR "${BERNARDX_3RD_DIR}/async_simple"  CACHE PATH "async_simple source dir")
+set(LUA_DIR         "${BERNARDX_3RD_DIR}/lua"            CACHE PATH "lua source dir")
+set(SOL2_DIR        "${BERNARDX_3RD_DIR}/sol2"           CACHE PATH "sol2 source dir")
+set(SPDLOG_DIR      "${BERNARDX_3RD_DIR}/spdlog"         CACHE PATH "spdlog source dir")
+set(OPENSSL_DIR     "${BERNARDX_3RD_DIR}/openssl"        CACHE PATH "openssl source dir")
+set(CINATRA_DIR     "${BERNARDX_3RD_DIR}/cinatra"        CACHE PATH "cinatra source dir")
+set(JSON_DIR        "${BERNARDX_3RD_DIR}/json"            CACHE PATH "nlohmann json source dir")
+set(GFLAGS_DIR      "${BERNARDX_3RD_DIR}/gflags"         CACHE PATH "gflags source dir")
+set(GOOGLETEST_DIR  "${BERNARDX_3RD_DIR}/googletest"     CACHE PATH "googletest source dir")
+
 add_definitions(-DASIO_STANDALONE)
-FetchContent_Declare(
-    asio
-    GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
-    GIT_TAG        asio-1-36-0
-    GIT_SUBMODULES ""
-    GIT_SUBMODULES_RECURSE OFF
-)
-FetchContent_MakeAvailable(asio)
 
-# async_simple (coroutine + executor)
+# ── asio (header-only) ────────────────────────────────────────────────────────
+# Provide asio_SOURCE_DIR so cinatra's CMake can reuse it.
+set(asio_SOURCE_DIR ${ASIO_DIR} CACHE PATH "asio source" FORCE)
+
+# ── async_simple ──────────────────────────────────────────────────────────────
 set(ASYNC_SIMPLE_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
 set(ASYNC_SIMPLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ASYNC_SIMPLE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ASYNC_SIMPLE_ENABLE_BENCHMARKS OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    async_simple
-    GIT_REPOSITORY https://github.com/lizhizhuanshu/async_simple.git
-    GIT_TAG        main
-)
-FetchContent_MakeAvailable(async_simple)
+set(ASYNC_SIMPLE_BUILD_MODULES OFF CACHE BOOL "" FORCE)
+set(ASYNC_SIMPLE_BUILD_DEMO_EXAMPLE OFF CACHE BOOL "" FORCE)
+# Set async_simple_SOURCE_DIR so cinatra reuses this instead of fetching again
+set(async_simple_SOURCE_DIR ${ASYNC_SIMPLE_DIR} CACHE PATH "async_simple source" FORCE)
+add_subdirectory(${ASYNC_SIMPLE_DIR})
 
-# Lua (static library from source)
-FetchContent_Declare(
-    lua
-    GIT_REPOSITORY https://github.com/lua/lua.git
-    GIT_TAG        v5.4.8
-)
-FetchContent_MakeAvailable(lua)
-file(GLOB LUA_SOURCES ${lua_SOURCE_DIR}/*.c)
+# ── Lua ───────────────────────────────────────────────────────────────────────
+file(GLOB LUA_SOURCES ${LUA_DIR}/*.c)
 list(FILTER LUA_SOURCES EXCLUDE REGEX ".*ltests\\.c|.*onelua\\.c")
 add_library(lua STATIC ${LUA_SOURCES})
-target_include_directories(lua PUBLIC ${lua_SOURCE_DIR})
+target_include_directories(lua PUBLIC ${LUA_DIR})
 set_property(TARGET lua PROPERTY C_STANDARD 99)
 if(UNIX)
     target_link_libraries(lua PRIVATE dl m)
 endif()
 
-# sol2 (header-only, uses fork with local modifications)
+# ── sol2 ──────────────────────────────────────────────────────────────────────
 set(SOL2_INSTALL OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    sol2
-    GIT_REPOSITORY https://github.com/lizhizhuanshu/sol2.git
-    GIT_TAG        v3.5.0
-)
-FetchContent_MakeAvailable(sol2)
+add_subdirectory(${SOL2_DIR})
 
-# spdlog (header-only)
+# ── spdlog ────────────────────────────────────────────────────────────────────
 set(SPDLOG_HEADER_ONLY ON CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    spdlog
-    GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG        v1.17.0
-)
-FetchContent_MakeAvailable(spdlog)
+add_subdirectory(${SPDLOG_DIR})
 
-# OpenSSL (from source)
-FetchContent_Declare(
-    openssl
-    GIT_REPOSITORY https://github.com/openssl/openssl.git
-    GIT_TAG        openssl-3.4.0
-)
-FetchContent_MakeAvailable(openssl)
+# ── OpenSSL ───────────────────────────────────────────────────────────────────
+# Try system OpenSSL first; fall back to find_openssl.cmake from cinatra.
+find_package(OpenSSL QUIET)
+if(NOT OpenSSL_FOUND)
+    # cinatra ships cmake/find_openssl.cmake which handles various platforms
+    include(${CINATRA_DIR}/cmake/find_openssl.cmake)
+endif()
 
-# cinatra (HTTP client, header-only) -- reuses asio fetched above
+# ── cinatra ───────────────────────────────────────────────────────────────────
 set(ENABLE_SSL ON CACHE BOOL "" FORCE)
 set(BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_PRESS_TOOL OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    cinatra
-    GIT_REPOSITORY https://github.com/lizhizhuanshu/cinatra.git
-    GIT_TAG        master
-)
-FetchContent_MakeAvailable(cinatra)
+# Prevent cinatra from fetching asio/async_simple again
+set(asio_POPULATED ON CACHE BOOL "" FORCE)
+set(async_simple_POPULATED ON CACHE BOOL "" FORCE)
+add_subdirectory(${CINATRA_DIR})
 
-# nlohmann/json (header-only)
+# ── nlohmann/json ────────────────────────────────────────────────────────────
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.11.3
-)
-FetchContent_MakeAvailable(json)
+add_subdirectory(${JSON_DIR})
 
-# ── BernardX library ─────────────────────────────────────────────────────
+# Export source dirs to parent scope
+set(asio_SOURCE_DIR ${ASIO_DIR} PARENT_SCOPE)
+set(cinatra_SOURCE_DIR ${CINATRA_DIR} PARENT_SCOPE)
+
+# ── BernardX library ─────────────────────────────────────────────────────────
 
 add_library(bernardx_lib STATIC
     src/lua/lua_runtime.cc
@@ -129,7 +117,7 @@ add_library(bernardx_lib STATIC
 )
 target_include_directories(bernardx_lib PUBLIC src/lua src/bt)
 cinatra_use_third_party_headers(bernardx_lib)
-target_include_directories(bernardx_lib SYSTEM PRIVATE ${cinatra_SOURCE_DIR}/include)
+target_include_directories(bernardx_lib SYSTEM PRIVATE ${CINATRA_DIR}/include)
 target_compile_definitions(bernardx_lib PUBLIC CINATRA_ENABLE_SSL)
 find_package(Threads REQUIRED)
 target_link_libraries(bernardx_lib PUBLIC
@@ -141,52 +129,41 @@ target_link_libraries(bernardx_lib PUBLIC
 )
 target_link_libraries(bernardx_lib PRIVATE
     Threads::Threads
-    ssl
-    crypto
     dl
 )
+if(OpenSSL_FOUND)
+    target_link_libraries(bernardx_lib PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
-# ── bernardx executable ────────────────────────────────────────────────────
+# ── bernardx executable ──────────────────────────────────────────────────────
 
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE INTERNAL "")
-FetchContent_Declare(
-    gflags
-    GIT_REPOSITORY https://github.com/gflags/gflags.git
-    GIT_TAG        v2.2.2
-)
-FetchContent_MakeAvailable(gflags)
+add_subdirectory(${GFLAGS_DIR})
 
 add_executable(bernardx src/main.cc)
 target_link_libraries(bernardx PRIVATE bernardx_lib gflags)
 target_include_directories(bernardx PRIVATE ${CMAKE_SOURCE_DIR}/src/lua ${CMAKE_SOURCE_DIR}/src/bt)
-target_include_directories(bernardx SYSTEM PRIVATE ${cinatra_SOURCE_DIR}/include)
+target_include_directories(bernardx SYSTEM PRIVATE ${CINATRA_DIR}/include)
 cinatra_use_third_party_headers(bernardx)
 
-
-
-# ── Tests ──────────────────────────────────────────────────────────────────
+# ── Tests ────────────────────────────────────────────────────────────────────
 
 enable_testing()
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG        v1.14.0
-)
-FetchContent_MakeAvailable(googletest)
+add_subdirectory(${GOOGLETEST_DIR})
 
 file(GLOB TEST_SOURCES tests/*.cc)
 add_executable(bernardx_test ${TEST_SOURCES})
 target_link_libraries(bernardx_test PRIVATE bernardx_lib GTest::gtest_main)
 target_include_directories(bernardx_test PRIVATE ${CMAKE_SOURCE_DIR}/src/lua ${CMAKE_SOURCE_DIR}/src/bt)
-target_include_directories(bernardx_test SYSTEM PRIVATE ${cinatra_SOURCE_DIR}/include)
+target_include_directories(bernardx_test SYSTEM PRIVATE ${CINATRA_DIR}/include)
 cinatra_use_third_party_headers(bernardx_test)
 
 include(GoogleTest)
 gtest_discover_tests(bernardx_test)
 
-# ── Install ───────────────────────────────────────────────────────────────
+# ── Install ──────────────────────────────────────────────────────────────────
 
 include(GNUInstallDirs)
 

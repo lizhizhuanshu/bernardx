@@ -1,0 +1,30 @@
+[submodule "3rd/asio"]
+	path = 3rd/asio
+	url = https://github.com/chriskohlhoff/asio.git
+[submodule "3rd/spdlog"]
+	path = 3rd/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "3rd/async_simple"]
+	path = 3rd/async_simple
+	url = https://github.com/lizhizhuanshu/async_simple.git
+[submodule "3rd/lua"]
+	path = 3rd/lua
+	url = https://github.com/lua/lua.git
+[submodule "3rd/sol2"]
+	path = 3rd/sol2
+	url = https://github.com/lizhizhuanshu/sol2.git
+[submodule "3rd/openssl"]
+	path = 3rd/openssl
+	url = https://github.com/openssl/openssl.git
+[submodule "3rd/cinatra"]
+	path = 3rd/cinatra
+	url = https://github.com/lizhizhuanshu/cinatra.git
+[submodule "3rd/json"]
+	path = 3rd/json
+	url = https://github.com/nlohmann/json.git
+[submodule "3rd/gflags"]
+	path = 3rd/gflags
+	url = https://github.com/gflags/gflags.git
+[submodule "3rd/googletest"]
+	path = 3rd/googletest
+	url = https://github.com/google/googletest.git
