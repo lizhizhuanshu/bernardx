@@ -58,15 +58,17 @@ set(SPDLOG_HEADER_ONLY ON CACHE BOOL "" FORCE)
 add_subdirectory(${SPDLOG_DIR})
 
 # ── OpenSSL ───────────────────────────────────────────────────────────────────
-# Try system OpenSSL first; fall back to find_openssl.cmake from cinatra.
-find_package(OpenSSL QUIET)
-if(NOT OpenSSL_FOUND)
-    # cinatra ships cmake/find_openssl.cmake which handles various platforms
-    include(${CINATRA_DIR}/cmake/find_openssl.cmake)
+if(ENABLE_SSL)
+    find_package(OpenSSL QUIET)
+    if(NOT OpenSSL_FOUND)
+        include(${CINATRA_DIR}/cmake/find_openssl.cmake)
+    endif()
 endif()
 
 # ── cinatra ───────────────────────────────────────────────────────────────────
-set(ENABLE_SSL ON CACHE BOOL "" FORCE)
+if(NOT ENABLE_SSL)
+    set(ENABLE_SSL OFF CACHE BOOL "" FORCE)
+endif()
 set(BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_PRESS_TOOL OFF CACHE BOOL "" FORCE)
@@ -115,7 +117,9 @@ add_library(bernardx_lib STATIC
 target_include_directories(bernardx_lib PUBLIC src/lua src/bt)
 cinatra_use_third_party_headers(bernardx_lib)
 target_include_directories(bernardx_lib SYSTEM PRIVATE ${CINATRA_DIR}/include)
-target_compile_definitions(bernardx_lib PUBLIC CINATRA_ENABLE_SSL)
+if(OpenSSL_FOUND)
+    target_compile_definitions(bernardx_lib PUBLIC CINATRA_ENABLE_SSL)
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(bernardx_lib PUBLIC
     sol2::sol2
@@ -134,6 +138,10 @@ endif()
 
 # ── bernardx executable ──────────────────────────────────────────────────────
 
+if(NOT BERNARDX_BUILD_EXECUTABLE)
+    return()
+endif()
+
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE INTERNAL "")
@@ -147,18 +155,20 @@ cinatra_use_third_party_headers(bernardx)
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
-enable_testing()
-add_subdirectory(${GOOGLETEST_DIR})
+if(BERNARDX_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(${GOOGLETEST_DIR})
 
-file(GLOB TEST_SOURCES tests/*.cc)
-add_executable(bernardx_test ${TEST_SOURCES})
-target_link_libraries(bernardx_test PRIVATE bernardx_lib GTest::gtest_main)
-target_include_directories(bernardx_test PRIVATE ${CMAKE_SOURCE_DIR}/src/lua ${CMAKE_SOURCE_DIR}/src/bt)
-target_include_directories(bernardx_test SYSTEM PRIVATE ${CINATRA_DIR}/include)
-cinatra_use_third_party_headers(bernardx_test)
+    file(GLOB TEST_SOURCES tests/*.cc)
+    add_executable(bernardx_test ${TEST_SOURCES})
+    target_link_libraries(bernardx_test PRIVATE bernardx_lib GTest::gtest_main)
+    target_include_directories(bernardx_test PRIVATE ${CMAKE_SOURCE_DIR}/src/lua ${CMAKE_SOURCE_DIR}/src/bt)
+    target_include_directories(bernardx_test SYSTEM PRIVATE ${CINATRA_DIR}/include)
+    cinatra_use_third_party_headers(bernardx_test)
 
-include(GoogleTest)
-gtest_discover_tests(bernardx_test)
+    include(GoogleTest)
+    gtest_discover_tests(bernardx_test)
+endif()
 
 # ── Install ──────────────────────────────────────────────────────────────────
 
