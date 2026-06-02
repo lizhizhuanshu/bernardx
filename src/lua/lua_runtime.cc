@@ -560,7 +560,7 @@ void LuaRuntime::ProcessTask(TaskRequest task) {
 void LuaRuntime::ProcessRequireRun(std::string source, std::string module_name, AsyncHandle caller_handle) {
     lua_State* co = AcquireCo();
 
-    std::string chunkname = "@" + module_name;
+    std::string chunkname = module_name;
     int load_status = luaL_loadbuffer(co, source.c_str(), source.size(), chunkname.c_str());
     if (load_status != LUA_OK) {
         const char* err = lua_tostring(co, -1);
@@ -578,6 +578,9 @@ void LuaRuntime::ProcessRequireRun(std::string source, std::string module_name, 
 
     if (status == LUA_OK) {
         auto values = PeekValues(co, nresults);
+        if (values.empty() || std::holds_alternative<std::nullptr_t>(values[0])) {
+            values = {LuaValue{true}};
+        }
         CacheModuleValues(main_L_, module_name.c_str(), values);
         PushResume(caller_handle, std::move(values));
         ReleaseCo(co);
@@ -589,6 +592,9 @@ void LuaRuntime::ProcessRequireRun(std::string source, std::string module_name, 
             [self, handle, mod_name](ScriptResult result) {
                 if (result.status == LUA_OK) {
                     auto& vals = result.values;
+                    if (vals.empty() || std::holds_alternative<std::nullptr_t>(vals[0])) {
+                        vals = {LuaValue{true}};
+                    }
                     CacheModuleValues(self->main_state(), mod_name.c_str(), vals);
                     self->PushResume(handle, std::move(vals));
                 } else {
@@ -612,7 +618,7 @@ void LuaRuntime::ProcessRequireRun(std::string source, std::string module_name, 
 void LuaRuntime::ProcessLoadFileRun(std::string source, std::string filename, AsyncHandle caller_handle) {
     lua_State* co = AcquireCo();
 
-    std::string chunkname = "@" + filename;
+    std::string chunkname = filename;
     int load_status = luaL_loadbuffer(co, source.c_str(), source.size(), chunkname.c_str());
     if (load_status != LUA_OK) {
         const char* err = lua_tostring(co, -1);
