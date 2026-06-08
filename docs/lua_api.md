@@ -421,27 +421,39 @@ local bt = require('bt')
 
 | 函数 | 说明 |
 |------|------|
-| `bt.set_project_path(path)` | 设置行为树项目根目录 |
-| `bt.load(json_or_path)` | 加载并初始化行为树（协程异步） |
-| `bt.tick()` | 执行一次 tick（协程异步），返回 `"running"` / `"success"` / `"failure"` |
+| `bt.run(opts)` | 加载并运行行为树直到完成或超时（协程异步） |
 | `bt.notify(event, data)` | 发送事件到事件队列 |
 | `bt.get_status()` | 获取状态 (`"idle"` / `"running"` / `"success"` / `"failure"`) |
 
-### bt.set_project_path(path)
+### bt.run(opts)
 
-设置行为树的项目根目录。路径以 `@` 开头表示远程资源路径（`@remote_base`），此时脚本通过 `ResourceProvider` 加载；否则为本地文件系统路径。
+协程异步——调用时 yield 挂起，行为树运行完成后自动恢复。
 
-设置后，`bt.load()` 中的目录路径会相对于此路径解析，Script/Sensor 节点的脚本路径也基于此路径查找。
+`bt.run()` 是行为树的一站式入口，完成加载、初始化、tick 循环的完整流程：
 
-```lua
--- 本地路径
-bt.set_project_path("/path/to/bt_project")
-local ok = bt.load("trees/ai_main")
+1. 解析 JSON 或从目录加载树结构
+2. 创建对应的 `CodeProvider`（自动）
+3. 初始化所有 Script 节点（加载脚本）
+4. 初始化所有 Sensor（加载脚本）
+5. 激活初始路径上的 Sensor
+6. 进入 tick 循环，直到树完成、达到最大步数或超时
 
--- 远程路径（通过 ResourceProvider 加载脚本）
-bt.set_project_path("@my_remote_project")
-local ok = bt.load("trees/ai_main")
-```
+**参数：** `opts` table
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | `string` | `path` 和 `json` 至少一个 | 树文件/目录路径 |
+| `json` | `string` | `path` 和 `json` 至少一个 | 树 JSON 字符串 |
+| `project_path` | `string` | 否 | 行为树项目根目录 |
+| `max_step` | `integer` | 否 | 最大 tick 步数，未设置则无限 |
+| `timeout` | `integer` | 否 | 超时时间（毫秒），未设置则不超时 |
+| `interval` | `integer` | 否 | tick 间隔（毫秒），未设置则连续 tick |
+
+**`project_path` 说明：**
+
+路径以 `@` 开头表示远程资源路径（`@remote_base`），此时脚本通过 `ResourceProvider` 加载；否则为本地文件系统路径。
+
+如果未提供 `project_path`，则使用 C++ 端通过 `SetProjectPath()` 设置的路径。
 
 **BT 代码搜索路径**（本地模式，设置项目路径后）：
 
@@ -456,84 +468,58 @@ local ok = bt.load("trees/ai_main")
 2. `{remote_base}/sensors/`
 3. `{remote_base}/`
 
----
-
-### bt.load(json_or_path)
-
-协程异步——调用时 yield 挂起，初始化完成后自动恢复。
-
-加载流程：
-1. 解析 JSON 或从目录加载树结构
-2. 创建对应的 `CodeProvider`（自动）
-3. 初始化所有 Script 节点（加载脚本）
-4. 初始化所有 Sensor（加载脚本）
-5. 激活初始路径上的 Sensor
-
-`bt.load()` 会自动根据项目路径创建 `CodeProvider` 并设置到运行时，确保 Script/Sensor 节点能正确加载脚本。如果运行时尚未配置 `CodeProvider`，`bt.load()` 创建的 `CodeProvider` 会自动成为运行时的默认 `CodeProvider`，后续 `require()` / `loadfile()` 也会使用它。
-
-重复调用 `bt.load()` 会先停止并清理之前的树（递增 generation 以使旧的异步操作失效）。
-
-**三种调用方式：**
-
-```lua
--- 方式1: JSON 字符串（以 { 或 [ 开头）
-local ok, err = bt.load('{"root": {"type": "Selector", "children": [...]}}')
-
--- 方式2: 目录路径
-local ok, err = bt.load("path/to/tree_dir")
-
--- 方式3: 结合项目路径使用（推荐）
-bt.set_project_path("/path/to/bt_project")
-local ok, err = bt.load("trees/ai_main")
-```
-
 **返回值：**
 
 | 返回值 | 类型 | 说明 |
 |--------|------|------|
-| `ok` | `boolean` | `true` = 加载成功，`false` = 出错 |
-| `err` | `string` | 出错时为错误信息，成功时为 `nil` |
+| `status` | `string` / `nil` | `"success"` / `"failure"` / `"timeout"`，出错时为 `nil` |
+| `err` | `string` / `nil` | 出错时为错误信息，成功时为 `nil` |
 
----
+**使用示例：**
 
-### bt.tick()
+```lua
+local bt = require('bt')
 
-协程异步——调用时 yield 挂起，执行一次 tick 后自动恢复。
+-- 方式1: JSON 字符串
+local status, err = bt.run({
+    json = '{"root": {"type": "Selector", "children": [...]}}',
+    project_path = "/path/to/bt_project"
+})
 
-每次 tick 内部依次执行：
+-- 方式2: 目录路径
+local status, err = bt.run({
+    path = "trees/ai_main",
+    project_path = "/path/to/bt_project"
+})
+
+-- 方式3: 带超时和步数限制
+local status, err = bt.run({
+    path = "trees/ai_main",
+    project_path = "/path/to/bt_project",
+    max_step = 100,
+    timeout = 5000,
+    interval = 100
+})
+
+-- 检查结果
+if not status then
+    error("bt.run failed: " .. err)
+elseif status == "timeout" then
+    print("tree timed out")
+else
+    print("tree finished:", status)
+end
+```
+
+**每次 tick 内部依次执行：**
 
 1. **处理事件** — 将 `bt.notify()` 推入的事件从队列取出，写入黑板（`_event_{name}`）
 2. **执行传感器** — 运行所有到期且处于激活状态的 Sensor，将结果写入黑板
 3. **评估装饰器** — 检查装饰器条件变化，若条件从满足变为不满足则触发对应节点的中止（`OnAborted`）
 4. **Tick 树** — 从根节点开始执行行为树
 5. **更新传感器激活状态** — 根据当前活跃路径激活/停用 Sensor
-6. **树完成时自动重置** — 若返回 `success` 或 `failure`，停用所有 Sensor 并重置树，下次 `bt.tick()` 会重新开始
+6. **树完成时自动重置** — 若返回 `success` 或 `failure`，停用所有 Sensor 并重置树
 
-**返回值：**
+重复调用 `bt.run()` 会先停止并清理之前的树（递增 generation 以使旧的异步操作失效）。
 
-| 返回值 | 类型 | 说明 |
-|--------|------|------|
-| `status` | `string` | `"running"` / `"success"` / `"failure"` |
-
-如果未加载树，返回 `nil, "no tree loaded"`。
-
-**使用示例：**
-
-```lua
-local bt = require('bt')
-bt.set_project_path("/path/to/bt_project")
-
--- 加载树
-local ok, err = bt.load("trees/ai_main")
-if not ok then error(err) end
-
--- Lua 驱动 tick 循环
-while true do
-    local status = bt.tick()
-    if status ~= "running" then
-        print("tree finished:", status)
-        break
-    end
-    coroutine.yield()  -- 让出控制权给事件循环
-end
-```
+`bt.run()` 会自动根据项目路径创建 `CodeProvider` 并设置到运行时，确保 Script/Sensor 节点能正确加载脚本。

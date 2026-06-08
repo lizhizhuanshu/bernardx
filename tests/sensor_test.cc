@@ -215,7 +215,7 @@ using SensorActivationTest = SensorBtTest;
 TEST_F(SensorActivationTest, SensorOnActivePathIsActivated) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Script",
@@ -225,13 +225,9 @@ TEST_F(SensorActivationTest, SensorOnActivePathIsActivated) {
                 ]
             }
         }]]
-        local ok = bt.load(json)
-        if ok then
-            local s
-            repeat s = bt.tick() until s ~= "running"
-            return true, s
-        end
-        return false, "load failed"
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -242,7 +238,7 @@ TEST_F(SensorActivationTest, SensorOnActivePathIsActivated) {
 TEST_F(SensorActivationTest, SensorOnInactiveBranchNotActivated) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Selector",
@@ -265,11 +261,9 @@ TEST_F(SensorActivationTest, SensorOnInactiveBranchNotActivated) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -279,7 +273,7 @@ TEST_F(SensorActivationTest, SensorOnInactiveBranchNotActivated) {
 TEST_F(SensorActivationTest, SensorDeactivatedWhenBranchLeavesActivePath) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Selector",
@@ -302,11 +296,9 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenBranchLeavesActivePath) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -317,7 +309,7 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenBranchLeavesActivePath) {
 TEST_F(SensorActivationTest, BothBranchesActivatedSequentially) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Selector",
@@ -345,11 +337,9 @@ TEST_F(SensorActivationTest, BothBranchesActivatedSequentially) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -362,7 +352,7 @@ TEST_F(SensorActivationTest, BothBranchesActivatedSequentially) {
 TEST_F(SensorActivationTest, AllSensorsDeactivatedWhenTreeCompletes) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Script",
@@ -372,11 +362,9 @@ TEST_F(SensorActivationTest, AllSensorsDeactivatedWhenTreeCompletes) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -387,7 +375,7 @@ TEST_F(SensorActivationTest, AllSensorsDeactivatedWhenTreeCompletes) {
 TEST_F(SensorActivationTest, SensorDeactivatedWhenAnotherSelectorBranchTakesOver) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Selector",
@@ -415,11 +403,9 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenAnotherSelectorBranchTakesOver
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -434,7 +420,7 @@ using AbortSensorTest = SensorBtTest;
 TEST_F(AbortSensorTest, LowerPriorityKeepsSensorActive) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Sequence",
@@ -458,11 +444,9 @@ TEST_F(AbortSensorTest, LowerPriorityKeepsSensorActive) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -472,7 +456,7 @@ TEST_F(AbortSensorTest, LowerPriorityKeepsSensorActive) {
 TEST_F(AbortSensorTest, NoAbortDeactivatesSensor) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Sequence",
@@ -496,11 +480,9 @@ TEST_F(AbortSensorTest, NoAbortDeactivatesSensor) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -510,7 +492,7 @@ TEST_F(AbortSensorTest, NoAbortDeactivatesSensor) {
 TEST_F(AbortSensorTest, BothKeepsSensorActive) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Sequence",
@@ -534,11 +516,9 @@ TEST_F(AbortSensorTest, BothKeepsSensorActive) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -548,7 +528,7 @@ TEST_F(AbortSensorTest, BothKeepsSensorActive) {
 TEST_F(AbortSensorTest, SelfAbortDeactivatesSensor) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Sequence",
@@ -572,11 +552,9 @@ TEST_F(AbortSensorTest, SelfAbortDeactivatesSensor) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -586,7 +564,7 @@ TEST_F(AbortSensorTest, SelfAbortDeactivatesSensor) {
 TEST_F(AbortSensorTest, NoDecoratorDeactivatesSensor) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Sequence",
@@ -607,11 +585,9 @@ TEST_F(AbortSensorTest, NoDecoratorDeactivatesSensor) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -621,7 +597,7 @@ TEST_F(AbortSensorTest, NoDecoratorDeactivatesSensor) {
 TEST_F(AbortSensorTest, SecondSensorWithAbortAlsoMonitored) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Sequence",
@@ -645,11 +621,9 @@ TEST_F(AbortSensorTest, SecondSensorWithAbortAlsoMonitored) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -661,7 +635,7 @@ using DeepSensorTest = SensorBtTest;
 TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Sequence",
@@ -724,11 +698,9 @@ TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -740,7 +712,7 @@ TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
 TEST_F(DeepSensorTest, FiveLevelAbortMonitoringAcrossDepths) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Sequence",
@@ -792,11 +764,9 @@ TEST_F(DeepSensorTest, FiveLevelAbortMonitoringAcrossDepths) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -806,7 +776,7 @@ TEST_F(DeepSensorTest, FiveLevelAbortMonitoringAcrossDepths) {
 TEST_F(DeepSensorTest, FiveLevelNoAbortSensorDeactivatedAtDepth) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Sequence",
@@ -855,11 +825,9 @@ TEST_F(DeepSensorTest, FiveLevelNoAbortSensorDeactivatedAtDepth) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -870,7 +838,7 @@ TEST_F(DeepSensorTest, FiveLevelNoAbortSensorDeactivatedAtDepth) {
 TEST_F(DeepSensorTest, FiveLevelMultipleAbortSensorsAtDifferentDepths) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Sequence",
@@ -944,11 +912,9 @@ TEST_F(DeepSensorTest, FiveLevelMultipleAbortSensorsAtDifferentDepths) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -962,7 +928,7 @@ using SensorInitTest = SensorBtTest;
 TEST_F(SensorInitTest, SensorWithBasicScript) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Script",
@@ -972,11 +938,9 @@ TEST_F(SensorInitTest, SensorWithBasicScript) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 2u);
@@ -986,7 +950,7 @@ TEST_F(SensorInitTest, SensorWithBasicScript) {
 TEST_F(SensorInitTest, SensorWithAsyncRequire) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Script",
@@ -996,11 +960,9 @@ TEST_F(SensorInitTest, SensorWithAsyncRequire) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 2u);
@@ -1010,7 +972,7 @@ TEST_F(SensorInitTest, SensorWithAsyncRequire) {
 TEST_F(SensorInitTest, SensorScriptNotFound) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Script",
@@ -1020,11 +982,9 @@ TEST_F(SensorInitTest, SensorScriptNotFound) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 2u);
@@ -1037,7 +997,7 @@ TEST_F(SensorInitTest, SensorScriptNotFound) {
 TEST_F(SensorInitTest, SensorMissingTickFunction) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Script",
@@ -1047,11 +1007,9 @@ TEST_F(SensorInitTest, SensorMissingTickFunction) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 2u);
@@ -1064,7 +1022,7 @@ TEST_F(SensorInitTest, SensorMissingTickFunction) {
 TEST_F(SensorInitTest, SensorOnCompositeNode) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Sequence",
@@ -1076,11 +1034,9 @@ TEST_F(SensorInitTest, SensorOnCompositeNode) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 2u);
@@ -1090,7 +1046,7 @@ TEST_F(SensorInitTest, SensorOnCompositeNode) {
 TEST_F(SensorInitTest, MultipleSensorsOnTree) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Script",
@@ -1101,11 +1057,9 @@ TEST_F(SensorInitTest, MultipleSensorsOnTree) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 2u);
@@ -1115,7 +1069,7 @@ TEST_F(SensorInitTest, MultipleSensorsOnTree) {
 TEST_F(SensorInitTest, SensorFullLifecycle) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.set_project_path(')" + tests_dir_ + R"(')
+
         local json = [[{
             "root": {
                 "type": "Script",
@@ -1125,11 +1079,9 @@ TEST_F(SensorInitTest, SensorFullLifecycle) {
                 ]
             }
         }]]
-        local ok, status = bt.load(json)
-        if ok then
-            repeat status = bt.tick() until status ~= "running"
-        end
-        return ok, status
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        if not status then return false, err end
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 2u);

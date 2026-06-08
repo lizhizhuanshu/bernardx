@@ -2,10 +2,10 @@
 
 ## 推荐项目结构
 
-行为树项目可以独立于主 Lua 项目，拥有自己的目录结构。通过 `bt.set_project_path()` 指定项目根目录后，树的加载、脚本查找和 `require()` 都基于该路径。
+行为树项目可以独立于主 Lua 项目，拥有自己的目录结构。通过 `bt.run({project_path = path, ...})` 指定项目根目录后，树的加载、脚本查找和 `require()` 都基于该路径。
 
 ```
-bt_project/                   ← bt.set_project_path() 指向这里
+bt_project/                   ← project_path 指向这里
 ├── trees/                    # 行为树 JSON 配置
 │   └── ai_main/              # 每个目录 = 一棵行为树
 │       ├── root.json         #   根树定义（必需）
@@ -29,8 +29,10 @@ bt_project/                   ← bt.set_project_path() 指向这里
 ### 使用方式
 
 ```lua
-bt.set_project_path("/path/to/bt_project")
-local status = bt.run("trees/ai_main")
+local status = bt.run({
+    path = "trees/ai_main",
+    project_path = "/path/to/bt_project"
+})
 ```
 
 ### 代码查找路径
@@ -100,8 +102,10 @@ sensors/
 
 ```lua
 -- main.lua
-bt.set_project_path("bt_project")
-local status = bt.run("trees/ai_main")
+local status = bt.run({
+    path = "trees/ai_main",
+    project_path = "bt_project"
+})
 print("tree finished:", status)
 ```
 
