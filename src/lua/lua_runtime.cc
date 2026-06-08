@@ -512,7 +512,7 @@ void LuaRuntime::CallLuaFunction(int fn_ref, std::vector<LuaValue> args) {
 // --- Task processing (executor thread only) ---
 
 void LuaRuntime::ProcessTask(TaskRequest task) {
-    lua_State* co = AcquireCo();
+    lua_State* co = AcquireCoroutine();
     int nargs = 0;
 
     std::visit(overloaded{
@@ -527,7 +527,7 @@ void LuaRuntime::ProcessTask(TaskRequest task) {
                            const char* err = lua_tostring(co, -1);
                            spdlog::error("LuaRuntime: {}", err ? err : "unknown error");
                            lua_pop(co, 1);
-                           ReleaseCo(co);
+                           ReleaseCoroutine(co);
                            ScriptResult result;
                            result.status = load_result;
                            result.error = err ? err : "unknown error";
@@ -550,7 +550,7 @@ void LuaRuntime::ProcessTask(TaskRequest task) {
     int nresults = 0;
     int status = lua_resume(co, main_L_, nargs, &nresults);
 
-    script_promises_[co] = std::move(task.promise);
+    completions_[co] = std::move(task.promise);
 
     if (status != LUA_YIELD) {
         MaybeRecycleCo(co, status, nresults);
@@ -558,7 +558,7 @@ void LuaRuntime::ProcessTask(TaskRequest task) {
 }
 
 void LuaRuntime::ProcessRequireRun(std::string source, std::string module_name, AsyncHandle caller_handle) {
-    lua_State* co = AcquireCo();
+    lua_State* co = AcquireCoroutine();
 
     std::string chunkname = module_name;
     int load_status = luaL_loadbuffer(co, source.c_str(), source.size(), chunkname.c_str());
@@ -567,7 +567,7 @@ void LuaRuntime::ProcessRequireRun(std::string source, std::string module_name, 
         std::string errmsg = err ? err : "unknown error";
         spdlog::error("RequireRun: {}", errmsg);
         lua_pop(co, 1);
-        ReleaseCo(co);
+        ReleaseCoroutine(co);
         PushResume(caller_handle, {LuaValue{nullptr}, LuaValue{std::move(errmsg)}});
         return;
     }
@@ -583,7 +583,7 @@ void LuaRuntime::ProcessRequireRun(std::string source, std::string module_name, 
         }
         CacheModuleValues(main_L_, module_name.c_str(), values);
         PushResume(caller_handle, std::move(values));
-        ReleaseCo(co);
+        ReleaseCoroutine(co);
     } else if (status == LUA_YIELD) {
         auto handle = caller_handle;
         auto mod_name = module_name;
@@ -611,12 +611,12 @@ void LuaRuntime::ProcessRequireRun(std::string source, std::string module_name, 
         lua_pop(co, 1);
         PushResume(caller_handle,
             {LuaValue{nullptr}, LuaValue{std::move(errmsg)}});
-        ReleaseCo(co);
+        ReleaseCoroutine(co);
     }
 }
 
 void LuaRuntime::ProcessLoadFileRun(std::string source, std::string filename, AsyncHandle caller_handle) {
-    lua_State* co = AcquireCo();
+    lua_State* co = AcquireCoroutine();
 
     std::string chunkname = filename;
     int load_status = luaL_loadbuffer(co, source.c_str(), source.size(), chunkname.c_str());
@@ -624,7 +624,7 @@ void LuaRuntime::ProcessLoadFileRun(std::string source, std::string filename, As
         const char* err = lua_tostring(co, -1);
         spdlog::error("LoadFileRun: {}", err ? err : "unknown error");
         lua_pop(co, 1);
-        ReleaseCo(co);
+        ReleaseCoroutine(co);
         PushResume(caller_handle, {LuaValue{nullptr}});
         return;
     }
@@ -633,7 +633,7 @@ void LuaRuntime::ProcessLoadFileRun(std::string source, std::string filename, As
     int ref = luaL_ref(co, LUA_REGISTRYINDEX);
     int type = lua_type(co, -1);
     PushResume(caller_handle, {CreateRef(ref, type)});
-    ReleaseCo(co);
+    ReleaseCoroutine(co);
 }
 
 // --- Yield support ---
@@ -691,15 +691,16 @@ void LuaRuntime::Interrupt() {
     executor_->schedule([self]() {
         if (self->shutting_down_.load(std::memory_order_acquire)) return;
 
-        decltype(script_promises_) promises;
-        std::swap(self->script_promises_, promises);
+        decltype(self->completions_) saved;
+        std::swap(self->completions_, saved);
         self->pending_.clear();
-        self->co_complete_callbacks_.clear();
 
         self->timer_mgr_->CancelAll(self->main_L_);
 
-        for (auto& [co, promise] : promises) {
-            promise.setValue(ScriptResult{LUA_ERRRUN, {}, "interrupted"});
+        for (auto& [co, handler] : saved) {
+            if (auto* p = std::get_if<async_simple::Promise<ScriptResult>>(&handler)) {
+                p->setValue(ScriptResult{LUA_ERRRUN, {}, "interrupted"});
+            }
         }
     });
 }
@@ -709,11 +710,9 @@ void LuaRuntime::Interrupt() {
 void LuaRuntime::Shutdown() {
     if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
 
-    decltype(script_promises_) pending_promises;
-
-    std::swap(script_promises_, pending_promises);
+    decltype(completions_) saved;
+    std::swap(completions_, saved);
     pending_.clear();
-    co_complete_callbacks_.clear();
 
     for (auto& ext : extensions_) {
         ext->OnShutdown(main_L_);
@@ -722,8 +721,10 @@ void LuaRuntime::Shutdown() {
         lib->Close(main_L_);
     }
 
-    for (auto& [co, promise] : pending_promises) {
-        promise.setValue(ScriptResult{LUA_ERRRUN, {}, "runtime shutdown"});
+    for (auto& [co, handler] : saved) {
+        if (auto* p = std::get_if<async_simple::Promise<ScriptResult>>(&handler)) {
+            p->setValue(ScriptResult{LUA_ERRRUN, {}, "runtime shutdown"});
+        }
     }
 
     if (timer_mgr_) {
@@ -742,7 +743,7 @@ bool LuaRuntime::CallWithCallback(lua_State* co, int nargs, std::function<void(S
     int status = lua_resume(co, main_L_, nargs, &nresults);
 
     if (status == LUA_YIELD) {
-        co_complete_callbacks_[co] = std::move(on_complete);
+        completions_[co] = std::move(on_complete);
         return true;
     }
 
@@ -761,25 +762,25 @@ bool LuaRuntime::CallWithCallback(lua_State* co, int nargs, std::function<void(S
     if (status == LUA_OK) {
         result.values = PeekValues(co, nresults);
     }
-    ReleaseCo(co);
+    ReleaseCoroutine(co);
 
     on_complete(std::move(result));
     return false;
 }
 
 void LuaRuntime::CancelCall(lua_State* co) {
-    co_complete_callbacks_.erase(co);
-    ReleaseCo(co);
+    completions_.erase(co);
+    ReleaseCoroutine(co);
 }
 
 // --- Coroutine completion callback ---
 
-void LuaRuntime::SetCoCompleteCallback(lua_State* co, CoCompleteCallback cb) {
-    co_complete_callbacks_[co] = std::move(cb);
+void LuaRuntime::SetCoCompleteCallback(lua_State* co, std::function<void(ScriptResult)> cb) {
+    completions_[co] = std::move(cb);
 }
 
 void LuaRuntime::RemoveCoCompleteCallback(lua_State* co) {
-    co_complete_callbacks_.erase(co);
+    completions_.erase(co);
 }
 
 void LuaRuntime::MaybeRecycleCo(lua_State* co, int status, int nresults) {
@@ -791,7 +792,6 @@ void LuaRuntime::MaybeRecycleCo(lua_State* co, int status, int nresults) {
         lua_pop(co, 1);
     }
     if (status != LUA_YIELD) {
-        // Build the result once
         ScriptResult result;
         result.status = status;
         result.error = std::move(error_msg);
@@ -799,26 +799,17 @@ void LuaRuntime::MaybeRecycleCo(lua_State* co, int status, int nresults) {
             result.values = PeekValues(co, nresults);
         }
 
-        // Save and erase the promise BEFORE any callback to avoid data race.
-        std::optional<async_simple::Promise<ScriptResult>> saved_promise;
-        auto it = script_promises_.find(co);
-        if (it != script_promises_.end()) {
-            saved_promise = std::move(it->second);
-            script_promises_.erase(it);
-        }
-
-        // Invoke completion callback with a copy (callback may also need values)
-        auto cb_it = co_complete_callbacks_.find(co);
-        if (cb_it != co_complete_callbacks_.end()) {
-            cb_it->second(ScriptResult{result});  // copy
-            co_complete_callbacks_.erase(cb_it);
-        }
-
-        ReleaseCo(co);
-
-        // LAST: resolve the promise — this wakes the main thread
-        if (saved_promise) {
-            saved_promise->setValue(std::move(result));
+        auto it = completions_.find(co);
+        if (it != completions_.end()) {
+            auto handler = std::move(it->second);
+            completions_.erase(it);
+            ReleaseCoroutine(co);
+            std::visit(overloaded{
+                [&](async_simple::Promise<ScriptResult>& p) { p.setValue(std::move(result)); },
+                [&](std::function<void(ScriptResult)>& cb) { cb(std::move(result)); }
+            }, handler);
+        } else {
+            ReleaseCoroutine(co);
         }
     }
 }
@@ -869,7 +860,7 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::CallFunction(int fn_ref, std:
 async_simple::coro::Lazy<ScriptResult> LuaRuntime::AwaitCoroutine(lua_State* co, int status, int nresults) {
     if (status == LUA_OK) {
         auto values = PeekValues(co, nresults);
-        ReleaseCo(co);
+        ReleaseCoroutine(co);
         co_return ScriptResult{LUA_OK, std::move(values)};
     }
 
@@ -889,12 +880,12 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::AwaitCoroutine(lua_State* co,
     std::string errmsg = err ? err : "unknown error";
     spdlog::error("LuaRuntime: {}", errmsg);
     lua_pop(co, 1);
-    ReleaseCo(co);
+    ReleaseCoroutine(co);
     co_return ScriptResult{status, {}, std::move(errmsg)};
 }
 
 async_simple::coro::Lazy<ScriptResult> LuaRuntime::CallAsync(int fn_ref, std::vector<LuaValue> args) {
-    lua_State* co = AcquireCo();
+    lua_State* co = AcquireCoroutine();
 
     lua_rawgeti(co, LUA_REGISTRYINDEX, fn_ref);
     PushValues(co, args);
@@ -907,7 +898,7 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::CallAsync(int fn_ref, std::ve
 }
 
 async_simple::coro::Lazy<ScriptResult> LuaRuntime::DoFileAsync(const std::string& path) {
-    lua_State* co = AcquireCo();
+    lua_State* co = AcquireCoroutine();
 
     int load_status = luaL_loadfile(co, path.c_str());
     if (load_status != LUA_OK) {
@@ -915,7 +906,7 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::DoFileAsync(const std::string
         std::string errmsg = err ? err : "unknown error";
         spdlog::error("LuaRuntime::DoFileAsync: {}", errmsg);
         lua_pop(co, 1);
-        ReleaseCo(co);
+        ReleaseCoroutine(co);
         co_return ScriptResult{load_status, {}, std::move(errmsg)};
     }
 
@@ -926,7 +917,7 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::DoFileAsync(const std::string
 }
 
 async_simple::coro::Lazy<ScriptResult> LuaRuntime::DoBufferAsync(const std::string& chunkname, std::string source) {
-    lua_State* co = AcquireCo();
+    lua_State* co = AcquireCoroutine();
 
     int load_status = luaL_loadbuffer(co, source.c_str(), source.size(), chunkname.c_str());
     if (load_status != LUA_OK) {
@@ -934,7 +925,7 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::DoBufferAsync(const std::stri
         std::string errmsg = err ? err : "unknown error";
         spdlog::error("LuaRuntime::DoBufferAsync: {}", errmsg);
         lua_pop(co, 1);
-        ReleaseCo(co);
+        ReleaseCoroutine(co);
         co_return ScriptResult{load_status, {}, std::move(errmsg)};
     }
 
@@ -1002,7 +993,7 @@ LuaRuntime::Ptr LuaRuntime::Builder::Create() {
         rt->executor_,
         [self](AsyncHandle handle) { self->DoResume(handle, {}); },
         [self](int fn_ref) {
-            lua_State* co = self->AcquireCo();
+            lua_State* co = self->AcquireCoroutine();
             lua_rawgeti(co, LUA_REGISTRYINDEX, fn_ref);
             luaL_unref(self->main_L_, LUA_REGISTRYINDEX, fn_ref);
             int nresults = 0;

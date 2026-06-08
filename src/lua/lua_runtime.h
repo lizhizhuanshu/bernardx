@@ -107,10 +107,10 @@ public:
 
     LuaRef CreateRef(int ref, int type);
 
-    // --- BT support ---
+    // --- Coroutine pool ---
 
-    lua_State* AcquireCoroutine() { return AcquireCo(); }
-    void ReleaseCoroutine(lua_State* co) { ReleaseCo(co); }
+    [[nodiscard]] lua_State* AcquireCoroutine() { return co_pool_->Acquire(); }
+    void ReleaseCoroutine(lua_State* co) { co_pool_->Release(co); }
     void SetCoCompleteCallback(lua_State* co, std::function<void(ScriptResult)> cb);
     void RemoveCoCompleteCallback(lua_State* co);
     std::shared_ptr<CodeProvider> shared_code_provider() const { return code_provider_; }
@@ -170,7 +170,10 @@ public:
 private:
     LuaRuntime();
 
-    using CoCompleteCallback = std::function<void(ScriptResult)>;
+    using CompletionHandler = std::variant<
+        async_simple::Promise<ScriptResult>,
+        std::function<void(ScriptResult)>
+    >;
     struct ResumeResult { lua_State* co = nullptr; int status = 0; };
     struct PendingEntry { lua_State* co; };
 
@@ -198,9 +201,6 @@ private:
     // Async coroutine helper (executor thread only)
     async_simple::coro::Lazy<ScriptResult> AwaitCoroutine(lua_State* co, int status, int nresults);
 
-    // Coroutine pool
-    [[nodiscard]] lua_State* AcquireCo() { return co_pool_->Acquire(); }
-    void ReleaseCo(lua_State* co) { co_pool_->Release(co); }
     void MaybeRecycleCo(lua_State* co, int status, int nresults);
 
     // --- Members ---
@@ -223,6 +223,5 @@ private:
     std::unique_ptr<TimerManager> timer_mgr_;
     std::unique_ptr<CoroutinePool> co_pool_;
 
-    std::unordered_map<lua_State*, async_simple::Promise<ScriptResult>> script_promises_;
-    std::unordered_map<lua_State*, CoCompleteCallback> co_complete_callbacks_;
+    std::unordered_map<lua_State*, CompletionHandler> completions_;
 };
