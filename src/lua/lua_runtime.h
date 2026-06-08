@@ -80,6 +80,17 @@ public:
     async_simple::coro::Lazy<ScriptResult> CallAsync(int fn_ref, std::vector<LuaValue> args = {});
     // Load and run a file in a new coroutine. Awaits completion (handles yield).
     async_simple::coro::Lazy<ScriptResult> DoFileAsync(const std::string& path);
+    // Load and run a buffer in a new coroutine. Awaits completion (handles yield).
+    async_simple::coro::Lazy<ScriptResult> DoBufferAsync(const std::string& chunkname, std::string source);
+
+    // --- Callback-based coroutine call (executor thread only) ---
+
+    // Call a function in a coroutine. The coroutine must have the function and
+    // nargs arguments already on its stack. Returns true if the coroutine yielded
+    // (callback fires later), false if it completed synchronously (callback already fired).
+    bool CallWithCallback(lua_State* co, int nargs, std::function<void(ScriptResult)> on_complete);
+    // Cancel a yielded coroutine (removes callback, releases coroutine).
+    void CancelCall(lua_State* co);
 
     // --- Extraspace ---
 
@@ -103,6 +114,7 @@ public:
     void SetCoCompleteCallback(lua_State* co, std::function<void(ScriptResult)> cb);
     void RemoveCoCompleteCallback(lua_State* co);
     std::shared_ptr<CodeProvider> shared_code_provider() const { return code_provider_; }
+    void set_shared_code_provider(std::shared_ptr<CodeProvider> provider) { code_provider_ = std::move(provider); }
 
     // --- Internal accessors (used by builtin helpers in .cc) ---
 

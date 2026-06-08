@@ -735,6 +735,43 @@ void LuaRuntime::Shutdown() {
     SetExtraspace(main_L_, nullptr);
 }
 
+// --- Callback-based coroutine call ---
+
+bool LuaRuntime::CallWithCallback(lua_State* co, int nargs, std::function<void(ScriptResult)> on_complete) {
+    int nresults = 0;
+    int status = lua_resume(co, main_L_, nargs, &nresults);
+
+    if (status == LUA_YIELD) {
+        co_complete_callbacks_[co] = std::move(on_complete);
+        return true;
+    }
+
+    // Synchronous completion (OK or error)
+    std::string error_msg;
+    if (status != LUA_OK) {
+        const char* err = lua_tostring(co, -1);
+        error_msg = err ? err : "unknown error";
+        spdlog::error("LuaRuntime::CallWithCallback: {}", error_msg);
+        lua_pop(co, 1);
+    }
+
+    ScriptResult result;
+    result.status = status;
+    result.error = std::move(error_msg);
+    if (status == LUA_OK) {
+        result.values = PeekValues(co, nresults);
+    }
+    ReleaseCo(co);
+
+    on_complete(std::move(result));
+    return false;
+}
+
+void LuaRuntime::CancelCall(lua_State* co) {
+    co_complete_callbacks_.erase(co);
+    ReleaseCo(co);
+}
+
 // --- Coroutine completion callback ---
 
 void LuaRuntime::SetCoCompleteCallback(lua_State* co, CoCompleteCallback cb) {
@@ -877,6 +914,25 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::DoFileAsync(const std::string
         const char* err = lua_tostring(co, -1);
         std::string errmsg = err ? err : "unknown error";
         spdlog::error("LuaRuntime::DoFileAsync: {}", errmsg);
+        lua_pop(co, 1);
+        ReleaseCo(co);
+        co_return ScriptResult{load_status, {}, std::move(errmsg)};
+    }
+
+    int nresults = 0;
+    int status = lua_resume(co, main_L_, 0, &nresults);
+
+    co_return co_await AwaitCoroutine(co, status, nresults);
+}
+
+async_simple::coro::Lazy<ScriptResult> LuaRuntime::DoBufferAsync(const std::string& chunkname, std::string source) {
+    lua_State* co = AcquireCo();
+
+    int load_status = luaL_loadbuffer(co, source.c_str(), source.size(), chunkname.c_str());
+    if (load_status != LUA_OK) {
+        const char* err = lua_tostring(co, -1);
+        std::string errmsg = err ? err : "unknown error";
+        spdlog::error("LuaRuntime::DoBufferAsync: {}", errmsg);
         lua_pop(co, 1);
         ReleaseCo(co);
         co_return ScriptResult{load_status, {}, std::move(errmsg)};

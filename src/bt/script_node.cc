@@ -14,7 +14,7 @@ ScriptNode::ScriptNode(uint32_t id, std::string name, std::string script_path, A
 
 ScriptNode::~ScriptNode() {
     if (yielded_co_ != nullptr && host_.lua_context_) {
-        host_.lua_context_->RemoveCoCompleteCallback(yielded_co_);
+        host_.lua_context_->CancelCall(yielded_co_);
         yielded_co_ = nullptr;
     }
 }
@@ -54,12 +54,52 @@ NodeStatus ScriptNode::ParseReturnValues(const std::vector<LuaValue>& values, bo
     return NodeStatus::kFailure;
 }
 
+void ScriptNode::CallExit(const std::string& reason) {
+    if (host_.refs_.exit_ref != LUA_NOREF) {
+        lua_pushstring(host_.main_L_, reason.c_str());
+        LuaCallMethod(host_.main_L_, host_.refs_.exit_ref, host_.refs_.table_ref, 1);
+    }
+}
+
+NodeStatus ScriptNode::HandleScriptResult(const ScriptResult& result) {
+    if (result.status != LUA_OK) {
+        std::string msg = "'" + name_ + "' coroutine error: " + result.error;
+        spdlog::error("ScriptNode::Tick: {}", msg);
+        set_last_error(msg);
+        active_ = false;
+        CallExit("failure");
+        return NodeStatus::kFailure;
+    }
+
+    bool deactivate = false;
+    auto ns = ParseReturnValues(result.values, deactivate);
+    if (deactivate) {
+        active_ = false;
+        auto* s = std::get_if<std::string>(&result.values[0]);
+        CallExit(s ? *s : "failure");
+    }
+    return ns;
+}
+
+NodeStatus ScriptNode::HandleEnterResult(const ScriptResult& result) {
+    if (result.status != LUA_OK) {
+        std::string msg = "'" + name_ + "' Enter error: " + result.error;
+        spdlog::error("ScriptNode::Tick: {}", msg);
+        set_last_error(msg);
+        active_ = false;
+        CallExit("failure");
+        return NodeStatus::kFailure;
+    }
+    return NodeStatus::kRunning;
+}
+
 NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
     if (!is_loaded() || !host_.main_L_ || !host_.lua_context_) {
         set_last_error("'" + name_ + "' not loaded");
         return NodeStatus::kFailure;
     }
 
+    // Check if a yielded call has completed
     if (yielded_co_ != nullptr) {
         if (!has_result_) {
             return NodeStatus::kRunning;
@@ -68,94 +108,70 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
         has_result_ = false;
         yielded_co_ = nullptr;
 
-        if (result.status != LUA_OK) {
-            std::string msg = "'" + name_ + "' coroutine error: " + result.error;
-            spdlog::error("ScriptNode::Tick: {}", msg);
-            set_last_error(std::move(msg));
-            active_ = false;
-            if (host_.refs_.exit_ref != LUA_NOREF) {
-                lua_pushstring(host_.main_L_, "failure");
-                LuaCallMethod(host_.main_L_, host_.refs_.exit_ref, host_.refs_.table_ref, 1);
-            }
-            return NodeStatus::kFailure;
+        if (entering_) {
+            entering_ = false;
+            auto status = HandleEnterResult(result);
+            if (status != NodeStatus::kRunning) return status;
+        } else {
+            return HandleScriptResult(result);
         }
-
-        bool deactivate = false;
-        auto ns = ParseReturnValues(result.values, deactivate);
-        if (deactivate) {
-            active_ = false;
-            if (host_.refs_.exit_ref != LUA_NOREF) {
-                auto* s = std::get_if<std::string>(&result.values[0]);
-                lua_pushstring(host_.main_L_, s ? s->c_str() : "failure");
-                LuaCallMethod(host_.main_L_, host_.refs_.exit_ref, host_.refs_.table_ref, 1);
-            }
-        }
-        return ns;
     }
 
+    // Enter on first tick
     if (!active_) {
-    active_ = true;
-    if (host_.refs_.enter_ref != LUA_NOREF) {
-        PushArgsTable(host_.main_L_, args_);
-        LuaCallMethod(host_.main_L_, host_.refs_.enter_ref, host_.refs_.table_ref, 1);
-    }
+        active_ = true;
+        if (host_.refs_.enter_ref != LUA_NOREF) {
+            lua_State* co = host_.lua_context_->AcquireCoroutine();
+            lua_rawgeti(co, LUA_REGISTRYINDEX, host_.refs_.enter_ref);
+            lua_rawgeti(co, LUA_REGISTRYINDEX, host_.refs_.table_ref);
+            PushArgsTable(co, args_);
+
+            bool yielded = host_.lua_context_->CallWithCallback(co, 2,
+                [this](ScriptResult r) {
+                    has_result_ = true;
+                    result_ = std::move(r);
+                });
+
+            if (yielded) {
+                yielded_co_ = co;
+                entering_ = true;
+                return NodeStatus::kRunning;
+            }
+
+            // Enter completed synchronously
+            has_result_ = false;
+            auto status = HandleEnterResult(result_);
+            if (status != NodeStatus::kRunning) return status;
+        }
     }
 
+    // Start the tick call
     lua_State* co = host_.lua_context_->AcquireCoroutine();
-
     lua_rawgeti(co, LUA_REGISTRYINDEX, host_.refs_.tick_ref);
     lua_rawgeti(co, LUA_REGISTRYINDEX, host_.refs_.table_ref);
 
-    host_.lua_context_->SetCoCompleteCallback(co, [this](ScriptResult r) {
-        has_result_ = true;
-        result_ = std::move(r);
-    });
+    bool yielded = host_.lua_context_->CallWithCallback(co, 1,
+        [this](ScriptResult r) {
+            has_result_ = true;
+            result_ = std::move(r);
+        });
 
-    int nresults = 0;
-    int status = lua_resume(co, host_.main_L_, 1, &nresults);
-
-    if (status == LUA_YIELD) {
+    if (yielded) {
         yielded_co_ = co;
         return NodeStatus::kRunning;
     }
 
-    host_.lua_context_->RemoveCoCompleteCallback(co);
-
-    if (status != LUA_OK) {
-        const char* err = lua_tostring(co, -1);
-        std::string msg = "'" + name_ + "' error: " + (err ? err : "unknown");
-        spdlog::error("ScriptNode::Tick: {}", msg);
-        set_last_error(std::move(msg));
-        lua_pop(co, 1);
-        active_ = false;
-        if (host_.refs_.exit_ref != LUA_NOREF) {
-            lua_pushstring(host_.main_L_, "failure");
-            LuaCallMethod(host_.main_L_, host_.refs_.exit_ref, host_.refs_.table_ref, 1);
-        }
-        return NodeStatus::kFailure;
-    }
-
-    auto values = LuaRuntime::PeekValues(co, nresults);
-    lua_pop(co, nresults);
-
-    bool deactivate = false;
-    auto ns = ParseReturnValues(values, deactivate);
-    if (deactivate) {
-        active_ = false;
-        if (host_.refs_.exit_ref != LUA_NOREF) {
-            auto* s = std::get_if<std::string>(&values[0]);
-            lua_pushstring(host_.main_L_, s ? s->c_str() : "failure");
-            LuaCallMethod(host_.main_L_, host_.refs_.exit_ref, host_.refs_.table_ref, 1);
-        }
-    }
-    return ns;
+    // Completed synchronously — callback already fired, result_ is set
+    has_result_ = false;
+    return HandleScriptResult(result_);
 }
 
 void ScriptNode::Reset() {
     if (yielded_co_ != nullptr) {
-        host_.lua_context_->RemoveCoCompleteCallback(yielded_co_);
+        host_.lua_context_->CancelCall(yielded_co_);
         yielded_co_ = nullptr;
         has_result_ = false;
+        entering_ = false;
     }
 
     if (active_ && host_.refs_.exit_ref != LUA_NOREF && host_.main_L_) {
@@ -168,9 +184,10 @@ void ScriptNode::Reset() {
 
 void ScriptNode::OnAborted() {
     if (yielded_co_ != nullptr) {
-        host_.lua_context_->RemoveCoCompleteCallback(yielded_co_);
+        host_.lua_context_->CancelCall(yielded_co_);
         yielded_co_ = nullptr;
         has_result_ = false;
+        entering_ = false;
     }
 
     if (active_ && host_.main_L_) {

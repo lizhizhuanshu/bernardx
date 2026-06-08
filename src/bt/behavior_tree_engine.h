@@ -1,11 +1,8 @@
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <set>
 #include <string>
 
@@ -28,60 +25,43 @@ public:
     explicit BehaviorTreeEngine(std::shared_ptr<Blackboard> bb = {});
     ~BehaviorTreeEngine();
 
-    // Non-copyable
     BehaviorTreeEngine(const BehaviorTreeEngine&) = delete;
     BehaviorTreeEngine& operator=(const BehaviorTreeEngine&) = delete;
+    BehaviorTreeEngine(BehaviorTreeEngine&&) = delete;
+    BehaviorTreeEngine& operator=(BehaviorTreeEngine&&) = delete;
 
     // Load tree from JSON string
     std::pair<bool, std::string> Load(const std::string& json);
 
-    // Lifecycle (thread-safe)
-    void Run();
-    void Pause();
-    void Resume();
+    // Reset tree state and release all resources
     void Stop();
 
-    // Tick loop management — creates a dedicated LuaRuntime and runs TickOnce
-    // in a loop on its executor until the tree completes or StopLoop is called.
-    using CompletionCallback = std::function<void(const std::string& status, const std::string& error)>;
+    // Synchronous single tick
+    NodeStatus TickOnce();
 
-    void StartLoop(std::shared_ptr<CodeProvider> code_provider,
-                   int64_t tick_interval_ms,
-                   CompletionCallback on_complete,
-                   LuaRuntime* parent_runtime);
-    void StopLoop();
-    bool IsLoopRunning() const { return loop_running_.load(); }
-
-    // State queries (thread-safe)
-    bool IsRunning() const { return running_.load(); }
-    bool IsPaused() const { return paused_.load(); }
+    bool IsLoaded() const { return root_ != nullptr; }
     std::string GetStatus() const;
 
     Blackboard& blackboard() { return *blackboard_; }
 
-    // Event injection (thread-safe)
     void Notify(const std::string& event_name, LuaValue data);
 
-    // Initialize script nodes with lua_State and LuaRuntime (called on event loop thread)
-    // Async — each script's Init can yield (e.g., for async require)
     async_simple::coro::Lazy<std::string> InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx);
 
     void SetProjectPath(std::string path) { project_path_ = std::move(path); }
     const std::string& project_path() const { return project_path_; }
 
     async_simple::coro::Lazy<std::string> InitSensorsAsync(lua_State* L, LuaRuntime* ctx);
-
     void ActivateInitialSensors();
-
     void DeactivateAllSensors();
 
-    NodeStatus TickOnce();
+    // Generation counter — incremented on Stop(). Async init checks this to detect stale operations.
+    uint64_t generation() const { return generation_; }
 
 private:
     using DecoratorState = std::unordered_map<Node*, std::unordered_map<Decorator*, bool>>;
 
     bool EvaluateDecorators(Node* node);
-    void EvaluateDecoratorsRecursive(Node* node);
     void PropagateAbort(Node* source, AbortMode mode);
     void HandleEvents();
     void ResetTree();
@@ -89,7 +69,6 @@ private:
     void CollectRunningNodes(Node* node, std::vector<Node*>& out);
     bool IsDescendantOf(Node* node, Node* ancestor) const;
 
-    // Sensor management
     void TickSensors();
     void UpdateActiveSensors();
     void CollectActiveNodes(Node* node, std::set<Node*>& out);
@@ -105,22 +84,10 @@ private:
     std::string project_path_;
     DecoratorState decorator_state_;
 
-    std::atomic<bool> running_{false};
-    std::atomic<bool> paused_{false};
-
     std::map<std::string, std::unique_ptr<ActiveSensor>> active_sensors_;
-    // Nodes that had sensors activated last tick
     std::set<Node*> prev_sensor_nodes_;
 
-    // Tick loop state
-    LuaRuntime::Ptr bt_context_;
-    async_simple::coro::Lazy<void> TickLoop(LuaRuntime::Ptr ctx,
-                                             int64_t tick_interval_ms,
-                                             CompletionCallback on_complete);
     std::string last_error_;
-
-    std::atomic<bool> loop_running_{false};
-    std::mutex tick_loop_mu_;
-    std::condition_variable tick_loop_cv_;
-    bool tick_loop_exited_ = true;
+    NodeStatus last_status_ = NodeStatus::kRunning;
+    uint64_t generation_ = 0;
 };

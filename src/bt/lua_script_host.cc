@@ -1,6 +1,5 @@
 #include "lua_script_host.h"
 
-#include <filesystem>
 #include <spdlog/spdlog.h>
 
 #include "bt_utils.h"
@@ -13,36 +12,44 @@ async_simple::coro::Lazy<bool> LuaScriptHost::LoadScript(
     main_L_ = L;
     lua_context_ = ctx;
 
-    std::string full_path = script_path;
-    if (!base_path.empty() && !std::filesystem::path(script_path).is_absolute()) {
-        full_path = std::filesystem::absolute(base_path + "/" + script_path).string();
+    if (!ctx->shared_code_provider()) {
+        last_error_ = "no code provider configured, cannot load '" + script_path + "'";
+        spdlog::error("LuaScriptHost::LoadScript: {}", last_error_);
+        co_return false;
     }
 
-    auto result = co_await ctx->DoFileAsync(full_path);
+    auto source = co_await ctx->shared_code_provider()->LoadFile(script_path);
+    if (!source.has_value()) {
+        last_error_ = "failed to load script '" + script_path + "'";
+        spdlog::error("LuaScriptHost::LoadScript: {}", last_error_);
+        co_return false;
+    }
+
+    auto result = co_await ctx->DoBufferAsync(script_path, std::move(*source));
 
     if (result.status != LUA_OK) {
-        last_error_ = "failed to execute '" + full_path + "': " +
+        last_error_ = "failed to execute '" + script_path + "': " +
                       (result.error.empty() ? "unknown error" : result.error);
         spdlog::error("LuaScriptHost::LoadScript: {}", last_error_);
         co_return false;
     }
 
     if (result.values.empty()) {
-        last_error_ = "'" + full_path + "' did not return a value";
+        last_error_ = "'" + script_path + "' did not return a value";
         spdlog::error("LuaScriptHost::LoadScript: {}", last_error_);
         co_return false;
     }
 
     auto* table_ref = std::get_if<LuaRef>(&result.values[0]);
     if (!table_ref) {
-        last_error_ = "'" + full_path + "' did not return a table";
+        last_error_ = "'" + script_path + "' did not return a table";
         spdlog::error("LuaScriptHost::LoadScript: {}", last_error_);
         co_return false;
     }
 
     lua_rawgeti(L, LUA_REGISTRYINDEX, (*table_ref)->ref);
     if (!lua_istable(L, -1)) {
-        last_error_ = "'" + full_path + "' did not return a table";
+        last_error_ = "'" + script_path + "' did not return a table";
         spdlog::error("LuaScriptHost::LoadScript: {}", last_error_);
         lua_pop(L, 1);
         co_return false;

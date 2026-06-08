@@ -28,42 +28,18 @@ std::pair<bool, std::string> BehaviorTreeEngine::Load(const std::string& json) {
     root_ = std::move(result.root);
     blackboard_->Clear();
     event_queue_.Drain();
+    last_status_ = NodeStatus::kRunning;
     return {true, {}};
 }
 
-void BehaviorTreeEngine::Run() {
-    if (!root_) {
-        spdlog::error("BehaviorTreeEngine: no tree loaded");
-        return;
-    }
-    if (running_.load()) {
-        spdlog::warn("BehaviorTreeEngine: already running");
-        return;
-    }
-
-    running_.store(true);
-    paused_.store(false);
-
-    spdlog::info("BehaviorTreeEngine: started");
-}
-
-void BehaviorTreeEngine::Pause() {
-    if (!running_.load() || paused_.load()) return;
-    paused_.store(true);
-}
-
-void BehaviorTreeEngine::Resume() {
-    if (!paused_.load()) return;
-    paused_.store(false);
-}
-
 void BehaviorTreeEngine::Stop() {
-    if (!running_.load()) return;
-
-    running_.store(false);
-    paused_.store(false);
-    ResetTree();
-    spdlog::info("BehaviorTreeEngine: stopped");
+    DeactivateAllSensors();
+    root_.reset();
+    blackboard_->Clear();
+    event_queue_.Drain();
+    ClearDecoratorState();
+    last_status_ = NodeStatus::kRunning;
+    generation_++;
 }
 
 void BehaviorTreeEngine::Notify(const std::string& event_name, LuaValue data) {
@@ -71,9 +47,12 @@ void BehaviorTreeEngine::Notify(const std::string& event_name, LuaValue data) {
 }
 
 std::string BehaviorTreeEngine::GetStatus() const {
-    if (!running_.load()) return "stopped";
-    if (paused_.load()) return "paused";
-    return "running";
+    if (!root_) return "idle";
+    switch (last_status_) {
+        case NodeStatus::kSuccess: return "success";
+        case NodeStatus::kFailure: return "failure";
+        default: return "running";
+    }
 }
 
 async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx) {
@@ -86,9 +65,7 @@ async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitScriptNodesAsync(l
 }
 
 NodeStatus BehaviorTreeEngine::TickOnce() {
-    // Returns kRunning when paused/no-root so the BT event loop doesn't break.
-    // Only success/failure cause the event loop to stop and resume the bt.run() coroutine.
-    if (!root_ || !running_.load() || paused_.load()) return NodeStatus::kRunning;
+    if (!root_) return NodeStatus::kFailure;
 
     HandleEvents();
     TickSensors();
@@ -110,6 +87,8 @@ NodeStatus BehaviorTreeEngine::TickOnce() {
         }
         ResetTree();
     }
+
+    last_status_ = status;
     return status;
 }
 
@@ -140,16 +119,6 @@ bool BehaviorTreeEngine::EvaluateDecorators(Node* node) {
         }
     }
     return true;
-}
-
-void BehaviorTreeEngine::EvaluateDecoratorsRecursive(Node* node) {
-    EvaluateDecorators(node);
-    auto* composite = dynamic_cast<Composite*>(node);
-    if (composite) {
-        for (auto& child : composite->children()) {
-            EvaluateDecoratorsRecursive(child.get());
-        }
-    }
 }
 
 void BehaviorTreeEngine::PropagateAbort(Node* source, AbortMode mode) {
@@ -299,15 +268,12 @@ void BehaviorTreeEngine::UpdateActiveSensors() {
     CollectActiveNodes(root_.get(), active_nodes);
     CollectAbortMonitoringNodes(root_.get(), active_nodes);
 
-    // Activate sensors for newly active nodes
     for (auto* node : active_nodes) {
         if (!prev_sensor_nodes_.count(node)) {
             ActivateNodeSensors(node);
         }
     }
 
-    // Deactivate sensors for no-longer-active nodes
-    // (only if no other active node still needs the same sensor)
     for (auto* node : prev_sensor_nodes_) {
         if (!active_nodes.count(node)) {
             DeactivateNodeSensors(node, active_nodes);
@@ -369,7 +335,6 @@ void BehaviorTreeEngine::ActivateNodeSensors(Node* node) {
 
 void BehaviorTreeEngine::DeactivateNodeSensors(Node* node, const std::set<Node*>& still_active) {
     for (auto& spec : node->sensor_specs()) {
-        // Check if any still-active node also declares this sensor
         bool still_needed = false;
         for (auto* other : still_active) {
             if (other == node) continue;
@@ -396,111 +361,4 @@ void BehaviorTreeEngine::DeactivateAllSensors() {
         sensor->Deactivate(blackboard_.get());
     }
     prev_sensor_nodes_.clear();
-}
-
-// --- Tick loop management ---
-
-void BehaviorTreeEngine::StartLoop(std::shared_ptr<CodeProvider> code_provider,
-                                    int64_t tick_interval_ms,
-                                    CompletionCallback on_complete,
-                                    LuaRuntime* parent_runtime) {
-    auto builder = LuaRuntime::Builder()
-        .WithCodeProvider(std::move(code_provider));
-
-    if (parent_runtime) {
-        builder.InheritFrom(parent_runtime);
-    }
-
-    bt_context_ = builder.Create();
-
-    {
-        std::lock_guard lock(tick_loop_mu_);
-        tick_loop_exited_ = false;
-    }
-    loop_running_.store(true);
-
-    auto self = shared_from_this();
-    auto ctx = bt_context_;
-    bt_context_->executor()->schedule(
-        [self, ctx, tick_interval_ms, cb = std::move(on_complete)]() mutable {
-            if (!self->bt_context_) return;
-            self->TickLoop(std::move(ctx), tick_interval_ms, std::move(cb))
-                .via(self->bt_context_->executor())
-                .start([self](auto&&) {});
-        });
-}
-
-void BehaviorTreeEngine::StopLoop() {
-    if (!loop_running_.load()) return;
-
-    loop_running_.store(false, std::memory_order_release);
-    DeactivateAllSensors();
-
-    {
-        std::unique_lock lock(tick_loop_mu_);
-        tick_loop_cv_.wait(lock, [this] { return tick_loop_exited_; });
-    }
-
-    bt_context_.reset();
-}
-
-async_simple::coro::Lazy<void> BehaviorTreeEngine::TickLoop(
-    LuaRuntime::Ptr ctx, int64_t tick_interval_ms,
-    CompletionCallback on_complete) {
-    auto done_guard = [this]() {
-        {
-            std::lock_guard lock(tick_loop_mu_);
-            tick_loop_exited_ = true;
-        }
-        tick_loop_cv_.notify_all();
-    };
-
-    auto init_error = co_await InitScriptNodesAsync(ctx->main_state(), ctx.get());
-    if (!init_error.empty()) {
-        if (on_complete) {
-            on_complete("failure", init_error);
-        }
-        done_guard();
-        co_return;
-    }
-
-    auto sensor_error = co_await InitSensorsAsync(ctx->main_state(), ctx.get());
-    if (!sensor_error.empty()) {
-        if (on_complete) {
-            on_complete("failure", sensor_error);
-        }
-        done_guard();
-        co_return;
-    }
-
-    ActivateInitialSensors();
-    Run();
-
-    while (loop_running_.load(std::memory_order_acquire)) {
-        auto status = TickOnce();
-
-        if (status == NodeStatus::kSuccess || status == NodeStatus::kFailure) {
-            std::string s = (status == NodeStatus::kSuccess) ? "success" : "failure";
-            std::string err;
-            if (status == NodeStatus::kFailure && !last_error_.empty()) {
-                err = last_error_;
-            }
-            Stop();
-            if (on_complete) {
-                on_complete(s, err);
-            }
-            done_guard();
-            co_return;
-        }
-
-        async_simple::Promise<void> p;
-        auto f = p.getFuture();
-        auto* ex = ctx->executor();
-        ex->schedule([p = std::move(p)]() mutable { p.setValue(); },
-                     std::chrono::milliseconds(tick_interval_ms));
-        co_await std::move(f);
-    }
-
-    Stop();
-    done_guard();
 }

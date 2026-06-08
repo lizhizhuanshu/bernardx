@@ -182,10 +182,7 @@ protected:
     }
 
     void TearDown() override {
-        if (lib && lib->engine() && lib->engine()->IsRunning()) {
-            lib->engine()->StopLoop();
-            lib->engine()->Stop();
-        }
+        lib->engine()->Stop();
     }
 
     int64_t BbGetInt(const std::string& key) {
@@ -216,7 +213,6 @@ protected:
 using SensorActivationTest = SensorBtTest;
 
 TEST_F(SensorActivationTest, SensorOnActivePathIsActivated) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -229,8 +225,13 @@ TEST_F(SensorActivationTest, SensorOnActivePathIsActivated) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
-        return ok, status
+        local ok = bt.load(json)
+        if ok then
+            local s
+            repeat s = bt.tick() until s ~= "running"
+            return true, s
+        end
+        return false, "load failed"
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::get<bool>(r.values[0]));
@@ -239,7 +240,6 @@ TEST_F(SensorActivationTest, SensorOnActivePathIsActivated) {
 }
 
 TEST_F(SensorActivationTest, SensorOnInactiveBranchNotActivated) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -265,7 +265,10 @@ TEST_F(SensorActivationTest, SensorOnInactiveBranchNotActivated) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -274,7 +277,6 @@ TEST_F(SensorActivationTest, SensorOnInactiveBranchNotActivated) {
 }
 
 TEST_F(SensorActivationTest, SensorDeactivatedWhenBranchLeavesActivePath) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -300,7 +302,10 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenBranchLeavesActivePath) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -310,7 +315,6 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenBranchLeavesActivePath) {
 }
 
 TEST_F(SensorActivationTest, BothBranchesActivatedSequentially) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -341,7 +345,10 @@ TEST_F(SensorActivationTest, BothBranchesActivatedSequentially) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -353,7 +360,6 @@ TEST_F(SensorActivationTest, BothBranchesActivatedSequentially) {
 }
 
 TEST_F(SensorActivationTest, AllSensorsDeactivatedWhenTreeCompletes) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -366,7 +372,10 @@ TEST_F(SensorActivationTest, AllSensorsDeactivatedWhenTreeCompletes) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -376,7 +385,6 @@ TEST_F(SensorActivationTest, AllSensorsDeactivatedWhenTreeCompletes) {
 }
 
 TEST_F(SensorActivationTest, SensorDeactivatedWhenAnotherSelectorBranchTakesOver) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -407,7 +415,10 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenAnotherSelectorBranchTakesOver
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -421,7 +432,6 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenAnotherSelectorBranchTakesOver
 using AbortSensorTest = SensorBtTest;
 
 TEST_F(AbortSensorTest, LowerPriorityKeepsSensorActive) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -448,7 +458,10 @@ TEST_F(AbortSensorTest, LowerPriorityKeepsSensorActive) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -457,7 +470,6 @@ TEST_F(AbortSensorTest, LowerPriorityKeepsSensorActive) {
 }
 
 TEST_F(AbortSensorTest, NoAbortDeactivatesSensor) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -484,7 +496,10 @@ TEST_F(AbortSensorTest, NoAbortDeactivatesSensor) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -493,7 +508,6 @@ TEST_F(AbortSensorTest, NoAbortDeactivatesSensor) {
 }
 
 TEST_F(AbortSensorTest, BothKeepsSensorActive) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -520,7 +534,10 @@ TEST_F(AbortSensorTest, BothKeepsSensorActive) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -529,7 +546,6 @@ TEST_F(AbortSensorTest, BothKeepsSensorActive) {
 }
 
 TEST_F(AbortSensorTest, SelfAbortDeactivatesSensor) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -556,7 +572,10 @@ TEST_F(AbortSensorTest, SelfAbortDeactivatesSensor) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -565,7 +584,6 @@ TEST_F(AbortSensorTest, SelfAbortDeactivatesSensor) {
 }
 
 TEST_F(AbortSensorTest, NoDecoratorDeactivatesSensor) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -589,7 +607,10 @@ TEST_F(AbortSensorTest, NoDecoratorDeactivatesSensor) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -598,7 +619,6 @@ TEST_F(AbortSensorTest, NoDecoratorDeactivatesSensor) {
 }
 
 TEST_F(AbortSensorTest, SecondSensorWithAbortAlsoMonitored) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -625,7 +645,10 @@ TEST_F(AbortSensorTest, SecondSensorWithAbortAlsoMonitored) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -636,7 +659,6 @@ TEST_F(AbortSensorTest, SecondSensorWithAbortAlsoMonitored) {
 using DeepSensorTest = SensorBtTest;
 
 TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -702,7 +724,10 @@ TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -713,7 +738,6 @@ TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
 }
 
 TEST_F(DeepSensorTest, FiveLevelAbortMonitoringAcrossDepths) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -768,7 +792,10 @@ TEST_F(DeepSensorTest, FiveLevelAbortMonitoringAcrossDepths) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -777,7 +804,6 @@ TEST_F(DeepSensorTest, FiveLevelAbortMonitoringAcrossDepths) {
 }
 
 TEST_F(DeepSensorTest, FiveLevelNoAbortSensorDeactivatedAtDepth) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -829,7 +855,10 @@ TEST_F(DeepSensorTest, FiveLevelNoAbortSensorDeactivatedAtDepth) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -839,7 +868,6 @@ TEST_F(DeepSensorTest, FiveLevelNoAbortSensorDeactivatedAtDepth) {
 }
 
 TEST_F(DeepSensorTest, FiveLevelMultipleAbortSensorsAtDifferentDepths) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -916,7 +944,10 @@ TEST_F(DeepSensorTest, FiveLevelMultipleAbortSensorsAtDifferentDepths) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -929,7 +960,6 @@ TEST_F(DeepSensorTest, FiveLevelMultipleAbortSensorsAtDifferentDepths) {
 using SensorInitTest = SensorBtTest;
 
 TEST_F(SensorInitTest, SensorWithBasicScript) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -942,7 +972,10 @@ TEST_F(SensorInitTest, SensorWithBasicScript) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -951,7 +984,6 @@ TEST_F(SensorInitTest, SensorWithBasicScript) {
 }
 
 TEST_F(SensorInitTest, SensorWithAsyncRequire) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -964,7 +996,10 @@ TEST_F(SensorInitTest, SensorWithAsyncRequire) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -973,7 +1008,6 @@ TEST_F(SensorInitTest, SensorWithAsyncRequire) {
 }
 
 TEST_F(SensorInitTest, SensorScriptNotFound) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -986,7 +1020,10 @@ TEST_F(SensorInitTest, SensorScriptNotFound) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -998,7 +1035,6 @@ TEST_F(SensorInitTest, SensorScriptNotFound) {
 }
 
 TEST_F(SensorInitTest, SensorMissingTickFunction) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -1011,7 +1047,10 @@ TEST_F(SensorInitTest, SensorMissingTickFunction) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1023,7 +1062,6 @@ TEST_F(SensorInitTest, SensorMissingTickFunction) {
 }
 
 TEST_F(SensorInitTest, SensorOnCompositeNode) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -1038,7 +1076,10 @@ TEST_F(SensorInitTest, SensorOnCompositeNode) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1047,7 +1088,6 @@ TEST_F(SensorInitTest, SensorOnCompositeNode) {
 }
 
 TEST_F(SensorInitTest, MultipleSensorsOnTree) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -1061,7 +1101,10 @@ TEST_F(SensorInitTest, MultipleSensorsOnTree) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1070,7 +1113,6 @@ TEST_F(SensorInitTest, MultipleSensorsOnTree) {
 }
 
 TEST_F(SensorInitTest, SensorFullLifecycle) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
@@ -1083,7 +1125,10 @@ TEST_F(SensorInitTest, SensorFullLifecycle) {
                 ]
             }
         }]]
-        local ok, status = bt.run(json)
+        local ok, status = bt.load(json)
+        if ok then
+            repeat status = bt.tick() until status ~= "running"
+        end
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);

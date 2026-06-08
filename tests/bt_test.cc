@@ -32,6 +32,7 @@
 #include "random_sequence.h"
 #include "wait_node.h"
 #include "tree_parser.h"
+#include "file_system_resource_provider.h"
 
 // --- Mock node for testing composites without Lua ---
 
@@ -635,9 +636,7 @@ protected:
     }
 
     void TearDown() override {
-        if (engine && engine->IsRunning()) {
-            engine->Stop();
-        }
+        engine->Stop();
     }
 
     BehaviorTreeEngine::Ptr engine;
@@ -664,13 +663,11 @@ TEST_F(BehaviorTreeEngineTest, LoadValidTree) {
     EXPECT_TRUE(engine->Load(json).first);
 }
 
-TEST_F(BehaviorTreeEngineTest, StatusBeforeRun) {
-    EXPECT_EQ(engine->GetStatus(), "stopped");
+TEST_F(BehaviorTreeEngineTest, StatusBeforeLoad) {
+    EXPECT_EQ(engine->GetStatus(), "idle");
 }
 
-TEST_F(BehaviorTreeEngineTest, RunAndStop) {
-    // Use a tree with only Script nodes that will fail (no LuaContext),
-    // so the tree should complete quickly and the engine should stop
+TEST_F(BehaviorTreeEngineTest, TickOnceOnLoadedTree) {
     const char* json = R"({
         "root": {
             "type": "Selector",
@@ -680,17 +677,13 @@ TEST_F(BehaviorTreeEngineTest, RunAndStop) {
         }
     })";
     ASSERT_TRUE(engine->Load(json).first);
-    engine->Run();
-    EXPECT_TRUE(engine->IsRunning());
+    EXPECT_TRUE(engine->IsLoaded());
 
-    // Give it time to tick at least once
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    engine->Stop();
-    EXPECT_FALSE(engine->IsRunning());
-    EXPECT_EQ(engine->GetStatus(), "stopped");
+    auto status = engine->TickOnce();
+    EXPECT_EQ(status, NodeStatus::kFailure);
 }
 
-TEST_F(BehaviorTreeEngineTest, PauseAndResume) {
+TEST_F(BehaviorTreeEngineTest, StopResetsTree) {
     const char* json = R"({
         "root": {
             "type": "Selector",
@@ -700,22 +693,13 @@ TEST_F(BehaviorTreeEngineTest, PauseAndResume) {
         }
     })";
     ASSERT_TRUE(engine->Load(json).first);
-    engine->Run();
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-
-    engine->Pause();
-    EXPECT_TRUE(engine->IsPaused());
-
-    engine->Resume();
-    EXPECT_FALSE(engine->IsPaused());
-
     engine->Stop();
+    EXPECT_EQ(engine->GetStatus(), "idle");
 }
 
-TEST_F(BehaviorTreeEngineTest, StopWithoutRun) {
-    // Should not crash
+TEST_F(BehaviorTreeEngineTest, StopWithoutLoad) {
     engine->Stop();
-    EXPECT_FALSE(engine->IsRunning());
+    EXPECT_EQ(engine->GetStatus(), "idle");
 }
 
 TEST_F(BehaviorTreeEngineTest, BlackboardPersistsAcrossLoad) {
@@ -753,10 +737,7 @@ protected:
     }
 
     void TearDown() override {
-        if (lib && lib->engine() && lib->engine()->IsRunning()) {
-            lib->engine()->StopLoop();
-            lib->engine()->Stop();
-        }
+        lib->engine()->Stop();
     }
 
     std::shared_ptr<Blackboard> blackboard;
@@ -779,12 +760,11 @@ TEST_F(BehaviorTreeLibraryTest, RequireReturnsTable) {
 TEST_F(BehaviorTreeLibraryTest, HasAllFunctions) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        return type(bt.run) == 'function'
-            and type(bt.pause) == 'function'
-            and type(bt.resume) == 'function'
-            and type(bt.stop) == 'function'
+        return type(bt.load) == 'function'
+            and type(bt.tick) == 'function'
             and type(bt.notify) == 'function'
             and type(bt.get_status) == 'function'
+            and type(bt.set_project_path) == 'function'
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 1u);
@@ -800,13 +780,13 @@ TEST_F(BehaviorTreeLibraryTest, GetStatusInitially) {
     ASSERT_EQ(r.values.size(), 1u);
     auto* s = std::get_if<std::string>(&r.values[0]);
     ASSERT_NE(s, nullptr);
-    EXPECT_EQ(*s, "stopped");
+    EXPECT_EQ(*s, "idle");
 }
 
-TEST_F(BehaviorTreeLibraryTest, RunInvalidJson) {
+TEST_F(BehaviorTreeLibraryTest, LoadInvalidJson) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local ok, err = bt.run('{invalid}')
+        local ok, err = bt.load('{invalid}')
         return ok, err or 'nil'
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -816,10 +796,10 @@ TEST_F(BehaviorTreeLibraryTest, RunInvalidJson) {
     EXPECT_NE(err->find("JSON"), std::string::npos);
 }
 
-TEST_F(BehaviorTreeLibraryTest, RunInvalidJsonReturnsSpecificError) {
+TEST_F(BehaviorTreeLibraryTest, LoadInvalidJsonReturnsSpecificError) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local ok, err = bt.run('{"children":[]}')
+        local ok, err = bt.load('{"children":[]}')
         return ok, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -829,10 +809,10 @@ TEST_F(BehaviorTreeLibraryTest, RunInvalidJsonReturnsSpecificError) {
     EXPECT_NE(err->find("root"), std::string::npos);
 }
 
-TEST_F(BehaviorTreeLibraryTest, RunUnknownNodeType) {
+TEST_F(BehaviorTreeLibraryTest, LoadUnknownNodeType) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local ok, err = bt.run('{"root":{"type":"UnknownType"}}')
+        local ok, err = bt.load('{"root":{"type":"UnknownType"}}')
         return ok, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -870,12 +850,11 @@ TEST_F(BehaviorTreeLibraryTest, GetBlackboardAsTable) {
     EXPECT_EQ(std::get<std::string>(r.values[1]), "hello");
 }
 
-TEST_F(BehaviorTreeLibraryTest, RunAndCheckStatus) {
-    lib->SetTickIntervalMs(10);
+TEST_F(BehaviorTreeLibraryTest, LoadAndTick) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local json = '{"root":{"type":"Selector","children":[{"type":"Script","path":"x.lua"}]}}'
-        local ok, err = bt.run(json)
+        local ok, err = bt.load(json)
         return ok, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -884,25 +863,20 @@ TEST_F(BehaviorTreeLibraryTest, RunAndCheckStatus) {
     auto* err = std::get_if<std::string>(&r.values[1]);
     ASSERT_NE(err, nullptr);
     EXPECT_FALSE(err->empty());
-    EXPECT_FALSE(lib->engine()->IsRunning());
 }
 
-TEST_F(BehaviorTreeLibraryTest, PauseResumeFromLua) {
-    lib->SetTickIntervalMs(200);
+TEST_F(BehaviorTreeLibraryTest, TickWithoutLoad) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = '{"root":{"type":"Selector","children":[{"type":"Script","path":"x.lua"}]}}'
-
-        local ok, err = bt.run(json)
-        return ok, err
+        local status, err = bt.tick()
+        return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 2u);
-    EXPECT_FALSE(std::get<bool>(r.values[0]));
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[0]));
     auto* err = std::get_if<std::string>(&r.values[1]);
     ASSERT_NE(err, nullptr);
-    EXPECT_FALSE(err->empty());
+    EXPECT_NE(err->find("no tree"), std::string::npos);
 }
 
 // --- Abort Mechanism Tests ---
@@ -1349,6 +1323,17 @@ protected:
         std::ofstream(dir_ / name) << content;
     }
 
+    void WriteSubtree(const std::string& name, const std::string& content) {
+        auto sub_dir = dir_ / "subtrees";
+        std::filesystem::create_directories(sub_dir);
+        std::ofstream(sub_dir / name) << content;
+    }
+
+    std::string LoadTree() {
+        FileSystemResourceProvider provider(dir_.string());
+        return async_simple::coro::syncAwait(TreeParser::LoadTree(&provider, ""));
+    }
+
     std::filesystem::path dir_;
 };
 
@@ -1357,7 +1342,7 @@ TEST_F(LoadTreeFromDirectoryTest, LoadsRootOnly) {
         {"type": "Script", "path": "a.lua"}
     ]})");
 
-    auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
+    auto json = LoadTree();
     ASSERT_FALSE(json.empty());
 
     auto _parse_result = TreeParser::Parse(json);
@@ -1371,12 +1356,12 @@ TEST_F(LoadTreeFromDirectoryTest, LoadsRootWithSubtrees) {
         {"type": "Subtree", "subtree": "combat"},
         {"type": "Script", "path": "idle.lua"}
     ]})");
-    WriteFile("combat.json", R"({"type": "Sequence", "children": [
+    WriteSubtree("combat.json", R"({"type": "Sequence", "children": [
         {"type": "Script", "path": "aim.lua"},
         {"type": "Script", "path": "attack.lua"}
     ]})");
 
-    auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
+    auto json = LoadTree();
     ASSERT_FALSE(json.empty());
 
     auto _parse_result = TreeParser::Parse(json);
@@ -1399,10 +1384,10 @@ TEST_F(LoadTreeFromDirectoryTest, MultipleSubtrees) {
         {"type": "Subtree", "subtree": "combat"},
         {"type": "Subtree", "subtree": "patrol"}
     ]})");
-    WriteFile("combat.json", R"({"type": "Script", "path": "fight.lua"})");
-    WriteFile("patrol.json", R"({"type": "Script", "path": "walk.lua"})");
+    WriteSubtree("combat.json", R"({"type": "Script", "path": "fight.lua"})");
+    WriteSubtree("patrol.json", R"({"type": "Script", "path": "walk.lua"})");
 
-    auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
+    auto json = LoadTree();
     ASSERT_FALSE(json.empty());
 
     auto _parse_result = TreeParser::Parse(json);
@@ -1420,7 +1405,7 @@ TEST_F(LoadTreeFromDirectoryTest, IgnoresNonJsonFiles) {
     WriteFile("notes.txt", "ignore me");
     WriteFile("data.csv", "1,2,3");
 
-    auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
+    auto json = LoadTree();
     ASSERT_FALSE(json.empty());
 
     auto _parse_result = TreeParser::Parse(json);
@@ -1430,30 +1415,96 @@ TEST_F(LoadTreeFromDirectoryTest, IgnoresNonJsonFiles) {
 }
 
 TEST_F(LoadTreeFromDirectoryTest, DirNotFound) {
-    auto json = TreeParser::LoadTreeFromDirectory("/nonexistent/path");
+    auto missing = dir_ / "no_such_dir";
+    FileSystemResourceProvider provider(missing.string());
+    auto json = async_simple::coro::syncAwait(TreeParser::LoadTree(&provider, ""));
     EXPECT_TRUE(json.empty());
 }
 
 TEST_F(LoadTreeFromDirectoryTest, NoRootJson) {
-    WriteFile("combat.json", R"({"type": "Script", "path": "fight.lua"})");
+    WriteSubtree("combat.json", R"({"type": "Script", "path": "fight.lua"})");
 
-    auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
+    auto json = LoadTree();
     EXPECT_TRUE(json.empty());
 }
 
 TEST_F(LoadTreeFromDirectoryTest, InvalidJsonInRoot) {
     WriteFile("root.json", "{invalid}");
 
-    auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
+    auto json = LoadTree();
     EXPECT_TRUE(json.empty());
 }
 
 TEST_F(LoadTreeFromDirectoryTest, InvalidJsonInSubtree) {
     WriteFile("root.json", R"({"type": "Subtree", "subtree": "bad"})");
-    WriteFile("bad.json", "{broken");
+    WriteSubtree("bad.json", "{broken");
 
-    auto json = TreeParser::LoadTreeFromDirectory(dir_.string());
+    auto json = LoadTree();
     EXPECT_TRUE(json.empty());
+}
+
+TEST_F(LoadTreeFromDirectoryTest, LoadsSensorsJson) {
+    WriteFile("root.json", R"({"type": "Script", "path": "a.lua",
+        "sensors": ["nearby", "combat.target_check"]
+    })");
+    WriteFile("sensors.json", R"({
+        "nearby": {"interval": 200},
+        "combat.target_check": {"interval": 100, "args": {"range": 50}}
+    })");
+
+    auto json = LoadTree();
+    ASSERT_FALSE(json.empty());
+
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
+    ASSERT_NE(root, nullptr);
+    ASSERT_EQ(root->sensor_specs().size(), 2u);
+
+    EXPECT_EQ(root->sensor_specs()[0].name, "nearby");
+    EXPECT_EQ(root->sensor_specs()[0].interval_ms, 200);
+    EXPECT_EQ(root->sensor_specs()[0].script_path, "sensors/nearby.lua");
+
+    EXPECT_EQ(root->sensor_specs()[1].name, "combat.target_check");
+    EXPECT_EQ(root->sensor_specs()[1].interval_ms, 100);
+    EXPECT_EQ(root->sensor_specs()[1].script_path, "sensors/combat/target_check.lua");
+    EXPECT_EQ(root->sensor_specs()[1].args.size(), 1u);
+}
+
+TEST_F(LoadTreeFromDirectoryTest, NoSensorsJsonIsFine) {
+    WriteFile("root.json", R"({"type": "Script", "path": "a.lua"})");
+
+    auto json = LoadTree();
+    ASSERT_FALSE(json.empty());
+
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
+    ASSERT_NE(root, nullptr);
+}
+
+TEST_F(LoadTreeFromDirectoryTest, InvalidSensorsJson) {
+    WriteFile("root.json", R"({"type": "Script", "path": "a.lua"})");
+    WriteFile("sensors.json", "{broken");
+
+    auto json = LoadTree();
+    EXPECT_TRUE(json.empty());
+}
+
+TEST_F(LoadTreeFromDirectoryTest, SensorsWithOverridePath) {
+    WriteFile("root.json", R"({"type": "Script", "path": "a.lua",
+        "sensors": ["custom"]
+    })");
+    WriteFile("sensors.json", R"({
+        "custom": {"path": "other/custom.lua", "interval": 500}
+    })");
+
+    auto json = LoadTree();
+    ASSERT_FALSE(json.empty());
+
+    auto _parse_result = TreeParser::Parse(json);
+    auto root = std::move(_parse_result.root);
+    ASSERT_NE(root, nullptr);
+    ASSERT_EQ(root->sensor_specs().size(), 1u);
+    EXPECT_EQ(root->sensor_specs()[0].script_path, "other/custom.lua");
 }
 
 // --- ScriptNode Args Parsing Tests ---
@@ -1523,9 +1574,6 @@ TEST(TreeParserArgsTest, ParseScriptNodeWithFloatArg) {
 
 // --- ScriptNode Colon-Method Integration Tests ---
 
-// Test scripts live in tests/scripts/ alongside this file.
-// bt.set_project_path points to the project tests/ directory.
-
 class ScriptNodeIntegrationTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -1537,16 +1585,12 @@ protected:
             .RegisterLibrary(lib)
             .Create();
 
-        // tests/ is the project root for test scripts
         tests_dir_ = std::filesystem::absolute(
             std::filesystem::path(__FILE__).parent_path()).string();
     }
 
     void TearDown() override {
-        if (lib && lib->engine() && lib->engine()->IsRunning()) {
-            lib->engine()->StopLoop();
-            lib->engine()->Stop();
-        }
+        lib->engine()->Stop();
     }
 
     std::string RunBtScript(const std::string& lua_code) {
@@ -1570,71 +1614,88 @@ protected:
 };
 
 TEST_F(ScriptNodeIntegrationTest, SelfStateInEnterAndTick) {
-    lib->SetTickIntervalMs(10);
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
-        return bt.run('{"root":{"type":"Script","path":"scripts/bt_module.lua"}}')
+        local ok = bt.load('{"root":{"type":"Script","path":"scripts/bt_module.lua"}}')
+        if not ok then return false, "load failed" end
+        local s
+        repeat s = bt.tick() until s ~= "running"
+        return true, s
     )");
     EXPECT_EQ(status, "success");
 }
 
 TEST_F(ScriptNodeIntegrationTest, ExitReasonAsParameter) {
-    lib->SetTickIntervalMs(10);
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
-        return bt.run('{"root":{"type":"Script","path":"scripts/check_reason.lua"}}')
+        local ok = bt.load('{"root":{"type":"Script","path":"scripts/check_reason.lua"}}')
+        if not ok then return false, "load failed" end
+        local s
+        repeat s = bt.tick() until s ~= "running"
+        return true, s
     )");
     EXPECT_EQ(status, "success");
 }
 
 TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
-    lib->SetTickIntervalMs(10);
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
-        return bt.run('{"root":{"type":"Script","path":"scripts/with_args.lua","args":{"target":"enemy","damage":100}}}')
+        local ok = bt.load('{"root":{"type":"Script","path":"scripts/with_args.lua","args":{"target":"enemy","damage":100}}}')
+        if not ok then return false, "load failed" end
+        local s
+        repeat s = bt.tick() until s ~= "running"
+        return true, s
     )");
     EXPECT_EQ(status, "success");
 }
 
 TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
-    lib->SetTickIntervalMs(10);
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
-        return bt.run('{"root":{"type":"Script","path":"scripts/bool_args.lua","args":{"enabled":true}}}')
+        local ok = bt.load('{"root":{"type":"Script","path":"scripts/bool_args.lua","args":{"enabled":true}}}')
+        if not ok then return false, "load failed" end
+        local s
+        repeat s = bt.tick() until s ~= "running"
+        return true, s
     )");
     EXPECT_EQ(status, "success");
 }
 
 TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
-    lib->SetTickIntervalMs(10);
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
-        return bt.run('{"root":{"type":"Script","path":"scripts/counter.lua"}}')
+        local ok = bt.load('{"root":{"type":"Script","path":"scripts/counter.lua"}}')
+        if not ok then return false, "load failed" end
+        local s
+        repeat s = bt.tick() until s ~= "running"
+        return true, s
     )");
     EXPECT_EQ(status, "success");
 }
 
 TEST_F(ScriptNodeIntegrationTest, NoArgsStillWorks) {
-    lib->SetTickIntervalMs(10);
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
-        return bt.run('{"root":{"type":"Script","path":"scripts/no_args.lua"}}')
+        local ok = bt.load('{"root":{"type":"Script","path":"scripts/no_args.lua"}}')
+        if not ok then return false, "load failed" end
+        local s
+        repeat s = bt.tick() until s ~= "running"
+        return true, s
     )");
     EXPECT_EQ(status, "success");
 }
 
 TEST_F(ScriptNodeIntegrationTest, ScriptNotFoundReturnsError) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
-        local ok, status = bt.run('{"root":{"type":"Script","path":"scripts/nonexistent.lua"}}')
+        local ok, status = bt.load('{"root":{"type":"Script","path":"scripts/nonexistent.lua"}}')
         return ok, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1643,48 +1704,49 @@ TEST_F(ScriptNodeIntegrationTest, ScriptNotFoundReturnsError) {
     auto* err = std::get_if<std::string>(&r.values[1]);
     ASSERT_NE(err, nullptr);
     EXPECT_NE(err->find("nonexistent.lua"), std::string::npos);
-    EXPECT_NE(err->find("No such file"), std::string::npos);
 }
 
 TEST_F(ScriptNodeIntegrationTest, ScriptRuntimeErrorReturnsError) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
-        local ok, status = bt.run('{"root":{"type":"Script","path":"scripts/runtime_error.lua"}}')
-        return ok, status
+        local ok = bt.load('{"root":{"type":"Script","path":"scripts/runtime_error.lua"}}')
+        if not ok then return false, "load failed" end
+        local s
+        repeat s = bt.tick() until s ~= "running"
+        return true, s
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 2u);
-    EXPECT_FALSE(std::get<bool>(r.values[0]));
-    auto* err = std::get_if<std::string>(&r.values[1]);
-    ASSERT_NE(err, nullptr);
-    EXPECT_NE(err->find("something went wrong"), std::string::npos);
-    EXPECT_NE(err->find("runtime_error.lua"), std::string::npos);
+    EXPECT_TRUE(std::get<bool>(r.values[0]));
+    auto* status = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(*status, "failure");
 }
 
 TEST_F(ScriptNodeIntegrationTest, NodeReturnsFailureIsNotError) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.set_project_path(')" + tests_dir_ + R"(')
-        local ok, status = bt.run('{"root":{"type":"Script","path":"scripts/returns_failure.lua"}}')
-        return ok, status
+        local ok = bt.load('{"root":{"type":"Script","path":"scripts/returns_failure.lua"}}')
+        if not ok then return false, "load failed" end
+        local s
+        repeat s = bt.tick() until s ~= "running"
+        return true, s
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 2u);
-     EXPECT_TRUE(std::get<bool>(r.values[0]));
+    EXPECT_TRUE(std::get<bool>(r.values[0]));
 }
 
 TEST_F(ScriptNodeIntegrationTest, InitErrorInSequenceStopsEarly) {
-    lib->SetTickIntervalMs(10);
     auto r = AWAIT_BT(rt->RunScript(
         "local bt = require('bt')\n"
         "bt.set_project_path('" + tests_dir_ + "')\n"
         "local json = '{\"root\":{\"type\":\"Sequence\",\"children\":"
         "[{\"type\":\"Script\",\"path\":\"scripts/nonexistent.lua\"},"
         "{\"type\":\"Script\",\"path\":\"scripts/no_args.lua\"}]}}'\n"
-        "local ok, status = bt.run(json)\n"
+        "local ok, status = bt.load(json)\n"
         "return ok, status\n"
     ));
     ASSERT_EQ(r.status, LUA_OK);

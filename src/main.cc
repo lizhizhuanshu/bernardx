@@ -70,8 +70,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (bt_lib->engine() && bt_lib->engine()->IsRunning()) {
-        bt_lib->engine()->StopLoop();
+    if (bt_lib->engine() && bt_lib->engine()->IsLoaded()) {
         bt_lib->engine()->Stop();
     }
 

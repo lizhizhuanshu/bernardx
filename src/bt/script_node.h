@@ -34,12 +34,16 @@ public:
 
 private:
     NodeStatus ParseReturnValues(const std::vector<LuaValue>& values, bool& deactivate);
+    void CallExit(const std::string& reason);
+    NodeStatus HandleEnterResult(const ScriptResult& result);
+    NodeStatus HandleScriptResult(const ScriptResult& result);
 
     std::string script_path_;
     ArgsMap args_;
     LuaScriptHost host_;
 
     bool active_ = false;
+    bool entering_ = false;
 
     lua_State* yielded_co_ = nullptr;
 
