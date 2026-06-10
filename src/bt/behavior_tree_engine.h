@@ -62,6 +62,7 @@ private:
     using DecoratorState = std::unordered_map<Node*, std::unordered_map<Decorator*, bool>>;
 
     bool EvaluateDecorators(Node* node);
+    void EvaluateAllAbortMonitors();
     void PropagateAbort(Node* source, AbortMode mode);
     void HandleEvents();
     void ResetTree();

@@ -9,7 +9,11 @@ Selector::Selector(uint32_t id, std::string name)
 
 NodeStatus Selector::Tick(Blackboard& bb, BtEventQueue& events) {
     for (size_t i = current_child_index_; i < children_.size(); ++i) {
-        auto status = children_[i]->Tick(bb, events);
+        auto& child = children_[i];
+        if (!child->CheckDecorators(bb)) {
+            continue;
+        }
+        auto status = child->Tick(bb, events);
         switch (status) {
             case NodeStatus::kRunning:
                 current_child_index_ = i;
@@ -18,8 +22,8 @@ NodeStatus Selector::Tick(Blackboard& bb, BtEventQueue& events) {
                 current_child_index_ = 0;
                 return NodeStatus::kSuccess;
             case NodeStatus::kFailure:
-                if (!children_[i]->last_error().empty()) {
-                    set_last_error(children_[i]->last_error());
+                if (!child->last_error().empty()) {
+                    set_last_error(child->last_error());
                 }
                 continue;
         }

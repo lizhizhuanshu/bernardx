@@ -12,13 +12,18 @@ NodeStatus RandomSequence::Tick(Blackboard& bb, BtEventQueue& events) {
 
     const auto& order = shuffled_tracker_.order();
     for (size_t i = current_child_index_; i < order.size(); ++i) {
-        auto status = children_[order[i]]->Tick(bb, events);
+        auto& child = children_[order[i]];
+        if (!child->CheckDecorators(bb)) {
+            current_child_index_ = 0;
+            return NodeStatus::kFailure;
+        }
+        auto status = child->Tick(bb, events);
         switch (status) {
             case NodeStatus::kRunning:
                 current_child_index_ = i;
                 return NodeStatus::kRunning;
             case NodeStatus::kFailure:
-                set_last_error(children_[order[i]]->last_error());
+                set_last_error(child->last_error());
                 current_child_index_ = 0;
                 return NodeStatus::kFailure;
             case NodeStatus::kSuccess:

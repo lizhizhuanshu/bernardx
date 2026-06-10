@@ -12,6 +12,14 @@ NodeStatus RetryUntilSuccessful::Tick(Blackboard& bb, BtEventQueue& events) {
         return NodeStatus::kFailure;
     }
 
+    if (!child_->CheckDecorators(bb)) {
+        ++attempt_count_;
+        if (max_attempts_ != kInfinite && attempt_count_ >= max_attempts_) {
+            return NodeStatus::kFailure;
+        }
+        return NodeStatus::kRunning;
+    }
+
     auto status = child_->Tick(bb, events);
     if (status == NodeStatus::kSuccess) {
         return NodeStatus::kSuccess;

@@ -46,6 +46,7 @@ public:
     void AddDecorator(std::unique_ptr<Decorator> dec);
 
     const std::vector<std::unique_ptr<Decorator>>& decorators() const { return decorators_; }
+    bool CheckDecorators(Blackboard& bb) const;
 
     const std::vector<SensorSpec>& sensor_specs() const { return sensor_specs_; }
     void AddSensorSpec(SensorSpec spec) { sensor_specs_.push_back(std::move(spec)); }

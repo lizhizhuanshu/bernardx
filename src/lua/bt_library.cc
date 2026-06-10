@@ -208,48 +208,43 @@ int bt_run(lua_State* L) {
     std::string tree_relative_path;
     std::string proj_path = pp;
     std::shared_ptr<CodeProvider> code_provider;
+    std::string remote_base = remote ? pp.substr(1) : std::string{};
 
     if (!json.empty()) {
         json_str = json;
+    } else if (remote) {
+        tree_relative_path = remote_base.empty()
+            ? std::string(path)
+            : (remote_base + "/" + path);
+        tree_provider = lib->resource_provider();
     } else {
-        // path is provided
-        if (remote) {
-            auto remote_base = pp.substr(1);
-            tree_relative_path = remote_base.empty()
-                ? std::string(path)
-                : (remote_base + "/" + path);
-            tree_provider = lib->resource_provider();
-
-            std::vector<std::string> search_paths = {
-                remote_base + "/scripts",
-                remote_base + "/sensors",
-                remote_base,
-            };
-            code_provider = std::make_shared<ResourceCodeProvider>(tree_provider, std::move(search_paths));
-        } else {
-            std::filesystem::path tree_path(path);
-            if (!pp.empty()) {
-                tree_path = std::filesystem::path(pp) / path;
-            }
-            tree_provider = std::make_shared<FileSystemResourceProvider>(tree_path.string());
+        std::filesystem::path tree_path(path);
+        if (!pp.empty()) {
+            tree_path = std::filesystem::path(pp) / path;
         }
+        tree_provider = std::make_shared<FileSystemResourceProvider>(tree_path.string());
     }
 
-    if (!code_provider) {
-        if (!pp.empty() && !remote) {
-            auto abs_pp = std::filesystem::absolute(pp);
-            std::vector<std::string> search_paths = {
-                (abs_pp / "scripts").string(),
-                (abs_pp / "sensors").string(),
-                abs_pp.string(),
-            };
-            if (!lib->main_libs_path().empty()) {
-                search_paths.push_back(std::filesystem::absolute(lib->main_libs_path()).string());
-            }
-            code_provider = std::make_shared<FileSystemCodeProvider>(std::move(search_paths));
-        } else {
-            code_provider = rt_ctx->shared_code_provider();
+    if (remote && lib->resource_provider()) {
+        std::vector<std::string> search_paths = {
+            remote_base + "/scripts",
+            remote_base + "/sensors",
+            remote_base,
+        };
+        code_provider = std::make_shared<ResourceCodeProvider>(lib->resource_provider(), std::move(search_paths));
+    } else if (!pp.empty() && !remote) {
+        auto abs_pp = std::filesystem::absolute(pp);
+        std::vector<std::string> search_paths = {
+            (abs_pp / "scripts").string(),
+            (abs_pp / "sensors").string(),
+            abs_pp.string(),
+        };
+        if (!lib->main_libs_path().empty()) {
+            search_paths.push_back(std::filesystem::absolute(lib->main_libs_path()).string());
         }
+        code_provider = std::make_shared<FileSystemCodeProvider>(std::move(search_paths));
+    } else {
+        code_provider = rt_ctx->shared_code_provider();
     }
 
     RunTreeAsync(rt_ctx, handle, engine->shared_from_this(),

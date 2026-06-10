@@ -7,6 +7,7 @@
 #include "bt_utils.h"
 #include "composite.h"
 #include "lua_runtime.h"
+#include "single_child_node.h"
 #include "subtree_node.h"
 #include "tree_parser.h"
 
@@ -26,7 +27,6 @@ std::pair<bool, std::string> BehaviorTreeEngine::Load(const std::string& json) {
         return {false, std::move(err)};
     }
     root_ = std::move(result.root);
-    blackboard_->Clear();
     event_queue_.Drain();
     last_status_ = NodeStatus::kRunning;
     return {true, {}};
@@ -35,7 +35,6 @@ std::pair<bool, std::string> BehaviorTreeEngine::Load(const std::string& json) {
 void BehaviorTreeEngine::Stop() {
     DeactivateAllSensors();
     root_.reset();
-    blackboard_->Clear();
     event_queue_.Drain();
     ClearDecoratorState();
     last_status_ = NodeStatus::kRunning;
@@ -69,6 +68,8 @@ NodeStatus BehaviorTreeEngine::TickOnce() {
 
     HandleEvents();
     TickSensors();
+
+    EvaluateAllAbortMonitors();
 
     if (!EvaluateDecorators(root_.get())) {
         return NodeStatus::kRunning;
@@ -121,6 +122,19 @@ bool BehaviorTreeEngine::EvaluateDecorators(Node* node) {
     return true;
 }
 
+void BehaviorTreeEngine::EvaluateAllAbortMonitors() {
+    if (!root_) return;
+
+    std::set<Node*> monitored;
+    CollectActiveNodes(root_.get(), monitored);
+    CollectAbortMonitoringNodes(root_.get(), monitored);
+    monitored.erase(root_.get());
+
+    for (auto* node : monitored) {
+        EvaluateDecorators(node);
+    }
+}
+
 void BehaviorTreeEngine::PropagateAbort(Node* source, AbortMode mode) {
     if (mode == AbortMode::kNone) return;
 
@@ -153,6 +167,8 @@ void BehaviorTreeEngine::PropagateAbort(Node* source, AbortMode mode) {
                                 }
                             }
                         }
+                        // Reset parent composite so it re-evaluates from the source child
+                        composite->set_current_child_index(i);
                         break;
                     }
                 }
@@ -197,6 +213,16 @@ void BehaviorTreeEngine::CollectRunningNodes(Node* node, std::vector<Node*>& out
         for (auto& child : composite->children()) {
             CollectRunningNodes(child.get(), out);
         }
+        return;
+    }
+    auto* single = dynamic_cast<SingleChildNode*>(node);
+    if (single && single->child()) {
+        CollectRunningNodes(single->child(), out);
+        return;
+    }
+    auto* sub = dynamic_cast<SubtreeNode*>(node);
+    if (sub && sub->subtree_root()) {
+        CollectRunningNodes(sub->subtree_root(), out);
     }
 }
 
@@ -217,7 +243,10 @@ async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitSensorsAsync(lua_S
 }
 
 async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitSensorsRecursive(Node* node, lua_State* L, LuaRuntime* ctx) {
+
     for (auto& spec : node->sensor_specs()) {
+        spdlog::debug("InitSensorsRecursive: sensor '{}', path='{}', interval={}",
+                      spec.name, spec.script_path, spec.interval_ms);
         if (active_sensors_.count(spec.name)) {
             spdlog::warn("BehaviorTreeEngine: duplicate sensor name '{}', overwriting", spec.name);
         }
@@ -235,6 +264,11 @@ async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitSensorsRecursive(N
     } else if (auto* sub = dynamic_cast<SubtreeNode*>(node)) {
         if (sub->subtree_root()) {
             auto error = co_await InitSensorsRecursive(sub->subtree_root(), L, ctx);
+            if (!error.empty()) co_return error;
+        }
+    } else if (auto* single = dynamic_cast<SingleChildNode*>(node)) {
+        if (single->child()) {
+            auto error = co_await InitSensorsRecursive(single->child(), L, ctx);
             if (!error.empty()) co_return error;
         }
     }
@@ -288,6 +322,16 @@ void BehaviorTreeEngine::CollectActiveNodes(Node* node, std::set<Node*>& out) {
     auto* composite = dynamic_cast<Composite*>(node);
     if (composite && composite->current_child_index() < composite->children().size()) {
         CollectActiveNodes(composite->children()[composite->current_child_index()].get(), out);
+        return;
+    }
+    auto* single = dynamic_cast<SingleChildNode*>(node);
+    if (single && single->child()) {
+        CollectActiveNodes(single->child(), out);
+        return;
+    }
+    auto* sub = dynamic_cast<SubtreeNode*>(node);
+    if (sub && sub->subtree_root()) {
+        CollectActiveNodes(sub->subtree_root(), out);
     }
 }
 
@@ -304,6 +348,11 @@ bool BehaviorTreeEngine::HasAbortLowerPriority(const Node* node) {
 void BehaviorTreeEngine::CollectAbortMonitoringNodes(Node* node, std::set<Node*>& out) {
     auto* composite = dynamic_cast<Composite*>(node);
     if (!composite) {
+        auto* single = dynamic_cast<SingleChildNode*>(node);
+        if (single && single->child()) {
+            CollectAbortMonitoringNodes(single->child(), out);
+            return;
+        }
         auto* sub = dynamic_cast<SubtreeNode*>(node);
         if (sub && sub->subtree_root()) {
             CollectAbortMonitoringNodes(sub->subtree_root(), out);

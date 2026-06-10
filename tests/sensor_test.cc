@@ -698,6 +698,8 @@ TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
                 ]
             }
         }]]
+        local bb = require('blackboard')
+        bb.set("flag", true)
         local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
         if not status then return false, err end
         return true, status
@@ -912,6 +914,10 @@ TEST_F(DeepSensorTest, FiveLevelMultipleAbortSensorsAtDifferentDepths) {
                 ]
             }
         }]]
+        local bb = require('blackboard')
+        bb.set("x", true)
+        bb.set("y", true)
+        bb.set("z", true)
         local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
         if not status then return false, err end
         return true, status

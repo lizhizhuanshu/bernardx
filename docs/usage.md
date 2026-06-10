@@ -51,6 +51,10 @@ my_project/               ← --dir 指向这里
 ├── libs/                 # 第三方 Lua 库（BT 也可 require 这些库）
 ├── bt_project/           # 行为树项目（可选，通过 bt.run({project_path=...}) 指定）
 │   ├── trees/            #   行为树 JSON
+│   │   └── ai_main/      #     每个目录 = 一棵行为树
+│   │       ├── root.json
+│   │       ├── sensors.json    # 全局传感器定义（可选）
+│   │       └── subtrees/      # 子树目录（可选）
 │   ├── scripts/          #   脚本节点
 │   └── sensors/          #   传感器脚本
 └── ...

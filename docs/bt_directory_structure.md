@@ -9,8 +9,10 @@ bt_project/                   ← project_path 指向这里
 ├── trees/                    # 行为树 JSON 配置
 │   └── ai_main/              # 每个目录 = 一棵行为树
 │       ├── root.json         #   根树定义（必需）
-│       ├── combat.json       #   子树 "combat"
-│       └── patrol.json       #   子树 "patrol"
+│       ├── sensors.json      #   全局传感器定义（可选）
+│       └── subtrees/         #   子树目录
+│           ├── combat.json   #     子树 "combat"
+│           └── patrol.json   #     子树 "patrol"
 ├── scripts/                  # Script 节点脚本
 │   ├── combat/               #   按功能域组织
 │   │   ├── aim.lua
@@ -20,7 +22,7 @@ bt_project/                   ← project_path 指向这里
 │   │   └── move_to.lua
 │   └── common/
 │       └── idle.lua
-└── sensors/                  # 传感器脚本
+└── sensors/                  # 传感器脚本（按 name 自动映射路径）
     ├── element_visible.lua
     ├── nearby.lua
     └── check_hp.lua
@@ -50,19 +52,22 @@ Script 和 Sensor 节点的 `path` 字段相对于项目根目录解析。例如
 
 ## trees/ — 行为树配置
 
-每个子目录对应一棵行为树。设置了项目路径时，通过 `bt.run("trees/ai_main")` 加载（路径相对于项目根目录）；未设置时，相对于当前工作目录。
+每个子目录对应一棵行为树。设置了项目路径时，通过 `bt.run({path = "trees/ai_main"})` 加载（路径相对于项目根目录）；未设置时，相对于当前工作目录。
 
 ```
 trees/ai_main/
-├── root.json       # 根节点定义（文件名固定，必需）
-├── combat.json     # 子树，文件名 → 子树名 "combat"
-└── patrol.json     # 子树，文件名 → 子树名 "patrol"
+├── root.json         # 根节点定义（文件名固定，必需）
+├── sensors.json      # 全局传感器定义（可选）
+└── subtrees/         # 子树目录（可选）
+    ├── combat.json   #   子树 "combat"
+    └── patrol.json   #   子树 "patrol"
 ```
 
 | 文件 | 说明 |
 |------|------|
 | `root.json` | 根树定义，内容为节点 JSON 对象（无外层 `{ "root": ... }` 包裹） |
-| `<name>.json` | 子树定义，文件名即子树名，通过 `{"type": "Subtree", "subtree": "<name>"}` 引用 |
+| `sensors.json` | 全局传感器定义，JSON 对象，键为传感器名称，值为配置（`interval`、`path`、`args`） |
+| `subtrees/<name>.json` | 子树定义，文件名即子树名，通过 `{"type": "Subtree", "subtree": "<name>"}` 引用 |
 | 非 `.json` 文件 | 自动忽略 |
 
 ---
@@ -87,13 +92,19 @@ scripts/
 
 ## sensors/ — 传感器脚本
 
-传感器脚本平铺在 `sensors/` 目录下，通过 `"path"` 引用：
+传感器脚本放在 `sensors/` 目录下，通过传感器名称自动映射路径（`.` 替换为 `/`）。传感器有两种配置方式：
+
+1. **全局定义**（`sensors.json`）：在树目录中定义，节点通过名称字符串引用
+2. **内联定义**：直接在节点的 `"sensors"` 数组中写完整配置
+
+详见 [传感器文档](bt_sensors.md)。
 
 ```
 sensors/
 ├── element_visible.lua    # UI 元素可见性检测
 ├── nearby.lua             # 附近目标检测
-└── check_hp.lua           # 血量检测
+└── combat/
+    └── target_check.lua   # 传感器名 "combat.target_check"
 ```
 
 ---
@@ -114,9 +125,11 @@ bt_project/
 ├── trees/
 │   └── ai_main/
 │       ├── root.json
-│       ├── combat.json
-│       ├── patrol.json
-│       └── flee.json
+│       ├── sensors.json
+│       └── subtrees/
+│           ├── combat.json
+│           ├── patrol.json
+│           └── flee.json
 ├── scripts/
 │   ├── combat/
 │   │   ├── aim.lua

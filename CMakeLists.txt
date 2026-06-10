@@ -4,6 +4,9 @@ project(bernardx LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 
 # ── Third-party dependency paths ──────────────────────────────────────────────
 # Defaults point to git submodules under 3rd/.

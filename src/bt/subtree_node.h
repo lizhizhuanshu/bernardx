@@ -32,6 +32,9 @@ public:
             set_last_error("no subtree root");
             return NodeStatus::kFailure;
         }
+        if (!subtree_root_->CheckDecorators(bb)) {
+            return NodeStatus::kFailure;
+        }
         auto status = subtree_root_->Tick(bb, events);
         if (status == NodeStatus::kFailure && !subtree_root_->last_error().empty()) {
             set_last_error(subtree_root_->last_error());

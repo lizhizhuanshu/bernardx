@@ -29,13 +29,16 @@ JSON 必须包含 `"root"` 字段，所有节点必须包含 `"type"` 字段。�
 
 ```
 tree_dir/
-├── root.json       # 根树定义（必需）
-├── combat.json     # 子树 "combat"
-└── patrol.json     # 子树 "patrol"
+├── root.json         # 根树定义（必需）
+├── sensors.json      # 全局传感器定义（可选）
+└── subtrees/         # 子树目录（可选）
+    ├── combat.json   #   子树 "combat"
+    └── patrol.json   #   子树 "patrol"
 ```
 
 - `root.json`：根节点定义（与内联模式的 `"root"` 字段内容格式相同）
-- 其他 `.json` 文件：文件名（去掉扩展名）作为子树名称，等价于内联模式 `"subtrees"` 中的一个条目
+- `sensors.json`：全局传感器定义（与内联模式的 `"sensors"` 字段格式相同）
+- `subtrees/` 目录：每个 `.json` 文件（文件名去掉扩展名）作为子树名称，等价于内联模式 `"subtrees"` 中的一个条目
 
 ```lua
 local bt = require('bt')
@@ -147,8 +150,9 @@ local status = bt.run("trees/ai_main")
 ```
 trees/ai_main/
 ├── root.json
-├── combat.json
-└── patrol.json
+└── subtrees/
+    ├── combat.json
+    └── patrol.json
 ```
 
 **root.json:**

@@ -44,7 +44,10 @@ public:
 
     void set_status(NodeStatus s) { status_ = s; }
 
-    NodeStatus Tick(Blackboard& /*bb*/, BtEventQueue& /*events*/) override { return status_; }
+    NodeStatus Tick(Blackboard& /*bb*/, BtEventQueue& /*events*/) override {
+        ++tick_count;
+        return status_;
+    }
 
     int tick_count = 0;
     bool aborted = false;
@@ -710,8 +713,8 @@ TEST_F(BehaviorTreeEngineTest, BlackboardPersistsAcrossLoad) {
         "root": {"type": "Selector", "children": [{"type": "Script", "path": "a.lua"}]}
     })";
     engine->Load(json);
-    // Load should clear blackboard
-    EXPECT_FALSE(engine->blackboard().Has("x"));
+    // Load preserves blackboard state
+    EXPECT_TRUE(engine->blackboard().Has("x"));
 }
 
 TEST_F(BehaviorTreeEngineTest, EventQueue) {
@@ -2320,4 +2323,328 @@ TEST(TreeParserWaitTest, ParseWaitDefault) {
     auto root = std::move(_parse_result.root);
     ASSERT_NE(root, nullptr);
      EXPECT_EQ(root->type(), "Wait");
+}
+
+// --- Decorator gating on child nodes ---
+
+TEST(SelectorDecoratorTest, SkipsChildWhenDecoratorFails) {
+    Blackboard bb;
+    BtEventQueue events;
+
+    auto sel = std::make_unique<Selector>(1, "sel");
+    auto* gated = new MockNode(2, "gated", NodeStatus::kSuccess);
+    gated->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
+    auto* fallback = new MockNode(3, "fallback", NodeStatus::kSuccess);
+
+    sel->AddChild(std::unique_ptr<MockNode>(gated));
+    sel->AddChild(std::unique_ptr<MockNode>(fallback));
+
+    // flag not set → first child's decorator fails → skip to fallback
+    EXPECT_EQ(sel->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(gated->tick_count, 0);
+    EXPECT_EQ(fallback->tick_count, 1);
+}
+
+TEST(SelectorDecoratorTest, TicksChildWhenDecoratorPasses) {
+    Blackboard bb;
+    BtEventQueue events;
+    bb.Set("flag", LuaValue(true));
+
+    auto sel = std::make_unique<Selector>(1, "sel");
+    auto* gated = new MockNode(2, "gated", NodeStatus::kSuccess);
+    gated->AddDecorator(std::make_unique<BlackboardCondition>("flag", "equals", LuaValue(true)));
+    auto* fallback = new MockNode(3, "fallback", NodeStatus::kSuccess);
+
+    sel->AddChild(std::unique_ptr<MockNode>(gated));
+    sel->AddChild(std::unique_ptr<MockNode>(fallback));
+
+    EXPECT_EQ(sel->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(gated->tick_count, 1);
+    EXPECT_EQ(fallback->tick_count, 0);
+}
+
+TEST(SelectorDecoratorTest, AllDecoratorsFailReturnsFailure) {
+    Blackboard bb;
+    BtEventQueue events;
+
+    auto sel = std::make_unique<Selector>(1, "sel");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    a->AddDecorator(std::make_unique<BlackboardCondition>("x", "is_set"));
+    auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
+    b->AddDecorator(std::make_unique<BlackboardCondition>("y", "is_set"));
+
+    sel->AddChild(std::unique_ptr<MockNode>(a));
+    sel->AddChild(std::unique_ptr<MockNode>(b));
+
+    EXPECT_EQ(sel->Tick(bb, events), NodeStatus::kFailure);
+    EXPECT_EQ(a->tick_count, 0);
+    EXPECT_EQ(b->tick_count, 0);
+}
+
+TEST(SequenceDecoratorTest, FailsImmediatelyWhenChildDecoratorFails) {
+    Blackboard bb;
+    BtEventQueue events;
+
+    auto seq = std::make_unique<Sequence>(1, "seq");
+    auto* gated = new MockNode(2, "gated", NodeStatus::kSuccess);
+    gated->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
+    auto* second = new MockNode(3, "second", NodeStatus::kSuccess);
+
+    seq->AddChild(std::unique_ptr<MockNode>(gated));
+    seq->AddChild(std::unique_ptr<MockNode>(second));
+
+    EXPECT_EQ(seq->Tick(bb, events), NodeStatus::kFailure);
+    EXPECT_EQ(gated->tick_count, 0);
+    EXPECT_EQ(second->tick_count, 0);
+}
+
+TEST(SequenceDecoratorTest, PassesThroughWhenDecoratorPasses) {
+    Blackboard bb;
+    BtEventQueue events;
+    bb.Set("flag", LuaValue(true));
+
+    auto seq = std::make_unique<Sequence>(1, "seq");
+    auto* gated = new MockNode(2, "gated", NodeStatus::kSuccess);
+    gated->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
+    auto* second = new MockNode(3, "second", NodeStatus::kSuccess);
+
+    seq->AddChild(std::unique_ptr<MockNode>(gated));
+    seq->AddChild(std::unique_ptr<MockNode>(second));
+
+    EXPECT_EQ(seq->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(gated->tick_count, 1);
+    EXPECT_EQ(second->tick_count, 1);
+}
+
+TEST(ParallelDecoratorTest, DecoratorFailCountsAsFailure) {
+    Blackboard bb;
+    BtEventQueue events;
+
+    auto par = std::make_unique<Parallel>(1, "par",
+        Parallel::Policy::kRequireAll, Parallel::Policy::kRequireOne);
+
+    auto* gated = new MockNode(2, "gated", NodeStatus::kSuccess);
+    gated->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
+    auto* ok = new MockNode(3, "ok", NodeStatus::kSuccess);
+
+    par->AddChild(std::unique_ptr<MockNode>(gated));
+    par->AddChild(std::unique_ptr<MockNode>(ok));
+
+    // gated skipped (decorator fail → failure_count=1), ok succeeds.
+    // With failure_policy=RequireOne, one failure → Parallel fails.
+    EXPECT_EQ(par->Tick(bb, events), NodeStatus::kFailure);
+    EXPECT_EQ(gated->tick_count, 0);
+    EXPECT_EQ(ok->tick_count, 1);
+}
+
+TEST(RetryDecoratorTest, RetriesWhenChildDecoratorFails) {
+    Blackboard bb;
+    BtEventQueue events;
+
+    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
+    child->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
+    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 3,
+        std::unique_ptr<MockNode>(child));
+
+    // Tick 1: decorator fails, attempt=1, returns Running
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(child->tick_count, 0);
+
+    // Tick 2: decorator still fails, attempt=2
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
+
+    // Tick 3: decorator still fails, attempt=3 == max → Failure
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kFailure);
+    EXPECT_EQ(child->tick_count, 0);
+}
+
+TEST(RetryDecoratorTest, SucceedsWhenDecoratorStartsPassing) {
+    Blackboard bb;
+    BtEventQueue events;
+
+    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
+    child->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
+    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 5,
+        std::unique_ptr<MockNode>(child));
+
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
+
+    bb.Set("flag", LuaValue(true));
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(child->tick_count, 1);
+}
+
+TEST(RepeatDecoratorTest, FailsWhenChildDecoratorFails) {
+    Blackboard bb;
+    BtEventQueue events;
+
+    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
+    child->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
+    auto repeat = std::make_unique<Repeat>(1, "rep", 3,
+        std::unique_ptr<MockNode>(child));
+
+    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kFailure);
+    EXPECT_EQ(child->tick_count, 0);
+}
+
+TEST(SubtreeDecoratorTest, BlocksSubtreeWhenDecoratorFails) {
+    Blackboard bb;
+    BtEventQueue events;
+
+    auto inner = std::make_unique<MockNode>(2, "inner", NodeStatus::kSuccess);
+    auto sub = std::make_unique<SubtreeNode>(1, "sub", "test",
+        std::move(inner));
+    sub->subtree_root()->AddDecorator(
+        std::make_unique<BlackboardCondition>("flag", "is_set"));
+
+    EXPECT_EQ(sub->Tick(bb, events), NodeStatus::kFailure);
+    auto* inner_node = dynamic_cast<MockNode*>(sub->subtree_root());
+    ASSERT_NE(inner_node, nullptr);
+    EXPECT_EQ(inner_node->tick_count, 0);
+}
+
+TEST(SubtreeDecoratorTest, ExecutesSubtreeWhenDecoratorPasses) {
+    Blackboard bb;
+    BtEventQueue events;
+    bb.Set("flag", LuaValue(true));
+
+    auto inner = std::make_unique<MockNode>(2, "inner", NodeStatus::kSuccess);
+    auto sub = std::make_unique<SubtreeNode>(1, "sub", "test",
+        std::move(inner));
+    sub->subtree_root()->AddDecorator(
+        std::make_unique<BlackboardCondition>("flag", "is_set"));
+
+    EXPECT_EQ(sub->Tick(bb, events), NodeStatus::kSuccess);
+    auto* inner_node = dynamic_cast<MockNode*>(sub->subtree_root());
+    ASSERT_NE(inner_node, nullptr);
+    EXPECT_EQ(inner_node->tick_count, 1);
+}
+
+TEST(DecoratorGateIntegrationTest, RetryWithSelectorGatedScript) {
+    Blackboard bb;
+    BtEventQueue events;
+
+    auto sel = std::make_unique<Selector>(2, "sel");
+
+    auto* print_script = new MockNode(3, "print", NodeStatus::kSuccess);
+    print_script->AddDecorator(std::make_unique<BlackboardCondition>(
+        "stop_visible", "equals", LuaValue(true)));
+
+    auto* fail_script = new MockNode(4, "fail", NodeStatus::kFailure);
+
+    sel->AddChild(std::unique_ptr<MockNode>(print_script));
+    sel->AddChild(std::unique_ptr<MockNode>(fail_script));
+
+    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 20000,
+        std::move(sel));
+
+    // stop_visible not set → first child's decorator fails → skip to fail_script → kFailure → retry
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
+    // print_script was never ticked (decorator blocked it)
+    EXPECT_EQ(print_script->tick_count, 0);
+
+    // Set stop_visible → first child's decorator passes → print_script executes → kSuccess
+    bb.Set("stop_visible", LuaValue(true));
+    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(print_script->tick_count, 1);
+}
+
+// --- Non-root Decorator Abort Propagation Tests ---
+
+class AbortPropagationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        blackboard = std::make_shared<Blackboard>();
+        bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
+        lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
+        rt = LuaRuntime::Builder()
+            .RegisterLibrary(bb_lib)
+            .RegisterLibrary(lib)
+            .Create();
+
+        tests_dir_ = std::filesystem::absolute(
+            std::filesystem::path(__FILE__).parent_path()).string();
+    }
+
+    void TearDown() override {
+        lib->engine()->Stop();
+    }
+
+    std::shared_ptr<Blackboard> blackboard;
+    std::shared_ptr<BlackboardLibrary> bb_lib;
+    std::shared_ptr<BehaviorTreeLibrary> lib;
+    LuaRuntime::Ptr rt;
+    std::string tests_dir_;
+};
+
+#define AWAIT_ABORT(lazy) async_simple::coro::syncAwait(lazy)
+
+TEST_F(AbortPropagationTest, SelfAbortTerminatesTree) {
+    // Script runs then clears "go" after 2 ticks. abort=Self on the Script.
+    // When "go" is cleared, the decorator transitions true→false, triggering Self abort.
+    // Sequence then fails (no more children).
+    auto r = AWAIT_ABORT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("go", true)
+        local json = [[{
+            "root": {
+                "type": "Sequence",
+                "children": [
+                    {
+                        "type": "Script",
+                        "path": "scripts/run_then_clear_flag.lua",
+                        "decorators": [
+                            {"type": "BlackboardCondition", "key": "go", "operator": "equals", "value": true, "abort": "Self"}
+                        ]
+                    }
+                ]
+            }
+        }]]
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"(',
+            max_step = 20, interval = 10})
+        return status
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    // Should be "failure" (aborted) not "timeout" (would happen without abort propagation)
+    EXPECT_EQ(*s, "failure");
+}
+
+TEST_F(AbortPropagationTest, LowerPriorityAbortPreemptsSibling) {
+    // Selector: [no_args (decorator: flag is_set, abort=LowerPriority), run_5_ticks]
+    // run_then_clear_flag sets "flag" after 2 ticks.
+    // When flag appears, LowerPriority abort fires → second child aborted → first child retries → succeeds.
+    auto r = AWAIT_ABORT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        local json = [[{
+            "root": {
+                "type": "Selector",
+                "children": [
+                    {
+                        "type": "Script",
+                        "path": "scripts/no_args.lua",
+                        "decorators": [
+                            {"type": "BlackboardCondition", "key": "flag", "operator": "is_set", "abort": "LowerPriority"}
+                        ]
+                    },
+                    {
+                        "type": "Script",
+                        "path": "scripts/run_then_set_flag.lua"
+                    }
+                ]
+            }
+        }]]
+        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"(',
+            max_step = 20, interval = 10})
+        return status
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    // LowerPriority abort should cause Selector to re-evaluate: first child's decorator
+    // now passes (flag set) → no_args succeeds → Selector succeeds
+    EXPECT_EQ(*s, "success");
 }

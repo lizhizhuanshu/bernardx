@@ -10,28 +10,105 @@
 
 ---
 
-## JSON 配置
+## 配置方式
 
-在任意节点（复合节点或叶子节点）上通过 `"sensors"` 数组声明：
+传感器有两种配置方式：**内联定义**和**全局定义 + 名称引用**。
+
+### 方式一：内联定义
+
+在节点的 `"sensors"` 数组中直接写完整配置：
 
 ```json
 {
   "type": "Sequence",
   "sensors": [
-    {"name": "login_btn", "path": "sensors/element_visible.lua", "interval": 100}
+    {
+      "name": "login_btn",
+      "path": "sensors/element_visible.lua",
+      "interval": 100,
+      "args": {"selector": "#login-btn"}
+    }
   ],
   "children": [...]
 }
 ```
 
+### 方式二：全局定义 + 名称引用
+
+在树目录的 `sensors.json` 中定义传感器，节点通过名称字符串引用：
+
+**sensors.json：**
+```json
+{
+  "nearby": {
+    "description": "附近目标检测",
+    "interval": 200,
+    "args": {"range": 50}
+  },
+  "combat.target_check": {
+    "interval": 100
+  }
+}
+```
+
+**root.json 中引用：**
+```json
+{
+  "type": "Script",
+  "path": "scripts/attack.lua",
+  "sensors": ["nearby", "combat.target_check"]
+}
+```
+
+名称引用时，`sensors.json` 中的定义提供 `interval`、`path`、`args` 等参数。如果全局定义中没有指定 `path`，则根据名称自动推导（见下方路径推导规则）。
+
+### 混合使用
+
+`"sensors"` 数组支持混合使用字符串引用和内联对象：
+
+```json
+{
+  "sensors": [
+    "nearby",
+    {"name": "custom", "path": "sensors/custom.lua", "interval": 50}
+  ]
+}
+```
+
+---
+
+## 字段参考
+
+### 节点 `sensors` 数组中的条目
+
+| 条目类型 | 格式 | 说明 |
+|---------|------|------|
+| 字符串 | `"nearby"` | 引用 `sensors.json` 中定义的传感器 |
+| 对象 | `{"name": "...", ...}` | 内联定义传感器配置 |
+
+### 传感器配置字段
+
 | 字段 | 必填 | 类型 | 说明 |
 |------|------|------|------|
 | `name` | **是** | string | 传感器名称，同时作为黑板键名（Tick 返回值写入 `bb[name]`） |
-| `path` | **是** | string | Lua 脚本路径 |
-| `interval` | **是** | integer | Tick 间隔（毫秒） |
+| `path` | 否 | string | Lua 脚本路径。未指定时根据 name 自动推导 |
+| `interval` | 否 | integer | Tick 间隔（毫秒），默认 `100` |
+| `description` | 否 | string | 传感器描述 |
 | `args` | 否 | object | 传递给 `Enter` 回调的参数对象 |
 
 `args` 值支持类型：`bool`、`int`（int64）、`double`、`string`。
+
+### 路径自动推导
+
+当未显式指定 `path` 时，根据 `name` 自动推导脚本路径：
+- 名称中的 `.` 替换为 `/`
+- 添加 `sensors/` 前缀和 `.lua` 后缀
+
+| name | 推导路径 |
+|------|---------|
+| `"nearby"` | `sensors/nearby.lua` |
+| `"combat.target_check"` | `sensors/combat/target_check.lua` |
+| `"ui.login.visible"` | `sensors/ui/login/visible.lua` |
 
 ---
 
@@ -81,13 +158,13 @@ return M
 ```json
 {
   "type": "Selector",
+  "sensors": [
+    "login_visible"
+  ],
   "children": [
     {
       "type": "Script",
       "path": "scripts/click_login.lua",
-      "sensors": [
-        {"name": "login_visible", "path": "sensors/element_visible.lua", "interval": 100}
-      ],
       "decorators": [
         {
           "type": "BlackboardCondition",

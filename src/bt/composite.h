@@ -21,6 +21,7 @@ public:
 
     bool has_started() const { return current_child_index_ > 0; }
     size_t current_child_index() const { return current_child_index_; }
+    void set_current_child_index(size_t idx) { current_child_index_ = idx; }
 
     void Reset() override;
     void OnAborted() override;

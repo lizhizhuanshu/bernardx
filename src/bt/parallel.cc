@@ -18,6 +18,10 @@ NodeStatus Parallel::Tick(Blackboard& bb, BtEventQueue& events) {
     int total = static_cast<int>(children_.size());
 
     for (auto& child : children_) {
+        if (!child->CheckDecorators(bb)) {
+            ++failure_count;
+            continue;
+        }
         auto status = child->Tick(bb, events);
         switch (status) {
             case NodeStatus::kSuccess:
