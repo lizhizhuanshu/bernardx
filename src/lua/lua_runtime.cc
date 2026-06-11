@@ -477,6 +477,23 @@ void LuaRuntime::PushResume(AsyncHandle handle, std::vector<LuaValue> args) {
     });
 }
 
+void LuaRuntime::PushResumeDirect(AsyncHandle handle, std::function<int(lua_State*)> fn) {
+    if (shutting_down_.load(std::memory_order_acquire) || interrupted_.load(std::memory_order_acquire)) return;
+    auto* self = this;
+    executor_->schedule([self, handle, fn = std::move(fn)]() mutable {
+        if (self->shutting_down_.load(std::memory_order_acquire) || self->interrupted_.load(std::memory_order_acquire)) return;
+        auto it = self->pending_.find(handle);
+        if (it == self->pending_.end()) return;
+        auto* co = it->second.co;
+        self->pending_.erase(it);
+        int nresults = fn(co);
+        int actual_nresults = 0;
+        int status = lua_resume(co, self->main_L_, nresults, &actual_nresults);
+        spdlog::debug("PushResumeDirect handle={}: lua_resume status={}", handle, status);
+        self->MaybeRecycleCo(co, status, actual_nresults);
+    });
+}
+
 void LuaRuntime::PushRelease(std::vector<int> refs) {
     if (shutting_down_.load(std::memory_order_acquire)) return;
     auto* self = this;

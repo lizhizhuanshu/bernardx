@@ -100,6 +100,9 @@ public:
     // --- Thread-safe submission ---
 
     void PushResume(AsyncHandle handle, std::vector<LuaValue> args = {});
+    // Resume with a custom function that prepares the stack. Runs on the Lua executor.
+    // fn receives the coroutine's lua_State and must return the number of values pushed.
+    void PushResumeDirect(AsyncHandle handle, std::function<int(lua_State*)> fn);
     void PushRelease(std::vector<int> refs);
     void CallLuaFunction(int fn_ref, std::vector<LuaValue> args);
 
