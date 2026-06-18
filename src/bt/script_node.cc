@@ -7,6 +7,35 @@
 #include "bt_event_queue.h"
 #include "types.h"
 
+namespace {
+
+std::string EscapeJson(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += c;
+        }
+    }
+    return out;
+}
+
+std::string BuildErrorJson(const std::string& node, const std::string& phase, const ScriptErrorDetail& detail) {
+    return "{\"type\":\"bt_script_error\",\"node\":\"" + EscapeJson(node) +
+           "\",\"phase\":\"" + EscapeJson(phase) +
+           "\",\"error\":{\"source\":\"" + EscapeJson(detail.source) +
+           "\",\"line\":" + std::to_string(detail.line) +
+           ",\"message\":\"" + EscapeJson(detail.message) +
+           "\",\"stack_trace\":\"" + EscapeJson(detail.stack_trace) + "\"}}";
+}
+
+}  // namespace
+
 ScriptNode::ScriptNode(uint32_t id, std::string name, std::string script_path, ArgsMap args)
     : Leaf(id, "Script", std::move(name)),
       script_path_(std::move(script_path)),
@@ -63,8 +92,8 @@ void ScriptNode::CallExit(const std::string& reason) {
 
 NodeStatus ScriptNode::HandleScriptResult(const ScriptResult& result) {
     if (result.status != LUA_OK) {
+        spdlog::error("{}", BuildErrorJson(name_, "Tick", result.error_detail));
         std::string msg = "'" + name_ + "' coroutine error: " + result.error;
-        spdlog::error("ScriptNode::Tick: {}", msg);
         set_last_error(msg);
         active_ = false;
         CallExit("failure");
@@ -83,8 +112,8 @@ NodeStatus ScriptNode::HandleScriptResult(const ScriptResult& result) {
 
 NodeStatus ScriptNode::HandleEnterResult(const ScriptResult& result) {
     if (result.status != LUA_OK) {
+        spdlog::error("{}", BuildErrorJson(name_, "Enter", result.error_detail));
         std::string msg = "'" + name_ + "' Enter error: " + result.error;
-        spdlog::error("ScriptNode::Tick: {}", msg);
         set_last_error(msg);
         active_ = false;
         CallExit("failure");

@@ -67,6 +67,40 @@ void CacheModuleValues(lua_State* L, const char* name, std::vector<LuaValue>& va
     lua_pop(L, 1);
 }
 
+std::string CollectStackTrace(lua_State* L) {
+    std::string trace;
+    lua_Debug debug;
+    for (int level = 0; lua_getstack(L, level, &debug); ++level) {
+        lua_getinfo(L, "Slt", &debug);
+        const char* source = debug.source ? debug.source : "?";
+        // Skip internal C frames and error message frames
+        if (source[0] == '=' && debug.currentline < 0) continue;
+        if (trace.empty()) {
+            trace = std::string(source) + ":" + std::to_string(debug.currentline);
+        } else {
+            trace += " -> " + std::string(source) + ":" + std::to_string(debug.currentline);
+        }
+        lua_pop(L, 1);
+    }
+    return trace;
+}
+
+ScriptErrorDetail CaptureErrorDetail(lua_State* L) {
+    ScriptErrorDetail detail;
+    const char* err = lua_tostring(L, -1);
+    detail.message = err ? err : "unknown error";
+
+    lua_Debug debug;
+    if (lua_getstack(L, 0, &debug)) {
+        lua_getinfo(L, "Sl", &debug);
+        detail.source = debug.source ? debug.source : "";
+        detail.line = debug.currentline;
+    }
+
+    detail.stack_trace = CollectStackTrace(L);
+    return detail;
+}
+
 // --- custom_require continuation ---
 
 int require_continuation(lua_State* L, int status, lua_KContext ctx) {
@@ -541,13 +575,14 @@ void LuaRuntime::ProcessTask(TaskRequest task) {
                            load_result = luaL_loadbuffer(co, s.chunk.c_str(), s.chunk.size(), s.name.c_str());
                        }
                        if (load_result != LUA_OK) {
-                           const char* err = lua_tostring(co, -1);
-                           spdlog::error("LuaRuntime: {}", err ? err : "unknown error");
+                           auto detail = CaptureErrorDetail(co);
+                           spdlog::error("LuaRuntime: {}", detail.message);
                            lua_pop(co, 1);
                            ReleaseCoroutine(co);
                            ScriptResult result;
                            result.status = load_result;
-                           result.error = err ? err : "unknown error";
+                           result.error = std::move(detail.message);
+                           result.error_detail = std::move(detail);
                            task.promise.setValue(std::move(result));
                            co = nullptr;
                        }
@@ -765,17 +800,15 @@ bool LuaRuntime::CallWithCallback(lua_State* co, int nargs, std::function<void(S
     }
 
     // Synchronous completion (OK or error)
-    std::string error_msg;
-    if (status != LUA_OK) {
-        const char* err = lua_tostring(co, -1);
-        error_msg = err ? err : "unknown error";
-        spdlog::error("LuaRuntime::CallWithCallback: {}", error_msg);
-        lua_pop(co, 1);
-    }
-
     ScriptResult result;
     result.status = status;
-    result.error = std::move(error_msg);
+    if (status != LUA_OK) {
+        auto detail = CaptureErrorDetail(co);
+        spdlog::error("LuaRuntime::CallWithCallback: {}", detail.message);
+        result.error = std::move(detail.message);
+        result.error_detail = std::move(detail);
+        lua_pop(co, 1);
+    }
     if (status == LUA_OK) {
         result.values = PeekValues(co, nresults);
     }
@@ -801,17 +834,33 @@ void LuaRuntime::RemoveCoCompleteCallback(lua_State* co) {
 }
 
 void LuaRuntime::MaybeRecycleCo(lua_State* co, int status, int nresults) {
-    std::string error_msg;
     if (status != LUA_OK && status != LUA_YIELD) {
-        const char* err = lua_tostring(co, -1);
-        error_msg = err ? err : "unknown error";
-        spdlog::error("LuaRuntime: {}", error_msg);
+        auto detail = CaptureErrorDetail(co);
+        spdlog::error("LuaRuntime: {}", detail.message);
         lua_pop(co, 1);
+
+        ScriptResult result;
+        result.status = status;
+        result.error = std::move(detail.message);
+        result.error_detail = std::move(detail);
+
+        auto it = completions_.find(co);
+        if (it != completions_.end()) {
+            auto handler = std::move(it->second);
+            completions_.erase(it);
+            ReleaseCoroutine(co);
+            std::visit(overloaded{
+                [&](async_simple::Promise<ScriptResult>& p) { p.setValue(std::move(result)); },
+                [&](std::function<void(ScriptResult)>& cb) { cb(std::move(result)); }
+            }, handler);
+        } else {
+            ReleaseCoroutine(co);
+        }
+        return;
     }
     if (status != LUA_YIELD) {
         ScriptResult result;
         result.status = status;
-        result.error = std::move(error_msg);
         if (status == LUA_OK) {
             result.values = PeekValues(co, nresults);
         }
@@ -893,12 +942,15 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::AwaitCoroutine(lua_State* co,
     }
 
     // Error
-    const char* err = lua_tostring(co, -1);
-    std::string errmsg = err ? err : "unknown error";
-    spdlog::error("LuaRuntime: {}", errmsg);
+    auto detail = CaptureErrorDetail(co);
+    spdlog::error("LuaRuntime: {}", detail.message);
     lua_pop(co, 1);
     ReleaseCoroutine(co);
-    co_return ScriptResult{status, {}, std::move(errmsg)};
+    ScriptResult result;
+    result.status = status;
+    result.error = std::move(detail.message);
+    result.error_detail = std::move(detail);
+    co_return result;
 }
 
 async_simple::coro::Lazy<ScriptResult> LuaRuntime::CallAsync(int fn_ref, std::vector<LuaValue> args) {
@@ -919,12 +971,15 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::DoFileAsync(const std::string
 
     int load_status = luaL_loadfile(co, path.c_str());
     if (load_status != LUA_OK) {
-        const char* err = lua_tostring(co, -1);
-        std::string errmsg = err ? err : "unknown error";
-        spdlog::error("LuaRuntime::DoFileAsync: {}", errmsg);
+        auto detail = CaptureErrorDetail(co);
+        spdlog::error("LuaRuntime::DoFileAsync: {}", detail.message);
         lua_pop(co, 1);
         ReleaseCoroutine(co);
-        co_return ScriptResult{load_status, {}, std::move(errmsg)};
+        ScriptResult result;
+        result.status = load_status;
+        result.error = std::move(detail.message);
+        result.error_detail = std::move(detail);
+        co_return result;
     }
 
     int nresults = 0;
