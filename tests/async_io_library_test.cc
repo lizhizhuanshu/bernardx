@@ -19,7 +19,7 @@
 class AsyncIOLibraryTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        tmpdir = std::filesystem::temp_directory_path() / "async_io_test";
+        tmpdir = std::filesystem::temp_directory_path() / ("async_io_test_" + std::to_string(getpid()));
         std::filesystem::create_directories(tmpdir);
 
         work = std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(

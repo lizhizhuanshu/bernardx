@@ -6,7 +6,6 @@
 
 async_simple::coro::Lazy<bool> LuaScriptHost::LoadScript(
     lua_State* L, LuaRuntime* ctx,
-    const std::string& base_path,
     const std::string& script_path,
     bool require_abort) {
     main_L_ = L;

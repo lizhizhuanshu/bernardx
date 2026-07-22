@@ -27,8 +27,7 @@ public:
     virtual void Reset();
     virtual void OnAborted();
 
-    virtual async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx,
-                                                 const std::string& base_path);
+    virtual async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx);
 
     // Tree structure
     Node* parent() const { return parent_; }

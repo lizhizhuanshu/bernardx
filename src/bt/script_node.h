@@ -24,7 +24,7 @@ public:
 
     const std::string& script_path() const { return script_path_; }
 
-    async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) override;
+    async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx) override;
 
     bool is_loaded() const { return host_.is_loaded(); }
 

@@ -5,166 +5,13 @@
 
 #include <filesystem>
 
-#include "behavior_tree_engine.h"
 #include "blackboard.h"
-#include "blackboard_condition.h"
-#include "bt_library.h"
 #include "blackboard_library.h"
-#include "composite.h"
-#include "decorator.h"
+#include "bt_library.h"
+#include "file_system_code_provider.h"
 #include "lua_runtime.h"
-#include "sensor.h"
-#include "tree_parser.h"
 
 #define AWAIT_BT(lazy) async_simple::coro::syncAwait(lazy)
-
-TEST(TreeParserSensorTest, ParseSensorsOnComposite) {
-    const char* json = R"({
-        "root": {
-            "type": "Sequence",
-            "sensors": [
-                {"name": "btn_visible", "path": "sensors/element.lua", "interval": 100},
-                {"name": "page_loaded", "path": "sensors/page.lua", "interval": 200}
-            ],
-            "children": [
-                {"type": "Script", "path": "a.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    const auto& specs = root->sensor_specs();
-    ASSERT_EQ(specs.size(), 2u);
-    EXPECT_EQ(specs[0].name, "btn_visible");
-    EXPECT_EQ(specs[0].script_path, "sensors/element.lua");
-    EXPECT_EQ(specs[0].interval_ms, 100);
-    EXPECT_EQ(specs[1].name, "page_loaded");
-    EXPECT_EQ(specs[1].interval_ms, 200);
-}
-
-TEST(TreeParserSensorTest, ParseSensorsOnScriptNode) {
-    const char* json = R"({
-        "root": {
-            "type": "Script",
-            "path": "a.lua",
-            "sensors": [
-                {"name": "check", "path": "sensors/check.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    ASSERT_EQ(root->sensor_specs().size(), 1u);
-    EXPECT_EQ(root->sensor_specs()[0].name, "check");
-    EXPECT_EQ(root->sensor_specs()[0].interval_ms, 100);
-}
-
-TEST(TreeParserSensorTest, ParseNoSensors) {
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "children": [
-                {"type": "Script", "path": "a.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_TRUE(root->sensor_specs().empty());
-}
-
-TEST(TreeParserSensorTest, ParseSensorMissingName) {
-    const char* json = R"({
-        "root": {
-            "type": "Script",
-            "path": "a.lua",
-            "sensors": [
-                {"path": "sensors/check.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_TRUE(root->sensor_specs().empty());
-}
-
-TEST(TreeParserSensorTest, ParseSensorsOnNestedNode) {
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "children": [
-                {
-                    "type": "Sequence",
-                    "name": "branch_a",
-                    "sensors": [
-                        {"name": "a_visible", "path": "sensors/a.lua"}
-                    ],
-                    "children": [
-                        {"type": "Script", "path": "a.lua"}
-                    ]
-                },
-                {
-                    "type": "Sequence",
-                    "name": "branch_b",
-                    "sensors": [
-                        {"name": "b_visible", "path": "sensors/b.lua"}
-                    ],
-                    "children": [
-                        {"type": "Script", "path": "b.lua"}
-                    ]
-                }
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    auto* sel = dynamic_cast<Composite*>(root.get());
-    ASSERT_NE(sel, nullptr);
-
-    auto* branch_a = sel->children()[0].get();
-    ASSERT_EQ(branch_a->sensor_specs().size(), 1u);
-    EXPECT_EQ(branch_a->sensor_specs()[0].name, "a_visible");
-
-    auto* branch_b = sel->children()[1].get();
-    ASSERT_EQ(branch_b->sensor_specs().size(), 1u);
-    EXPECT_EQ(branch_b->sensor_specs()[0].name, "b_visible");
-}
-
-TEST(SensorLifecycleTest, DeactivateAllOnLoad) {
-    auto engine = std::make_shared<BehaviorTreeEngine>();
-
-    const char* json1 = R"({
-        "root": {
-            "type": "Sequence",
-            "sensors": [
-                {"name": "s1", "path": "sensors/a.lua"}
-            ],
-            "children": [{"type": "Script", "path": "a.lua"}]
-        }
-    })";
-
-    ASSERT_TRUE(engine->Load(json1).first);
-
-    const char* json2 = R"({
-        "root": {
-            "type": "Selector",
-            "children": [{"type": "Script", "path": "b.lua"}]
-        }
-    })";
-
-    EXPECT_TRUE(engine->Load(json2).first);
-    EXPECT_TRUE(engine->blackboard().Has("s1") == false);
-}
 
 class SensorBtTest : public ::testing::Test {
 protected:
@@ -172,13 +19,14 @@ protected:
         blackboard = std::make_shared<Blackboard>();
         bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
         lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
+        tests_dir_ = std::filesystem::absolute(
+            std::filesystem::path(__FILE__).parent_path()).string();
         rt = LuaRuntime::Builder()
+            .WithCodeProvider(std::make_shared<FileSystemCodeProvider>(
+                std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts", tests_dir_ + "/sensors"}))
             .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
             .Create();
-
-        tests_dir_ = std::filesystem::absolute(
-            std::filesystem::path(__FILE__).parent_path()).string();
     }
 
     void TearDown() override {
@@ -215,17 +63,14 @@ using SensorActivationTest = SensorBtTest;
 TEST_F(SensorActivationTest, SensorOnActivePathIsActivated) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Script",
-                "path": "scripts/no_args.lua",
-                "sensors": [
-                    {"name": "sensor_a", "path": "sensors/tracking_a.lua", "interval": 50}
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        local status, err = bt.run({
+            tree = {
+                type = 'Script',
+                path = 'scripts/no_args.lua',
+                sensors = {'sensor_a'},
+            },
+            sensors = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -238,30 +83,20 @@ TEST_F(SensorActivationTest, SensorOnActivePathIsActivated) {
 TEST_F(SensorActivationTest, SensorOnInactiveBranchNotActivated) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Selector",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Selector',
+                children = {
+                    { type = 'Script', path = 'scripts/no_args.lua', name = 'branch_a' },
                     {
-                        "type": "Script",
-                        "path": "scripts/no_args.lua",
-                        "name": "branch_a"
+                        type = 'Sequence', name = 'branch_b',
+                        sensors = {'sensor_b'},
+                        children = { { type = 'Script', path = 'scripts/no_args.lua' } },
                     },
-                    {
-                        "type": "Sequence",
-                        "name": "branch_b",
-                        "sensors": [
-                            {"name": "sensor_b", "path": "sensors/tracking_b.lua", "interval": 50}
-                        ],
-                        "children": [
-                            {"type": "Script", "path": "scripts/no_args.lua"}
-                        ]
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                },
+            },
+            sensors = { sensor_b = {path = 'sensors/tracking_b.lua', interval = 50} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -273,30 +108,20 @@ TEST_F(SensorActivationTest, SensorOnInactiveBranchNotActivated) {
 TEST_F(SensorActivationTest, SensorDeactivatedWhenBranchLeavesActivePath) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Selector",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Selector',
+                children = {
                     {
-                        "type": "Sequence",
-                        "name": "branch_a",
-                        "sensors": [
-                            {"name": "sensor_a", "path": "sensors/tracking_a.lua", "interval": 50}
-                        ],
-                        "children": [
-                            {"type": "Script", "path": "scripts/run_2_then_fail.lua"}
-                        ]
+                        type = 'Sequence', name = 'branch_a',
+                        sensors = {'sensor_a'},
+                        children = { { type = 'Script', path = 'scripts/run_2_then_fail.lua' } },
                     },
-                    {
-                        "type": "Script",
-                        "path": "scripts/no_args.lua",
-                        "name": "branch_b"
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                    { type = 'Script', path = 'scripts/no_args.lua', name = 'branch_b' },
+                },
+            },
+            sensors = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -309,35 +134,27 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenBranchLeavesActivePath) {
 TEST_F(SensorActivationTest, BothBranchesActivatedSequentially) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Selector",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Selector',
+                children = {
                     {
-                        "type": "Sequence",
-                        "name": "branch_a",
-                        "sensors": [
-                            {"name": "sensor_a", "path": "sensors/tracking_a.lua", "interval": 50}
-                        ],
-                        "children": [
-                            {"type": "Script", "path": "scripts/run_2_then_fail.lua"}
-                        ]
+                        type = 'Sequence', name = 'branch_a',
+                        sensors = {'sensor_a'},
+                        children = { { type = 'Script', path = 'scripts/run_2_then_fail.lua' } },
                     },
                     {
-                        "type": "Sequence",
-                        "name": "branch_b",
-                        "sensors": [
-                            {"name": "sensor_b", "path": "sensors/tracking_b.lua", "interval": 50}
-                        ],
-                        "children": [
-                            {"type": "Script", "path": "scripts/run_3_ticks.lua"}
-                        ]
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                        type = 'Sequence', name = 'branch_b',
+                        sensors = {'sensor_b'},
+                        children = { { type = 'Script', path = 'scripts/run_3_ticks.lua' } },
+                    },
+                },
+            },
+            sensors = {
+                sensor_a = {path = 'sensors/tracking_a.lua', interval = 50},
+                sensor_b = {path = 'sensors/tracking_b.lua', interval = 50},
+            },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -352,17 +169,14 @@ TEST_F(SensorActivationTest, BothBranchesActivatedSequentially) {
 TEST_F(SensorActivationTest, AllSensorsDeactivatedWhenTreeCompletes) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Script",
-                "path": "scripts/run_3_ticks.lua",
-                "sensors": [
-                    {"name": "sensor_a", "path": "sensors/tracking_a.lua", "interval": 50}
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        local status, err = bt.run({
+            tree = {
+                type = 'Script',
+                path = 'scripts/run_3_ticks.lua',
+                sensors = {'sensor_a'},
+            },
+            sensors = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -375,35 +189,27 @@ TEST_F(SensorActivationTest, AllSensorsDeactivatedWhenTreeCompletes) {
 TEST_F(SensorActivationTest, SensorDeactivatedWhenAnotherSelectorBranchTakesOver) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Selector",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Selector',
+                children = {
                     {
-                        "type": "Sequence",
-                        "name": "branch_a",
-                        "sensors": [
-                            {"name": "sensor_a", "path": "sensors/tracking_a.lua", "interval": 50}
-                        ],
-                        "children": [
-                            {"type": "Script", "path": "scripts/run_2_then_fail.lua"}
-                        ]
+                        type = 'Sequence', name = 'branch_a',
+                        sensors = {'sensor_a'},
+                        children = { { type = 'Script', path = 'scripts/run_2_then_fail.lua' } },
                     },
                     {
-                        "type": "Sequence",
-                        "name": "branch_b",
-                        "sensors": [
-                            {"name": "sensor_b", "path": "sensors/tracking_b.lua", "interval": 50}
-                        ],
-                        "children": [
-                            {"type": "Script", "path": "scripts/run_3_ticks.lua"}
-                        ]
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                        type = 'Sequence', name = 'branch_b',
+                        sensors = {'sensor_b'},
+                        children = { { type = 'Script', path = 'scripts/run_3_ticks.lua' } },
+                    },
+                },
+            },
+            sensors = {
+                sensor_a = {path = 'sensors/tracking_a.lua', interval = 50},
+                sensor_b = {path = 'sensors/tracking_b.lua', interval = 50},
+            },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -420,31 +226,22 @@ using AbortSensorTest = SensorBtTest;
 TEST_F(AbortSensorTest, LowerPriorityKeepsSensorActive) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                children = {
                     {
-                        "type": "Script",
-                        "path": "scripts/no_args.lua",
-                        "name": "step_a",
-                        "decorators": [
-                            {"type": "BlackboardCondition", "key": "flag", "operator": "is_set", "abort": "LowerPriority"}
-                        ],
-                        "sensors": [
-                            {"name": "sensor_a", "path": "sensors/counting_a.lua", "interval": 10}
-                        ]
+                        type = 'Script', path = 'scripts/no_args.lua', name = 'step_a',
+                        decorators = {
+                            {type = 'BlackboardCondition', key = 'flag', operator = 'is_set', abort = 'LowerPriority'},
+                        },
+                        sensors = {'sensor_a'},
                     },
-                    {
-                        "type": "Script",
-                        "path": "scripts/run_3_ticks.lua",
-                        "name": "step_b"
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                    { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
+                },
+            },
+            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -456,31 +253,22 @@ TEST_F(AbortSensorTest, LowerPriorityKeepsSensorActive) {
 TEST_F(AbortSensorTest, NoAbortDeactivatesSensor) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                children = {
                     {
-                        "type": "Script",
-                        "path": "scripts/no_args.lua",
-                        "name": "step_a",
-                        "decorators": [
-                            {"type": "BlackboardCondition", "key": "flag", "operator": "is_set", "abort": "None"}
-                        ],
-                        "sensors": [
-                            {"name": "sensor_a", "path": "sensors/counting_a.lua", "interval": 10}
-                        ]
+                        type = 'Script', path = 'scripts/no_args.lua', name = 'step_a',
+                        decorators = {
+                            {type = 'BlackboardCondition', key = 'flag', operator = 'is_set', abort = 'None'},
+                        },
+                        sensors = {'sensor_a'},
                     },
-                    {
-                        "type": "Script",
-                        "path": "scripts/run_3_ticks.lua",
-                        "name": "step_b"
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                    { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
+                },
+            },
+            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -492,31 +280,22 @@ TEST_F(AbortSensorTest, NoAbortDeactivatesSensor) {
 TEST_F(AbortSensorTest, BothKeepsSensorActive) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                children = {
                     {
-                        "type": "Script",
-                        "path": "scripts/no_args.lua",
-                        "name": "step_a",
-                        "decorators": [
-                            {"type": "BlackboardCondition", "key": "flag", "operator": "is_set", "abort": "Both"}
-                        ],
-                        "sensors": [
-                            {"name": "sensor_a", "path": "sensors/counting_a.lua", "interval": 10}
-                        ]
+                        type = 'Script', path = 'scripts/no_args.lua', name = 'step_a',
+                        decorators = {
+                            {type = 'BlackboardCondition', key = 'flag', operator = 'is_set', abort = 'Both'},
+                        },
+                        sensors = {'sensor_a'},
                     },
-                    {
-                        "type": "Script",
-                        "path": "scripts/run_3_ticks.lua",
-                        "name": "step_b"
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                    { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
+                },
+            },
+            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -528,31 +307,22 @@ TEST_F(AbortSensorTest, BothKeepsSensorActive) {
 TEST_F(AbortSensorTest, SelfAbortDeactivatesSensor) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                children = {
                     {
-                        "type": "Script",
-                        "path": "scripts/no_args.lua",
-                        "name": "step_a",
-                        "decorators": [
-                            {"type": "BlackboardCondition", "key": "flag", "operator": "is_set", "abort": "Self"}
-                        ],
-                        "sensors": [
-                            {"name": "sensor_a", "path": "sensors/counting_a.lua", "interval": 10}
-                        ]
+                        type = 'Script', path = 'scripts/no_args.lua', name = 'step_a',
+                        decorators = {
+                            {type = 'BlackboardCondition', key = 'flag', operator = 'is_set', abort = 'Self'},
+                        },
+                        sensors = {'sensor_a'},
                     },
-                    {
-                        "type": "Script",
-                        "path": "scripts/run_3_ticks.lua",
-                        "name": "step_b"
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                    { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
+                },
+            },
+            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -564,28 +334,19 @@ TEST_F(AbortSensorTest, SelfAbortDeactivatesSensor) {
 TEST_F(AbortSensorTest, NoDecoratorDeactivatesSensor) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                children = {
                     {
-                        "type": "Script",
-                        "path": "scripts/no_args.lua",
-                        "name": "step_a",
-                        "sensors": [
-                            {"name": "sensor_a", "path": "sensors/counting_a.lua", "interval": 10}
-                        ]
+                        type = 'Script', path = 'scripts/no_args.lua', name = 'step_a',
+                        sensors = {'sensor_a'},
                     },
-                    {
-                        "type": "Script",
-                        "path": "scripts/run_3_ticks.lua",
-                        "name": "step_b"
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                    { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
+                },
+            },
+            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -597,31 +358,22 @@ TEST_F(AbortSensorTest, NoDecoratorDeactivatesSensor) {
 TEST_F(AbortSensorTest, SecondSensorWithAbortAlsoMonitored) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                children = {
                     {
-                        "type": "Script",
-                        "path": "scripts/no_args.lua",
-                        "name": "step_a",
-                        "decorators": [
-                            {"type": "BlackboardCondition", "key": "flag", "operator": "is_set", "abort": "LowerPriority"}
-                        ],
-                        "sensors": [
-                            {"name": "sensor_a", "path": "sensors/counting_a.lua", "interval": 10}
-                        ]
+                        type = 'Script', path = 'scripts/no_args.lua', name = 'step_a',
+                        decorators = {
+                            {type = 'BlackboardCondition', key = 'flag', operator = 'is_set', abort = 'LowerPriority'},
+                        },
+                        sensors = {'sensor_a'},
                     },
-                    {
-                        "type": "Script",
-                        "path": "scripts/run_3_ticks.lua",
-                        "name": "step_b"
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                    { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
+                },
+            },
+            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -635,72 +387,49 @@ using DeepSensorTest = SensorBtTest;
 TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "children": [
+        local bb = require('blackboard')
+        bb.set('flag', true)
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                children = {
                     {
-                        "type": "Selector",
-                        "name": "L2_sel",
-                        "children": [
+                        type = 'Selector', name = 'L2_sel',
+                        children = {
                             {
-                                "type": "Sequence",
-                                "name": "L3_seq",
-                                "children": [
+                                type = 'Sequence', name = 'L3_seq',
+                                children = {
                                     {
-                                        "type": "Script",
-                                        "path": "scripts/no_args.lua",
-                                        "name": "L4_step_a",
-                                        "decorators": [
-                                            {"type": "BlackboardCondition", "key": "flag", "operator": "is_set", "abort": "LowerPriority"}
-                                        ],
-                                        "sensors": [
-                                            {"name": "sensor_a", "path": "sensors/counting_a.lua", "interval": 10}
-                                        ]
+                                        type = 'Script', path = 'scripts/no_args.lua', name = 'L4_step_a',
+                                        decorators = {
+                                            {type = 'BlackboardCondition', key = 'flag', operator = 'is_set', abort = 'LowerPriority'},
+                                        },
+                                        sensors = {'sensor_a'},
                                     },
                                     {
-                                        "type": "Selector",
-                                        "name": "L4_sel",
-                                        "children": [
-                                            {
-                                                "type": "Script",
-                                                "path": "scripts/run_5_ticks.lua",
-                                                "name": "L5_step_b",
-                                                "sensors": [
-                                                    {"name": "sensor_b", "path": "sensors/counting_b.lua", "interval": 10}
-                                                ]
-                                            },
-                                            {
-                                                "type": "Script",
-                                                "path": "scripts/no_args.lua",
-                                                "name": "L5_fallback"
-                                            }
-                                        ]
-                                    }
-                                ]
+                                        type = 'Selector', name = 'L4_sel',
+                                        children = {
+                                            { type = 'Script', path = 'scripts/run_5_ticks.lua', name = 'L5_step_b', sensors = {'sensor_b'} },
+                                            { type = 'Script', path = 'scripts/no_args.lua', name = 'L5_fallback' },
+                                        },
+                                    },
+                                },
                             },
-                            {
-                                "type": "Script",
-                                "path": "scripts/no_args.lua",
-                                "name": "L3_fallback"
-                            }
-                        ]
+                            { type = 'Script', path = 'scripts/no_args.lua', name = 'L3_fallback' },
+                        },
                     },
                     {
-                        "type": "Script",
-                        "path": "scripts/run_5_ticks.lua",
-                        "name": "L2_tail",
-                        "sensors": [
-                            {"name": "sensor_c", "path": "sensors/counting_c.lua", "interval": 10}
-                        ]
-                    }
-                ]
-            }
-        }]]
-        local bb = require('blackboard')
-        bb.set("flag", true)
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                        type = 'Script', path = 'scripts/run_5_ticks.lua', name = 'L2_tail',
+                        sensors = {'sensor_c'},
+                    },
+                },
+            },
+            sensors = {
+                sensor_a = {path = 'sensors/counting_a.lua', interval = 10},
+                sensor_b = {path = 'sensors/counting_b.lua', interval = 10},
+                sensor_c = {path = 'sensors/counting_c.lua', interval = 10},
+            },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -714,59 +443,37 @@ TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
 TEST_F(DeepSensorTest, FiveLevelAbortMonitoringAcrossDepths) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                children = {
                     {
-                        "type": "Sequence",
-                        "name": "L2_seq",
-                        "children": [
+                        type = 'Sequence', name = 'L2_seq',
+                        children = {
                             {
-                                "type": "Script",
-                                "path": "scripts/no_args.lua",
-                                "name": "L3_instant",
-                                "decorators": [
-                                    {"type": "BlackboardCondition", "key": "flag", "operator": "is_set", "abort": "LowerPriority"}
-                                ],
-                                "sensors": [
-                                    {"name": "sensor_a", "path": "sensors/counting_a.lua", "interval": 10}
-                                ]
+                                type = 'Script', path = 'scripts/no_args.lua', name = 'L3_instant',
+                                decorators = {
+                                    {type = 'BlackboardCondition', key = 'flag', operator = 'is_set', abort = 'LowerPriority'},
+                                },
+                                sensors = {'sensor_a'},
                             },
                             {
-                                "type": "Selector",
-                                "name": "L3_sel",
-                                "children": [
+                                type = 'Selector', name = 'L3_sel',
+                                children = {
                                     {
-                                        "type": "Sequence",
-                                        "name": "L4_seq",
-                                        "children": [
-                                            {
-                                                "type": "Script",
-                                                "path": "scripts/run_5_ticks.lua",
-                                                "name": "L5_deep"
-                                            }
-                                        ]
+                                        type = 'Sequence', name = 'L4_seq',
+                                        children = { { type = 'Script', path = 'scripts/run_5_ticks.lua', name = 'L5_deep' } },
                                     },
-                                    {
-                                        "type": "Script",
-                                        "path": "scripts/no_args.lua",
-                                        "name": "L4_fallback"
-                                    }
-                                ]
-                            }
-                        ]
+                                    { type = 'Script', path = 'scripts/no_args.lua', name = 'L4_fallback' },
+                                },
+                            },
+                        },
                     },
-                    {
-                        "type": "Script",
-                        "path": "scripts/run_5_ticks.lua",
-                        "name": "L2_tail"
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                    { type = 'Script', path = 'scripts/run_5_ticks.lua', name = 'L2_tail' },
+                },
+            },
+            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -778,56 +485,34 @@ TEST_F(DeepSensorTest, FiveLevelAbortMonitoringAcrossDepths) {
 TEST_F(DeepSensorTest, FiveLevelNoAbortSensorDeactivatedAtDepth) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                children = {
                     {
-                        "type": "Sequence",
-                        "name": "L2_seq",
-                        "children": [
+                        type = 'Sequence', name = 'L2_seq',
+                        children = {
                             {
-                                "type": "Script",
-                                "path": "scripts/no_args.lua",
-                                "name": "L3_instant",
-                                "sensors": [
-                                    {"name": "sensor_a", "path": "sensors/counting_a.lua", "interval": 10}
-                                ]
+                                type = 'Script', path = 'scripts/no_args.lua', name = 'L3_instant',
+                                sensors = {'sensor_a'},
                             },
                             {
-                                "type": "Selector",
-                                "name": "L3_sel",
-                                "children": [
+                                type = 'Selector', name = 'L3_sel',
+                                children = {
                                     {
-                                        "type": "Sequence",
-                                        "name": "L4_seq",
-                                        "children": [
-                                            {
-                                                "type": "Script",
-                                                "path": "scripts/run_5_ticks.lua",
-                                                "name": "L5_deep"
-                                            }
-                                        ]
+                                        type = 'Sequence', name = 'L4_seq',
+                                        children = { { type = 'Script', path = 'scripts/run_5_ticks.lua', name = 'L5_deep' } },
                                     },
-                                    {
-                                        "type": "Script",
-                                        "path": "scripts/no_args.lua",
-                                        "name": "L4_fallback"
-                                    }
-                                ]
-                            }
-                        ]
+                                    { type = 'Script', path = 'scripts/no_args.lua', name = 'L4_fallback' },
+                                },
+                            },
+                        },
                     },
-                    {
-                        "type": "Script",
-                        "path": "scripts/run_5_ticks.lua",
-                        "name": "L2_tail"
-                    }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                    { type = 'Script', path = 'scripts/run_5_ticks.lua', name = 'L2_tail' },
+                },
+            },
+            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -840,85 +525,61 @@ TEST_F(DeepSensorTest, FiveLevelNoAbortSensorDeactivatedAtDepth) {
 TEST_F(DeepSensorTest, FiveLevelMultipleAbortSensorsAtDifferentDepths) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "children": [
+        local bb = require('blackboard')
+        bb.set('x', true)
+        bb.set('y', true)
+        bb.set('z', true)
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                children = {
                     {
-                        "type": "Script",
-                        "path": "scripts/no_args.lua",
-                        "name": "L2_skip",
-                        "decorators": [
-                            {"type": "BlackboardCondition", "key": "x", "operator": "is_set", "abort": "LowerPriority"}
-                        ],
-                        "sensors": [
-                            {"name": "sensor_a", "path": "sensors/counting_a.lua", "interval": 10}
-                        ]
+                        type = 'Script', path = 'scripts/no_args.lua', name = 'L2_skip',
+                        decorators = {
+                            {type = 'BlackboardCondition', key = 'x', operator = 'is_set', abort = 'LowerPriority'},
+                        },
+                        sensors = {'sensor_a'},
                     },
                     {
-                        "type": "Sequence",
-                        "name": "L2_inner",
-                        "children": [
+                        type = 'Sequence', name = 'L2_inner',
+                        children = {
                             {
-                                "type": "Script",
-                                "path": "scripts/no_args.lua",
-                                "name": "L3_skip",
-                                "decorators": [
-                                    {"type": "BlackboardCondition", "key": "y", "operator": "is_set", "abort": "LowerPriority"}
-                                ],
-                                "sensors": [
-                                    {"name": "sensor_b", "path": "sensors/counting_b.lua", "interval": 10}
-                                ]
+                                type = 'Script', path = 'scripts/no_args.lua', name = 'L3_skip',
+                                decorators = {
+                                    {type = 'BlackboardCondition', key = 'y', operator = 'is_set', abort = 'LowerPriority'},
+                                },
+                                sensors = {'sensor_b'},
                             },
                             {
-                                "type": "Sequence",
-                                "name": "L3_seq",
-                                "children": [
+                                type = 'Sequence', name = 'L3_seq',
+                                children = {
                                     {
-                                        "type": "Script",
-                                        "path": "scripts/no_args.lua",
-                                        "name": "L4_skip",
-                                        "decorators": [
-                                            {"type": "BlackboardCondition", "key": "z", "operator": "is_set", "abort": "LowerPriority"}
-                                        ],
-                                        "sensors": [
-                                            {"name": "sensor_c", "path": "sensors/counting_c.lua", "interval": 10}
-                                        ]
+                                        type = 'Script', path = 'scripts/no_args.lua', name = 'L4_skip',
+                                        decorators = {
+                                            {type = 'BlackboardCondition', key = 'z', operator = 'is_set', abort = 'LowerPriority'},
+                                        },
+                                        sensors = {'sensor_c'},
                                     },
                                     {
-                                        "type": "Selector",
-                                        "name": "L4_sel",
-                                        "children": [
-                                            {
-                                                "type": "Script",
-                                                "path": "scripts/run_5_ticks.lua",
-                                                "name": "L5_runner"
-                                            },
-                                            {
-                                                "type": "Script",
-                                                "path": "scripts/no_args.lua",
-                                                "name": "L5_fb"
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
+                                        type = 'Selector', name = 'L4_sel',
+                                        children = {
+                                            { type = 'Script', path = 'scripts/run_5_ticks.lua', name = 'L5_runner' },
+                                            { type = 'Script', path = 'scripts/no_args.lua', name = 'L5_fb' },
+                                        },
+                                    },
+                                },
+                            },
+                        },
                     },
-                    {
-                        "type": "Script",
-                        "path": "scripts/run_5_ticks.lua",
-                        "name": "L2_tail"
-                    }
-                ]
-            }
-        }]]
-        local bb = require('blackboard')
-        bb.set("x", true)
-        bb.set("y", true)
-        bb.set("z", true)
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+                    { type = 'Script', path = 'scripts/run_5_ticks.lua', name = 'L2_tail' },
+                },
+            },
+            sensors = {
+                sensor_a = {path = 'sensors/counting_a.lua', interval = 10},
+                sensor_b = {path = 'sensors/counting_b.lua', interval = 10},
+                sensor_c = {path = 'sensors/counting_c.lua', interval = 10},
+            },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -934,17 +595,14 @@ using SensorInitTest = SensorBtTest;
 TEST_F(SensorInitTest, SensorWithBasicScript) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Script",
-                "path": "scripts/no_args.lua",
-                "sensors": [
-                    {"name": "hp", "path": "sensors/basic.lua", "interval": 50}
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        local status, err = bt.run({
+            tree = {
+                type = 'Script',
+                path = 'scripts/no_args.lua',
+                sensors = {'hp'},
+            },
+            sensors = { hp = {path = 'sensors/basic.lua', interval = 50} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -956,17 +614,14 @@ TEST_F(SensorInitTest, SensorWithBasicScript) {
 TEST_F(SensorInitTest, SensorWithAsyncRequire) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Script",
-                "path": "scripts/no_args.lua",
-                "sensors": [
-                    {"name": "data", "path": "sensors/with_require.lua", "interval": 50}
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        local status, err = bt.run({
+            tree = {
+                type = 'Script',
+                path = 'scripts/no_args.lua',
+                sensors = {'data'},
+            },
+            sensors = { data = {path = 'sensors/with_require.lua', interval = 50} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -978,17 +633,14 @@ TEST_F(SensorInitTest, SensorWithAsyncRequire) {
 TEST_F(SensorInitTest, SensorScriptNotFound) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Script",
-                "path": "scripts/no_args.lua",
-                "sensors": [
-                    {"name": "bad", "path": "sensors/nonexistent.lua", "interval": 50}
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        local status, err = bt.run({
+            tree = {
+                type = 'Script',
+                path = 'scripts/no_args.lua',
+                sensors = {'bad'},
+            },
+            sensors = { bad = {path = 'sensors/nonexistent.lua', interval = 50} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -1003,17 +655,14 @@ TEST_F(SensorInitTest, SensorScriptNotFound) {
 TEST_F(SensorInitTest, SensorMissingTickFunction) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Script",
-                "path": "scripts/no_args.lua",
-                "sensors": [
-                    {"name": "no_tick", "path": "sensors/missing_tick.lua", "interval": 50}
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        local status, err = bt.run({
+            tree = {
+                type = 'Script',
+                path = 'scripts/no_args.lua',
+                sensors = {'no_tick'},
+            },
+            sensors = { no_tick = {path = 'sensors/missing_tick.lua', interval = 50} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -1028,19 +677,14 @@ TEST_F(SensorInitTest, SensorMissingTickFunction) {
 TEST_F(SensorInitTest, SensorOnCompositeNode) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "sensors": [
-                    {"name": "hp", "path": "sensors/basic.lua", "interval": 50}
-                ],
-                "children": [
-                    {"type": "Script", "path": "scripts/no_args.lua"}
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                sensors = {'hp'},
+                children = { { type = 'Script', path = 'scripts/no_args.lua' } },
+            },
+            sensors = { hp = {path = 'sensors/basic.lua', interval = 50} },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -1052,18 +696,17 @@ TEST_F(SensorInitTest, SensorOnCompositeNode) {
 TEST_F(SensorInitTest, MultipleSensorsOnTree) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Script",
-                "path": "scripts/no_args.lua",
-                "sensors": [
-                    {"name": "hp", "path": "sensors/basic.lua", "interval": 50},
-                    {"name": "data", "path": "sensors/with_require.lua", "interval": 100}
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        local status, err = bt.run({
+            tree = {
+                type = 'Script',
+                path = 'scripts/no_args.lua',
+                sensors = {'hp', 'data'},
+            },
+            sensors = {
+                hp = {path = 'sensors/basic.lua', interval = 50},
+                data = {path = 'sensors/with_require.lua', interval = 100},
+            },
+        })
         if not status then return false, err end
         return true, status
     )"));
@@ -1075,17 +718,14 @@ TEST_F(SensorInitTest, MultipleSensorsOnTree) {
 TEST_F(SensorInitTest, SensorFullLifecycle) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-
-        local json = [[{
-            "root": {
-                "type": "Script",
-                "path": "scripts/no_args.lua",
-                "sensors": [
-                    {"name": "full", "path": "sensors/full_lifecycle.lua", "interval": 50}
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"('})
+        local status, err = bt.run({
+            tree = {
+                type = 'Script',
+                path = 'scripts/no_args.lua',
+                sensors = {'full'},
+            },
+            sensors = { full = {path = 'sensors/full_lifecycle.lua', interval = 50} },
+        })
         if not status then return false, err end
         return true, status
     )"));

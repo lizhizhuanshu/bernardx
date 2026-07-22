@@ -30,8 +30,8 @@ public:
     BehaviorTreeEngine(BehaviorTreeEngine&&) = delete;
     BehaviorTreeEngine& operator=(BehaviorTreeEngine&&) = delete;
 
-    // Load tree from JSON string
-    std::pair<bool, std::string> Load(const std::string& json);
+    // Install an already-parsed tree root. Resets tree state and deactivates sensors.
+    void SetRoot(std::unique_ptr<Node> root);
 
     // Reset tree state and release all resources
     void Stop();
@@ -47,9 +47,6 @@ public:
     void Notify(const std::string& event_name, LuaValue data);
 
     async_simple::coro::Lazy<std::string> InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx);
-
-    void SetProjectPath(std::string path) { project_path_ = std::move(path); }
-    const std::string& project_path() const { return project_path_; }
 
     async_simple::coro::Lazy<std::string> InitSensorsAsync(lua_State* L, LuaRuntime* ctx);
     void ActivateInitialSensors();
@@ -82,7 +79,6 @@ private:
     std::unique_ptr<Node> root_;
     std::shared_ptr<Blackboard> blackboard_;
     BtEventQueue event_queue_;
-    std::string project_path_;
     DecoratorState decorator_state_;
 
     std::map<std::string, std::unique_ptr<ActiveSensor>> active_sensors_;

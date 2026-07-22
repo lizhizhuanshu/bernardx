@@ -40,7 +40,6 @@ int main(int argc, char* argv[]) {
     auto blackboard = std::make_shared<Blackboard>();
     auto bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
     auto bt_lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
-    bt_lib->SetMainLibsPath(std::filesystem::absolute(dir).string() + "/libs");
     auto http_lib = std::make_shared<HttpLibrary>(*http_exec);
     auto json_lib = std::make_shared<JsonLibrary>();
     auto fs_lib = std::make_shared<FileSystemLibrary>();

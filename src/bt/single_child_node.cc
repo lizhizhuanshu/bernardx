@@ -16,9 +16,8 @@ void SingleChildNode::OnAborted() {
     Node::OnAborted();
 }
 
-async_simple::coro::Lazy<bool> SingleChildNode::Init(lua_State* L, LuaRuntime* ctx,
-                                                      const std::string& base_path) {
-    if (child_ && !co_await child_->Init(L, ctx, base_path)) {
+async_simple::coro::Lazy<bool> SingleChildNode::Init(lua_State* L, LuaRuntime* ctx) {
+    if (child_ && !co_await child_->Init(L, ctx)) {
         set_last_error(child_->last_error());
         co_return false;
     }

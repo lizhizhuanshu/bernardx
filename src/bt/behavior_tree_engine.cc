@@ -9,7 +9,6 @@
 #include "lua_runtime.h"
 #include "single_child_node.h"
 #include "subtree_node.h"
-#include "tree_parser.h"
 
 BehaviorTreeEngine::BehaviorTreeEngine(std::shared_ptr<Blackboard> bb)
     : blackboard_(bb ? std::move(bb) : std::make_shared<Blackboard>()) {}
@@ -18,18 +17,11 @@ BehaviorTreeEngine::~BehaviorTreeEngine() {
     Stop();
 }
 
-std::pair<bool, std::string> BehaviorTreeEngine::Load(const std::string& json) {
+void BehaviorTreeEngine::SetRoot(std::unique_ptr<Node> root) {
     DeactivateAllSensors();
-    auto result = TreeParser::Parse(json);
-    if (!result.root) {
-        auto err = result.error.empty() ? "failed to parse JSON" : result.error;
-        spdlog::error("BehaviorTreeEngine: {}", err);
-        return {false, std::move(err)};
-    }
-    root_ = std::move(result.root);
+    root_ = std::move(root);
     event_queue_.Drain();
     last_status_ = NodeStatus::kRunning;
-    return {true, {}};
 }
 
 void BehaviorTreeEngine::Stop() {
@@ -56,7 +48,7 @@ std::string BehaviorTreeEngine::GetStatus() const {
 
 async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx) {
     if (root_) {
-        if (!co_await root_->Init(L, ctx, project_path_)) {
+        if (!co_await root_->Init(L, ctx)) {
             co_return root_->last_error();
         }
     }
@@ -251,7 +243,7 @@ async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitSensorsRecursive(N
             spdlog::warn("BehaviorTreeEngine: duplicate sensor name '{}', overwriting", spec.name);
         }
         auto sensor = std::make_unique<ActiveSensor>(spec);
-        if (!co_await sensor->Init(L, ctx, project_path_)) {
+        if (!co_await sensor->Init(L, ctx)) {
             co_return "failed to init sensor '" + spec.name + "'";
         }
         active_sensors_[spec.name] = std::move(sensor);

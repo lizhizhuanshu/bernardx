@@ -4,7 +4,6 @@
 #include <async_simple/coro/SyncAwait.h>
 
 #include <filesystem>
-#include <fstream>
 #include <thread>
 
 #include "behavior_tree_engine.h"
@@ -31,8 +30,31 @@
 #include "random_selector.h"
 #include "random_sequence.h"
 #include "wait_node.h"
-#include "tree_parser.h"
-#include "file_system_resource_provider.h"
+#include "lua_tree_parser.h"
+#include "file_system_code_provider.h"
+
+extern "C" {
+#include "lauxlib.h"
+#include "lua.h"
+}
+
+namespace {
+// Parse a Lua table expression (e.g. "{type='Selector',...}") into a Node tree
+// using LuaTreeParser, bypassing the JSON-based TreeParser (removed).
+// Used by BehaviorTreeEngineTest as a replacement for the deleted engine->Load(json).
+std::unique_ptr<Node> ParseLuaTree(const std::string& lua_expr) {
+    lua_State* L = luaL_newstate();
+    if (luaL_dostring(L, ("return " + lua_expr).c_str()) != LUA_OK || !lua_istable(L, -1)) {
+        lua_close(L);
+        return nullptr;
+    }
+    lua_newtable(L);  // subtrees (empty)
+    lua_newtable(L);  // sensors (empty)
+    auto result = LuaTreeParser::Parse(L, -3, -2, -1);
+    lua_close(L);
+    return std::move(result.root);
+}
+}  // namespace
 
 // --- Mock node for testing composites without Lua ---
 
@@ -414,222 +436,6 @@ TEST(ForceSuccessTest, AlwaysTrue) {
     EXPECT_TRUE(fs.Evaluate(bb));
 }
 
-// --- TreeParser Tests ---
-
-TEST(TreeParserTest, ParseSimpleSelector) {
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "children": [
-                {"type": "Script", "path": "a.lua"},
-                {"type": "Script", "path": "b.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Selector");
-    auto* sel = dynamic_cast<Composite*>(root.get());
-    ASSERT_NE(sel, nullptr);
-    EXPECT_EQ(sel->children().size(), 2u);
-}
-
-TEST(TreeParserTest, ParseSequence) {
-    const char* json = R"({
-        "root": {
-            "type": "Sequence",
-            "children": [
-                {"type": "Script", "path": "x.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Sequence");
-}
-
-TEST(TreeParserTest, ParseParallel) {
-    const char* json = R"({
-        "root": {
-            "type": "Parallel",
-            "success_policy": "RequireOne",
-            "failure_policy": "RequireAll",
-            "children": [
-                {"type": "Script", "path": "a.lua"},
-                {"type": "Script", "path": "b.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Parallel");
-}
-
-TEST(TreeParserTest, ParseScriptNode) {
-    const char* json = R"({
-        "root": {"type": "Script", "path": "scripts/test.lua"}
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Script");
-}
-
-TEST(TreeParserTest, ParseDecorators) {
-    const char* json = R"({
-        "root": {
-            "type": "Sequence",
-            "decorators": [
-                {
-                    "type": "BlackboardCondition",
-                    "key": "has_target",
-                    "operator": "is_set",
-                    "abort": "Both"
-                }
-            ],
-            "children": [
-                {"type": "Script", "path": "attack.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->decorators().size(), 1u);
-    auto* bc = dynamic_cast<BlackboardCondition*>(root->decorators()[0].get());
-    ASSERT_NE(bc, nullptr);
-    EXPECT_EQ(bc->abort_mode(), AbortMode::kBoth);
-}
-
-TEST(TreeParserTest, ParseNestedTree) {
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "children": [
-                {
-                    "type": "Sequence",
-                    "children": [
-                        {"type": "Script", "path": "a.lua"},
-                        {"type": "Script", "path": "b.lua"}
-                    ]
-                },
-                {"type": "Script", "path": "c.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    auto* sel = dynamic_cast<Composite*>(root.get());
-    ASSERT_NE(sel, nullptr);
-    EXPECT_EQ(sel->children().size(), 2u);
-
-    auto* seq = dynamic_cast<Composite*>(sel->children()[0].get());
-    ASSERT_NE(seq, nullptr);
-    EXPECT_EQ(seq->children().size(), 2u);
-}
-
-TEST(TreeParserTest, ParseInvalidJson) {
-    auto _parse_result = TreeParser::Parse("{invalid json");
-    auto root = std::move(_parse_result.root);
-    EXPECT_EQ(root, nullptr);
-}
-
-TEST(TreeParserTest, ParseMissingRoot) {
-    auto _parse_result = TreeParser::Parse("{}");
-    auto root = std::move(_parse_result.root);
-    EXPECT_EQ(root, nullptr);
-}
-
-TEST(TreeParserTest, ParseUnknownNodeType) {
-    const char* json = R"({
-        "root": {"type": "UnknownType"}
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    EXPECT_EQ(root, nullptr);
-}
-
-TEST(TreeParserTest, ParseScriptMissingPath) {
-    const char* json = R"({
-        "root": {"type": "Script"}
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    EXPECT_EQ(root, nullptr);
-}
-
-TEST(TreeParserTest, ParseNodeNames) {
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "name": "root_sel",
-            "children": [
-                {"type": "Script", "path": "a.lua", "name": "check_a"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->name(), "root_sel");
-
-    auto* sel = dynamic_cast<Composite*>(root.get());
-    EXPECT_EQ(sel->children()[0]->name(), "check_a");
-}
-
-TEST(TreeParserTest, ParseInverterDecorator) {
-    const char* json = R"({
-        "root": {
-            "type": "Script",
-            "path": "a.lua",
-            "decorators": [
-                {"type": "Inverter", "abort": "Self"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    ASSERT_EQ(root->decorators().size(), 1u);
-    auto* inv = dynamic_cast<Inverter*>(root->decorators()[0].get());
-    ASSERT_NE(inv, nullptr);
-    EXPECT_EQ(inv->abort_mode(), AbortMode::kSelf);
-}
-
-TEST(TreeParserTest, ParseForceSuccessDecorator) {
-    const char* json = R"({
-        "root": {
-            "type": "Script",
-            "path": "a.lua",
-            "decorators": [
-                {"type": "ForceSuccess"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    ASSERT_EQ(root->decorators().size(), 1u);
-    auto* fs = dynamic_cast<ForceSuccess*>(root->decorators()[0].get());
-    ASSERT_NE(fs, nullptr);
-    EXPECT_EQ(fs->abort_mode(), AbortMode::kNone);
-}
-
 // --- BehaviorTreeEngine Tests ---
 
 class BehaviorTreeEngineTest : public ::testing::Test {
@@ -645,25 +451,10 @@ protected:
     BehaviorTreeEngine::Ptr engine;
 };
 
-TEST_F(BehaviorTreeEngineTest, LoadInvalidJson) {
-    EXPECT_FALSE(engine->Load("not json").first);
-}
-
-TEST_F(BehaviorTreeEngineTest, LoadMissingRoot) {
-    EXPECT_FALSE(engine->Load("{}").first);
-}
-
 TEST_F(BehaviorTreeEngineTest, LoadValidTree) {
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "children": [
-                {"type": "Script", "path": "a.lua"},
-                {"type": "Script", "path": "b.lua"}
-            ]
-        }
-    })";
-    EXPECT_TRUE(engine->Load(json).first);
+    engine->SetRoot(ParseLuaTree(
+        "{type='Selector',children={{type='Script',path='a.lua'},{type='Script',path='b.lua'}}}"));
+    EXPECT_TRUE(engine->IsLoaded());
 }
 
 TEST_F(BehaviorTreeEngineTest, StatusBeforeLoad) {
@@ -671,15 +462,8 @@ TEST_F(BehaviorTreeEngineTest, StatusBeforeLoad) {
 }
 
 TEST_F(BehaviorTreeEngineTest, TickOnceOnLoadedTree) {
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "children": [
-                {"type": "Script", "path": "nonexistent.lua"}
-            ]
-        }
-    })";
-    ASSERT_TRUE(engine->Load(json).first);
+    engine->SetRoot(ParseLuaTree(
+        "{type='Selector',children={{type='Script',path='nonexistent.lua'}}}"));
     EXPECT_TRUE(engine->IsLoaded());
 
     auto status = engine->TickOnce();
@@ -687,15 +471,8 @@ TEST_F(BehaviorTreeEngineTest, TickOnceOnLoadedTree) {
 }
 
 TEST_F(BehaviorTreeEngineTest, StopResetsTree) {
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "children": [
-                {"type": "Script", "path": "nonexistent.lua"}
-            ]
-        }
-    })";
-    ASSERT_TRUE(engine->Load(json).first);
+    engine->SetRoot(ParseLuaTree(
+        "{type='Selector',children={{type='Script',path='nonexistent.lua'}}}"));
     engine->Stop();
     EXPECT_EQ(engine->GetStatus(), "idle");
 }
@@ -709,11 +486,9 @@ TEST_F(BehaviorTreeEngineTest, BlackboardPersistsAcrossLoad) {
     engine->blackboard().Set("x", LuaValue(static_cast<int64_t>(42)));
     EXPECT_TRUE(engine->blackboard().Has("x"));
 
-    const char* json = R"({
-        "root": {"type": "Selector", "children": [{"type": "Script", "path": "a.lua"}]}
-    })";
-    engine->Load(json);
-    // Load preserves blackboard state
+    engine->SetRoot(ParseLuaTree(
+        "{type='Selector',children={{type='Script',path='a.lua'}}}"));
+    // SetRoot preserves blackboard state
     EXPECT_TRUE(engine->blackboard().Has("x"));
 }
 
@@ -785,35 +560,37 @@ TEST_F(BehaviorTreeLibraryTest, GetStatusInitially) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, RunInvalidJson) {
+    // New API has no JSON string; missing the required `tree` table yields an error.
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({json = '{invalid}'})
+        local status, err = bt.run({})
         return status, err or 'nil'
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[0]));
     auto* err = std::get_if<std::string>(&r.values[1]);
     ASSERT_NE(err, nullptr);
-    EXPECT_NE(err->find("JSON"), std::string::npos);
+    EXPECT_NE(err->find("tree"), std::string::npos);
 }
 
 TEST_F(BehaviorTreeLibraryTest, RunInvalidJsonReturnsSpecificError) {
+    // A Script node with no path is rejected during parsing.
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({json = '{"children":[]}'})
+        local status, err = bt.run({tree = {type = 'Script'}})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[0]));
     auto* err = std::get_if<std::string>(&r.values[1]);
     ASSERT_NE(err, nullptr);
-    EXPECT_NE(err->find("root"), std::string::npos);
+    EXPECT_NE(err->find("path"), std::string::npos);
 }
 
 TEST_F(BehaviorTreeLibraryTest, RunUnknownNodeType) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({json = '{"root":{"type":"UnknownType"}}'})
+        local status, err = bt.run({tree = {type = 'UnknownType'}})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -852,10 +629,11 @@ TEST_F(BehaviorTreeLibraryTest, GetBlackboardAsTable) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, RunLoadAndTick) {
+    // x.lua does not exist → script init fails → bt.run returns nil + error.
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Selector","children":[{"type":"Script","path":"x.lua"}]}}'
+            tree = {type = 'Selector', children = {{type = 'Script', path = 'x.lua'}}}
         })
         return status, err
     )"));
@@ -868,6 +646,7 @@ TEST_F(BehaviorTreeLibraryTest, RunLoadAndTick) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, RunWithoutPathOrJson) {
+    // No `tree` field → error mentions "tree".
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.run({})
@@ -878,7 +657,7 @@ TEST_F(BehaviorTreeLibraryTest, RunWithoutPathOrJson) {
     EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[0]));
     auto* err = std::get_if<std::string>(&r.values[1]);
     ASSERT_NE(err, nullptr);
-    EXPECT_NE(err->find("path or json"), std::string::npos);
+    EXPECT_NE(err->find("tree"), std::string::npos);
 }
 
 // --- Abort Mechanism Tests ---
@@ -963,73 +742,11 @@ TEST(DecoratorOnNodeTest, AddDecorator) {
 
 TEST(DecoratorOnNodeTest, EngineManagesDecoratorState) {
     auto engine = std::make_shared<BehaviorTreeEngine>();
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "decorators": [
-                {"type": "BlackboardCondition", "key": "hp", "operator": "is_set"}
-            ],
-            "children": [{"type": "Script", "path": "a.lua"}]
-        }
-    })";
-    EXPECT_TRUE(engine->Load(json).first);
-}
-
-// --- AbortMode Parsing Tests ---
-
-TEST(AbortModeTest, TreeParserParseAbortNone) {
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "decorators": [
-                {"type": "BlackboardCondition", "key": "x", "operator": "is_set", "abort": "None"}
-            ],
-            "children": [{"type": "Script", "path": "a.lua"}]
-        }
-    })";
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    ASSERT_EQ(root->decorators().size(), 1u);
-    auto* bc = dynamic_cast<BlackboardCondition*>(root->decorators()[0].get());
-    ASSERT_NE(bc, nullptr);
-    EXPECT_EQ(bc->abort_mode(), AbortMode::kNone);
-}
-
-TEST(AbortModeTest, TreeParserParseAbortSelf) {
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "decorators": [
-                {"type": "BlackboardCondition", "key": "x", "operator": "is_set", "abort": "Self"}
-            ],
-            "children": [{"type": "Script", "path": "a.lua"}]
-        }
-    })";
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    auto* bc = dynamic_cast<BlackboardCondition*>(root->decorators()[0].get());
-    ASSERT_NE(bc, nullptr);
-    EXPECT_EQ(bc->abort_mode(), AbortMode::kSelf);
-}
-
-TEST(AbortModeTest, TreeParserParseAbortLowerPriority) {
-    const char* json = R"({
-        "root": {
-            "type": "Selector",
-            "decorators": [
-                {"type": "BlackboardCondition", "key": "x", "operator": "is_set", "abort": "LowerPriority"}
-            ],
-            "children": [{"type": "Script", "path": "a.lua"}]
-        }
-    })";
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    auto* bc = dynamic_cast<BlackboardCondition*>(root->decorators()[0].get());
-    ASSERT_NE(bc, nullptr);
-    EXPECT_EQ(bc->abort_mode(), AbortMode::kLowerPriority);
+    engine->SetRoot(ParseLuaTree(
+        "{type='Selector',"
+        "decorators={{type='BlackboardCondition',key='hp',operator='is_set'}},"
+        "children={{type='Script',path='a.lua'}}}"));
+    EXPECT_TRUE(engine->IsLoaded());
 }
 
 // --- BtEventQueue thread safety stress test ---
@@ -1057,523 +774,6 @@ TEST(BtEventQueueTest, ConcurrentPushDrain) {
      consumer.join();
 }
 
-// --- Subtree Tests ---
-
-TEST(SubtreeTest, ParseSubtree) {
-    const char* json = R"({
-        "subtrees": {
-            "combat": {
-                "type": "Sequence",
-                "children": [
-                    {"type": "Script", "path": "aim.lua"},
-                    {"type": "Script", "path": "attack.lua"}
-                ]
-            }
-        },
-        "root": {
-            "type": "Subtree",
-            "subtree": "combat"
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Subtree");
-    auto* sub = dynamic_cast<SubtreeNode*>(root.get());
-    ASSERT_NE(sub, nullptr);
-    EXPECT_EQ(sub->subtree_name(), "combat");
-    EXPECT_NE(sub->subtree_root(), nullptr);
-
-    auto* inner = dynamic_cast<Composite*>(sub->subtree_root());
-    ASSERT_NE(inner, nullptr);
-    EXPECT_EQ(inner->children().size(), 2u);
-}
-
-TEST(SubtreeTest, ParseSubtreeMissingName) {
-    const char* json = R"({
-        "root": {"type": "Subtree"}
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    EXPECT_EQ(root, nullptr);
-}
-
-TEST(SubtreeTest, ParseSubtreeUnknownName) {
-    const char* json = R"({
-        "root": {"type": "Subtree", "subtree": "nonexistent"}
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    EXPECT_EQ(root, nullptr);
-}
-
-TEST(SubtreeTest, ParseNestedSubtree) {
-    const char* json = R"({
-        "subtrees": {
-            "inner": {
-                "type": "Script",
-                "path": "inner.lua"
-            },
-            "outer": {
-                "type": "Sequence",
-                "children": [
-                    {"type": "Subtree", "subtree": "inner"},
-                    {"type": "Script", "path": "outer.lua"}
-                ]
-            }
-        },
-        "root": {
-            "type": "Subtree",
-            "subtree": "outer"
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Subtree");
-
-    auto* outer_sub = dynamic_cast<SubtreeNode*>(root.get());
-    ASSERT_NE(outer_sub, nullptr);
-    auto* outer_seq = dynamic_cast<Composite*>(outer_sub->subtree_root());
-    ASSERT_NE(outer_seq, nullptr);
-    EXPECT_EQ(outer_seq->children().size(), 2u);
-
-    // First child is an inner SubtreeNode
-    auto* inner_sub = dynamic_cast<SubtreeNode*>(outer_seq->children()[0].get());
-    ASSERT_NE(inner_sub, nullptr);
-    EXPECT_EQ(inner_sub->subtree_name(), "inner");
-}
-
-TEST(SubtreeTest, SubtreeWithDecorators) {
-    const char* json = R"({
-        "subtrees": {
-            "combat": {
-                "type": "Script",
-                "path": "fight.lua"
-            }
-        },
-        "root": {
-            "type": "Subtree",
-            "subtree": "combat",
-            "decorators": [
-                {"type": "BlackboardCondition", "key": "has_target", "operator": "is_set"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->decorators().size(), 1u);
-}
-
-TEST(SubtreeTest, SubtreeWithSensors) {
-    const char* json = R"({
-        "subtrees": {
-            "patrol": {
-                "type": "Script",
-                "path": "patrol.lua"
-            }
-        },
-        "root": {
-            "type": "Subtree",
-            "subtree": "patrol",
-            "sensors": [
-                {"name": "nearby", "path": "sensors/nearby.lua", "interval": 200}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->sensor_specs().size(), 1u);
-    EXPECT_EQ(root->sensor_specs()[0].name, "nearby");
-}
-
-TEST(SubtreeTest, SubtreeUsedMultipleTimes) {
-    const char* json = R"({
-        "subtrees": {
-            "check": {
-                "type": "Script",
-                "path": "check.lua"
-            }
-        },
-        "root": {
-            "type": "Sequence",
-            "children": [
-                {"type": "Subtree", "subtree": "check", "name": "check_1"},
-                {"type": "Subtree", "subtree": "check", "name": "check_2"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    auto* seq = dynamic_cast<Composite*>(root.get());
-    ASSERT_NE(seq, nullptr);
-    EXPECT_EQ(seq->children().size(), 2u);
-
-    EXPECT_EQ(seq->children()[0]->name(), "check_1");
-    EXPECT_EQ(seq->children()[1]->name(), "check_2");
-    EXPECT_EQ(seq->children()[0]->type(), "Subtree");
-    EXPECT_EQ(seq->children()[1]->type(), "Subtree");
-}
-
-TEST(SubtreeTest, SubtreeInSelector) {
-    const char* json = R"({
-        "subtrees": {
-            "combat": {
-                "type": "Sequence",
-                "children": [
-                    {"type": "Script", "path": "aim.lua"},
-                    {"type": "Script", "path": "attack.lua"}
-                ]
-            }
-        },
-        "root": {
-            "type": "Selector",
-            "children": [
-                {"type": "Subtree", "subtree": "combat"},
-                {"type": "Script", "path": "idle.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    auto* sel = dynamic_cast<Composite*>(root.get());
-    ASSERT_NE(sel, nullptr);
-    EXPECT_EQ(sel->children().size(), 2u);
-
-    auto* sub = dynamic_cast<SubtreeNode*>(sel->children()[0].get());
-    ASSERT_NE(sub, nullptr);
-    EXPECT_EQ(sub->subtree_name(), "combat");
-}
-
-TEST(SubtreeTest, SubtreeParentPointer) {
-    const char* json = R"({
-        "subtrees": {
-            "leaf": {
-                "type": "Script",
-                "path": "leaf.lua"
-            }
-        },
-        "root": {
-            "type": "Subtree",
-            "subtree": "leaf"
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    auto* sub = dynamic_cast<SubtreeNode*>(root.get());
-    ASSERT_NE(sub, nullptr);
-
-    // Subtree root's parent should be the SubtreeNode
-    EXPECT_EQ(sub->subtree_root()->parent(), sub);
-}
-
-TEST(SubtreeTest, CircularSubtreeReference) {
-    const char* json = R"({
-        "subtrees": {
-            "a": {"type": "Subtree", "subtree": "a"}
-        },
-        "root": {"type": "Subtree", "subtree": "a"}
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    EXPECT_EQ(root, nullptr);
-}
-
-TEST(SubtreeTest, IndirectCircularReference) {
-    const char* json = R"({
-        "subtrees": {
-            "a": {"type": "Subtree", "subtree": "b"},
-            "b": {"type": "Subtree", "subtree": "a"}
-        },
-        "root": {"type": "Subtree", "subtree": "a"}
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    EXPECT_EQ(root, nullptr);
-}
-
-// --- LoadTreeFromDirectory Tests ---
-
-class LoadTreeFromDirectoryTest : public ::testing::Test {
-protected:
-    void SetUp() override {
-        dir_ = std::filesystem::temp_directory_path() / "bt_test_tree";
-        std::filesystem::create_directories(dir_);
-    }
-
-    void TearDown() override {
-        std::filesystem::remove_all(dir_);
-    }
-
-    void WriteFile(const std::string& name, const std::string& content) {
-        std::ofstream(dir_ / name) << content;
-    }
-
-    void WriteSubtree(const std::string& name, const std::string& content) {
-        auto sub_dir = dir_ / "subtrees";
-        std::filesystem::create_directories(sub_dir);
-        std::ofstream(sub_dir / name) << content;
-    }
-
-    std::string LoadTree() {
-        FileSystemResourceProvider provider(dir_.string());
-        return async_simple::coro::syncAwait(TreeParser::LoadTree(&provider, ""));
-    }
-
-    std::filesystem::path dir_;
-};
-
-TEST_F(LoadTreeFromDirectoryTest, LoadsRootOnly) {
-    WriteFile("root.json", R"({"type": "Selector", "children": [
-        {"type": "Script", "path": "a.lua"}
-    ]})");
-
-    auto json = LoadTree();
-    ASSERT_FALSE(json.empty());
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Selector");
-}
-
-TEST_F(LoadTreeFromDirectoryTest, LoadsRootWithSubtrees) {
-    WriteFile("root.json", R"({"type": "Selector", "children": [
-        {"type": "Subtree", "subtree": "combat"},
-        {"type": "Script", "path": "idle.lua"}
-    ]})");
-    WriteSubtree("combat.json", R"({"type": "Sequence", "children": [
-        {"type": "Script", "path": "aim.lua"},
-        {"type": "Script", "path": "attack.lua"}
-    ]})");
-
-    auto json = LoadTree();
-    ASSERT_FALSE(json.empty());
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    auto* sel = dynamic_cast<Composite*>(root.get());
-    ASSERT_NE(sel, nullptr);
-    EXPECT_EQ(sel->children().size(), 2u);
-
-    auto* sub = dynamic_cast<SubtreeNode*>(sel->children()[0].get());
-    ASSERT_NE(sub, nullptr);
-    EXPECT_EQ(sub->subtree_name(), "combat");
-    auto* inner = dynamic_cast<Composite*>(sub->subtree_root());
-    ASSERT_NE(inner, nullptr);
-    EXPECT_EQ(inner->children().size(), 2u);
-}
-
-TEST_F(LoadTreeFromDirectoryTest, MultipleSubtrees) {
-    WriteFile("root.json", R"({"type": "Sequence", "children": [
-        {"type": "Subtree", "subtree": "combat"},
-        {"type": "Subtree", "subtree": "patrol"}
-    ]})");
-    WriteSubtree("combat.json", R"({"type": "Script", "path": "fight.lua"})");
-    WriteSubtree("patrol.json", R"({"type": "Script", "path": "walk.lua"})");
-
-    auto json = LoadTree();
-    ASSERT_FALSE(json.empty());
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    auto* seq = dynamic_cast<Composite*>(root.get());
-    ASSERT_NE(seq, nullptr);
-    EXPECT_EQ(seq->children().size(), 2u);
-    EXPECT_EQ(seq->children()[0]->type(), "Subtree");
-    EXPECT_EQ(seq->children()[1]->type(), "Subtree");
-}
-
-TEST_F(LoadTreeFromDirectoryTest, IgnoresNonJsonFiles) {
-    WriteFile("root.json", R"({"type": "Script", "path": "a.lua"})");
-    WriteFile("notes.txt", "ignore me");
-    WriteFile("data.csv", "1,2,3");
-
-    auto json = LoadTree();
-    ASSERT_FALSE(json.empty());
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Script");
-}
-
-TEST_F(LoadTreeFromDirectoryTest, DirNotFound) {
-    auto missing = dir_ / "no_such_dir";
-    FileSystemResourceProvider provider(missing.string());
-    auto json = async_simple::coro::syncAwait(TreeParser::LoadTree(&provider, ""));
-    EXPECT_TRUE(json.empty());
-}
-
-TEST_F(LoadTreeFromDirectoryTest, NoRootJson) {
-    WriteSubtree("combat.json", R"({"type": "Script", "path": "fight.lua"})");
-
-    auto json = LoadTree();
-    EXPECT_TRUE(json.empty());
-}
-
-TEST_F(LoadTreeFromDirectoryTest, InvalidJsonInRoot) {
-    WriteFile("root.json", "{invalid}");
-
-    auto json = LoadTree();
-    EXPECT_TRUE(json.empty());
-}
-
-TEST_F(LoadTreeFromDirectoryTest, InvalidJsonInSubtree) {
-    WriteFile("root.json", R"({"type": "Subtree", "subtree": "bad"})");
-    WriteSubtree("bad.json", "{broken");
-
-    auto json = LoadTree();
-    EXPECT_TRUE(json.empty());
-}
-
-TEST_F(LoadTreeFromDirectoryTest, LoadsSensorsJson) {
-    WriteFile("root.json", R"({"type": "Script", "path": "a.lua",
-        "sensors": ["nearby", "combat.target_check"]
-    })");
-    WriteFile("sensors.json", R"({
-        "nearby": {"interval": 200},
-        "combat.target_check": {"interval": 100, "args": {"range": 50}}
-    })");
-
-    auto json = LoadTree();
-    ASSERT_FALSE(json.empty());
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    ASSERT_EQ(root->sensor_specs().size(), 2u);
-
-    EXPECT_EQ(root->sensor_specs()[0].name, "nearby");
-    EXPECT_EQ(root->sensor_specs()[0].interval_ms, 200);
-    EXPECT_EQ(root->sensor_specs()[0].script_path, "sensors/nearby.lua");
-
-    EXPECT_EQ(root->sensor_specs()[1].name, "combat.target_check");
-    EXPECT_EQ(root->sensor_specs()[1].interval_ms, 100);
-    EXPECT_EQ(root->sensor_specs()[1].script_path, "sensors/combat/target_check.lua");
-    EXPECT_EQ(root->sensor_specs()[1].args.size(), 1u);
-}
-
-TEST_F(LoadTreeFromDirectoryTest, NoSensorsJsonIsFine) {
-    WriteFile("root.json", R"({"type": "Script", "path": "a.lua"})");
-
-    auto json = LoadTree();
-    ASSERT_FALSE(json.empty());
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-}
-
-TEST_F(LoadTreeFromDirectoryTest, InvalidSensorsJson) {
-    WriteFile("root.json", R"({"type": "Script", "path": "a.lua"})");
-    WriteFile("sensors.json", "{broken");
-
-    auto json = LoadTree();
-    EXPECT_TRUE(json.empty());
-}
-
-TEST_F(LoadTreeFromDirectoryTest, SensorsWithOverridePath) {
-    WriteFile("root.json", R"({"type": "Script", "path": "a.lua",
-        "sensors": ["custom"]
-    })");
-    WriteFile("sensors.json", R"({
-        "custom": {"path": "other/custom.lua", "interval": 500}
-    })");
-
-    auto json = LoadTree();
-    ASSERT_FALSE(json.empty());
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    ASSERT_EQ(root->sensor_specs().size(), 1u);
-    EXPECT_EQ(root->sensor_specs()[0].script_path, "other/custom.lua");
-}
-
-// --- ScriptNode Args Parsing Tests ---
-
-TEST(TreeParserArgsTest, ParseScriptNodeWithArgs) {
-    const char* json = R"({
-        "root": {
-            "type": "Script",
-            "path": "scripts/attack.lua",
-            "args": {
-                "target": "enemy",
-                "damage": 100,
-                "use_critical": true
-            }
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Script");
-    auto* script = dynamic_cast<ScriptNode*>(root.get());
-    ASSERT_NE(script, nullptr);
-    EXPECT_EQ(script->script_path(), "scripts/attack.lua");
-}
-
-TEST(TreeParserArgsTest, ParseScriptNodeWithNoArgs) {
-    const char* json = R"({
-        "root": {"type": "Script", "path": "test.lua"}
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Script");
-}
-
-TEST(TreeParserArgsTest, ParseScriptNodeWithEmptyArgs) {
-    const char* json = R"({
-        "root": {
-            "type": "Script",
-            "path": "test.lua",
-            "args": {}
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Script");
-}
-
-TEST(TreeParserArgsTest, ParseScriptNodeWithFloatArg) {
-    const char* json = R"({
-        "root": {
-            "type": "Script",
-            "path": "test.lua",
-            "args": {"ratio": 0.75}
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Script");
-}
-
 // --- ScriptNode Colon-Method Integration Tests ---
 
 class ScriptNodeIntegrationTest : public ::testing::Test {
@@ -1582,13 +782,14 @@ protected:
         blackboard = std::make_shared<Blackboard>();
         bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
         lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
+        tests_dir_ = std::filesystem::absolute(
+            std::filesystem::path(__FILE__).parent_path()).string();
         rt = LuaRuntime::Builder()
+            .WithCodeProvider(std::make_shared<FileSystemCodeProvider>(
+                std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts", tests_dir_ + "/sensors"}))
             .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
             .Create();
-
-        tests_dir_ = std::filesystem::absolute(
-            std::filesystem::path(__FILE__).parent_path()).string();
     }
 
     void TearDown() override {
@@ -1619,8 +820,7 @@ TEST_F(ScriptNodeIntegrationTest, SelfStateInEnterAndTick) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/bt_module.lua"}}',
-            project_path = ')" + tests_dir_ + R"('
+            tree = {type = 'Script', path = 'scripts/bt_module.lua'}
         })
         if not status then return false, err end
         return true, status
@@ -1632,8 +832,7 @@ TEST_F(ScriptNodeIntegrationTest, ExitReasonAsParameter) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/check_reason.lua"}}',
-            project_path = ')" + tests_dir_ + R"('
+            tree = {type = 'Script', path = 'scripts/check_reason.lua'}
         })
         if not status then return false, err end
         return true, status
@@ -1645,8 +844,7 @@ TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/with_args.lua","args":{"target":"enemy","damage":100}}}',
-            project_path = ')" + tests_dir_ + R"('
+            tree = {type = 'Script', path = 'scripts/with_args.lua', args = {target = 'enemy', damage = 100}}
         })
         if not status then return false, err end
         return true, status
@@ -1658,8 +856,7 @@ TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/bool_args.lua","args":{"enabled":true}}}',
-            project_path = ')" + tests_dir_ + R"('
+            tree = {type = 'Script', path = 'scripts/bool_args.lua', args = {enabled = true}}
         })
         if not status then return false, err end
         return true, status
@@ -1671,8 +868,7 @@ TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/counter.lua"}}',
-            project_path = ')" + tests_dir_ + R"('
+            tree = {type = 'Script', path = 'scripts/counter.lua'}
         })
         if not status then return false, err end
         return true, status
@@ -1684,8 +880,7 @@ TEST_F(ScriptNodeIntegrationTest, NoArgsStillWorks) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/no_args.lua"}}',
-            project_path = ')" + tests_dir_ + R"('
+            tree = {type = 'Script', path = 'scripts/no_args.lua'}
         })
         if not status then return false, err end
         return true, status
@@ -1697,8 +892,7 @@ TEST_F(ScriptNodeIntegrationTest, ScriptNotFoundReturnsError) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/nonexistent.lua"}}',
-            project_path = ')" + tests_dir_ + R"('
+            tree = {type = 'Script', path = 'scripts/nonexistent.lua'}
         })
         return status, err
     )"));
@@ -1714,8 +908,7 @@ TEST_F(ScriptNodeIntegrationTest, ScriptRuntimeErrorReturnsError) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/runtime_error.lua"}}',
-            project_path = ')" + tests_dir_ + R"('
+            tree = {type = 'Script', path = 'scripts/runtime_error.lua'}
         })
         if not status then return false, err end
         return true, status
@@ -1732,8 +925,7 @@ TEST_F(ScriptNodeIntegrationTest, NodeReturnsFailureIsNotError) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/returns_failure.lua"}}',
-            project_path = ')" + tests_dir_ + R"('
+            tree = {type = 'Script', path = 'scripts/returns_failure.lua'}
         })
         if not status then return false, err end
         return true, status
@@ -1746,10 +938,12 @@ TEST_F(ScriptNodeIntegrationTest, NodeReturnsFailureIsNotError) {
 TEST_F(ScriptNodeIntegrationTest, InitErrorInSequenceStopsEarly) {
     auto r = AWAIT_BT(rt->RunScript(
         "local bt = require('bt')\n"
-        "local json = '{\"root\":{\"type\":\"Sequence\",\"children\":"
-        "[{\"type\":\"Script\",\"path\":\"scripts/nonexistent.lua\"},"
-        "{\"type\":\"Script\",\"path\":\"scripts/no_args.lua\"}]}}'\n"
-        "local status, err = bt.run({json = json, project_path = '" + tests_dir_ + "'})\n"
+        "local status, err = bt.run({\n"
+        "    tree = {type = 'Sequence', children = {\n"
+        "        {type = 'Script', path = 'scripts/nonexistent.lua'},\n"
+        "        {type = 'Script', path = 'scripts/no_args.lua'},\n"
+        "    }}\n"
+        "})\n"
         "return status, err\n"
     ));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1768,13 +962,14 @@ protected:
         blackboard = std::make_shared<Blackboard>();
         bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
         lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
+        tests_dir_ = std::filesystem::absolute(
+            std::filesystem::path(__FILE__).parent_path()).string();
         rt = LuaRuntime::Builder()
+            .WithCodeProvider(std::make_shared<FileSystemCodeProvider>(
+                std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts", tests_dir_ + "/sensors"}))
             .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
             .Create();
-
-        tests_dir_ = std::filesystem::absolute(
-            std::filesystem::path(__FILE__).parent_path()).string();
     }
 
     void TearDown() override {
@@ -1792,8 +987,7 @@ TEST_F(BtRunOptionsTest, MaxStepStopsTree) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/run_forever.lua"}}',
-            project_path = ')" + tests_dir_ + R"(',
+            tree = {type = 'Script', path = 'scripts/run_forever.lua'},
             max_step = 2
         })
         return status, err
@@ -1809,8 +1003,7 @@ TEST_F(BtRunOptionsTest, MaxStepNotReachedTreeCompletes) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/run_3_ticks.lua"}}',
-            project_path = ')" + tests_dir_ + R"(',
+            tree = {type = 'Script', path = 'scripts/run_3_ticks.lua'},
             max_step = 100
         })
         return status, err
@@ -1826,8 +1019,7 @@ TEST_F(BtRunOptionsTest, TimeoutStopsTree) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/run_forever.lua"}}',
-            project_path = ')" + tests_dir_ + R"(',
+            tree = {type = 'Script', path = 'scripts/run_forever.lua'},
             timeout = 1
         })
         return status, err
@@ -1843,8 +1035,7 @@ TEST_F(BtRunOptionsTest, TimeoutNotReachedTreeCompletes) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/run_3_ticks.lua"}}',
-            project_path = ')" + tests_dir_ + R"(',
+            tree = {type = 'Script', path = 'scripts/run_3_ticks.lua'},
             timeout = 60000
         })
         return status, err
@@ -1860,8 +1051,7 @@ TEST_F(BtRunOptionsTest, IntervalAccepted) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/run_3_ticks.lua"}}',
-            project_path = ')" + tests_dir_ + R"(',
+            tree = {type = 'Script', path = 'scripts/run_3_ticks.lua'},
             interval = 10
         })
         return status, err
@@ -1876,8 +1066,7 @@ TEST_F(BtRunOptionsTest, CombinedMaxStepAndInterval) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.run({
-            json = '{"root":{"type":"Script","path":"scripts/run_forever.lua"}}',
-            project_path = ')" + tests_dir_ + R"(',
+            tree = {type = 'Script', path = 'scripts/run_forever.lua'},
             max_step = 3,
             interval = 10
         })
@@ -1895,26 +1084,6 @@ TEST(ForceFailureTest, AlwaysFalse) {
     Blackboard bb;
     ForceFailure ff;
     EXPECT_FALSE(ff.Evaluate(bb));
-}
-
-TEST(TreeParserForceFailureTest, ParseForceFailureDecorator) {
-    const char* json = R"({
-        "root": {
-            "type": "Script",
-            "path": "a.lua",
-            "decorators": [
-                {"type": "ForceFailure", "abort": "Self"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    ASSERT_EQ(root->decorators().size(), 1u);
-    auto* ff = dynamic_cast<ForceFailure*>(root->decorators()[0].get());
-    ASSERT_NE(ff, nullptr);
-    EXPECT_EQ(ff->abort_mode(), AbortMode::kSelf);
 }
 
 // --- Repeat Tests ---
@@ -2181,149 +1350,7 @@ TEST(WaitNodeTest, ResetRestartsTimer) {
     EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
 }
 
-// --- TreeParser new node type tests ---
-
-TEST(TreeParserRepeatTest, ParseRepeat) {
-    const char* json = R"({
-        "root": {
-            "type": "Repeat",
-            "count": 3,
-            "children": [
-                {"type": "Script", "path": "a.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Repeat");
-}
-
-TEST(TreeParserRepeatTest, ParseRepeatNoChildren) {
-    const char* json = R"({
-        "root": {
-            "type": "Repeat",
-            "count": 3
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    EXPECT_EQ(root, nullptr);
-}
-
-TEST(TreeParserRepeatTest, ParseRepeatInfinite) {
-    const char* json = R"({
-        "root": {
-            "type": "Repeat",
-            "count": -1,
-            "children": [
-                {"type": "Script", "path": "a.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Repeat");
-}
-
-TEST(TreeParserRetryTest, ParseRetryUntilSuccessful) {
-    const char* json = R"({
-        "root": {
-            "type": "RetryUntilSuccessful",
-            "attempts": 5,
-            "children": [
-                {"type": "Script", "path": "a.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "RetryUntilSuccessful");
-}
-
-TEST(TreeParserRetryTest, ParseRetryNoChildren) {
-    const char* json = R"({
-        "root": {
-            "type": "RetryUntilSuccessful",
-            "attempts": 3
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    EXPECT_EQ(root, nullptr);
-}
-
-TEST(TreeParserRandomTest, ParseRandomSelector) {
-    const char* json = R"({
-        "root": {
-            "type": "RandomSelector",
-            "children": [
-                {"type": "Script", "path": "a.lua"},
-                {"type": "Script", "path": "b.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "RandomSelector");
-    auto* sel = dynamic_cast<Composite*>(root.get());
-    ASSERT_NE(sel, nullptr);
-    EXPECT_EQ(sel->children().size(), 2u);
-}
-
-TEST(TreeParserRandomTest, ParseRandomSequence) {
-    const char* json = R"({
-        "root": {
-            "type": "RandomSequence",
-            "children": [
-                {"type": "Script", "path": "a.lua"},
-                {"type": "Script", "path": "b.lua"}
-            ]
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "RandomSequence");
-    auto* seq = dynamic_cast<Composite*>(root.get());
-    ASSERT_NE(seq, nullptr);
-    EXPECT_EQ(seq->children().size(), 2u);
-}
-
-TEST(TreeParserWaitTest, ParseWait) {
-    const char* json = R"({
-        "root": {
-            "type": "Wait",
-            "ms": 500
-        }
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(root->type(), "Wait");
-}
-
-TEST(TreeParserWaitTest, ParseWaitDefault) {
-    const char* json = R"({
-        "root": {"type": "Wait"}
-    })";
-
-    auto _parse_result = TreeParser::Parse(json);
-    auto root = std::move(_parse_result.root);
-    ASSERT_NE(root, nullptr);
-     EXPECT_EQ(root->type(), "Wait");
-}
+// --- TreeParser new node type tests (removed: JSON-based TreeParser deleted) ---
 
 // --- Decorator gating on child nodes ---
 
@@ -2557,13 +1584,14 @@ protected:
         blackboard = std::make_shared<Blackboard>();
         bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
         lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
+        tests_dir_ = std::filesystem::absolute(
+            std::filesystem::path(__FILE__).parent_path()).string();
         rt = LuaRuntime::Builder()
+            .WithCodeProvider(std::make_shared<FileSystemCodeProvider>(
+                std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts", tests_dir_ + "/sensors"}))
             .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
             .Create();
-
-        tests_dir_ = std::filesystem::absolute(
-            std::filesystem::path(__FILE__).parent_path()).string();
     }
 
     void TearDown() override {
@@ -2587,22 +1615,21 @@ TEST_F(AbortPropagationTest, SelfAbortTerminatesTree) {
         local bt = require('bt')
         local bb = require('blackboard')
         bb.set("go", true)
-        local json = [[{
-            "root": {
-                "type": "Sequence",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Sequence',
+                children = {
                     {
-                        "type": "Script",
-                        "path": "scripts/run_then_clear_flag.lua",
-                        "decorators": [
-                            {"type": "BlackboardCondition", "key": "go", "operator": "equals", "value": true, "abort": "Self"}
-                        ]
+                        type = 'Script',
+                        path = 'scripts/run_then_clear_flag.lua',
+                        decorators = {
+                            {type = 'BlackboardCondition', key = 'go', operator = 'equals', value = true, abort = 'Self'}
+                        }
                     }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"(',
-            max_step = 20, interval = 10})
+                }
+            },
+            max_step = 20, interval = 10
+        })
         return status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -2613,32 +1640,31 @@ TEST_F(AbortPropagationTest, SelfAbortTerminatesTree) {
 }
 
 TEST_F(AbortPropagationTest, LowerPriorityAbortPreemptsSibling) {
-    // Selector: [no_args (decorator: flag is_set, abort=LowerPriority), run_5_ticks]
-    // run_then_clear_flag sets "flag" after 2 ticks.
+    // Selector: [no_args (decorator: flag is_set, abort=LowerPriority), run_then_set_flag]
+    // run_then_set_flag sets "flag" after 2 ticks.
     // When flag appears, LowerPriority abort fires → second child aborted → first child retries → succeeds.
     auto r = AWAIT_ABORT(rt->RunScript(R"(
         local bt = require('bt')
         local bb = require('blackboard')
-        local json = [[{
-            "root": {
-                "type": "Selector",
-                "children": [
+        local status, err = bt.run({
+            tree = {
+                type = 'Selector',
+                children = {
                     {
-                        "type": "Script",
-                        "path": "scripts/no_args.lua",
-                        "decorators": [
-                            {"type": "BlackboardCondition", "key": "flag", "operator": "is_set", "abort": "LowerPriority"}
-                        ]
+                        type = 'Script',
+                        path = 'scripts/no_args.lua',
+                        decorators = {
+                            {type = 'BlackboardCondition', key = 'flag', operator = 'is_set', abort = 'LowerPriority'}
+                        }
                     },
                     {
-                        "type": "Script",
-                        "path": "scripts/run_then_set_flag.lua"
+                        type = 'Script',
+                        path = 'scripts/run_then_set_flag.lua'
                     }
-                ]
-            }
-        }]]
-        local status, err = bt.run({json = json, project_path = ')" + tests_dir_ + R"(',
-            max_step = 20, interval = 10})
+                }
+            },
+            max_step = 20, interval = 10
+        })
         return status
     )"));
     ASSERT_EQ(r.status, LUA_OK);

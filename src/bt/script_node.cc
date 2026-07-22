@@ -48,8 +48,8 @@ ScriptNode::~ScriptNode() {
     }
 }
 
-async_simple::coro::Lazy<bool> ScriptNode::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
-    if (!co_await host_.LoadScript(L, ctx, base_path, script_path_, true)) {
+async_simple::coro::Lazy<bool> ScriptNode::Init(lua_State* L, LuaRuntime* ctx) {
+    if (!co_await host_.LoadScript(L, ctx, script_path_, true)) {
         set_last_error(host_.last_error_);
         co_return false;
     }

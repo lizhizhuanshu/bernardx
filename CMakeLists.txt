@@ -106,7 +106,7 @@ add_library(bernardx_lib STATIC
     src/lua/async_io_library.cc
     src/lua/file_system_resource_provider.cc
     src/bt/behavior_tree_engine.cc
-    src/bt/tree_parser.cc
+    src/bt/lua_tree_parser.cc
     src/bt/single_child_node.cc
     src/bt/lua_script_host.cc
     src/bt/script_node.cc
@@ -156,6 +156,9 @@ endif()
 
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+# Suppress gflags' own bundled tests (gflags_unittest etc.) — they are unrelated
+# to bernardx and fail for environment reasons, cluttering ctest output.
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE INTERNAL "")
 add_subdirectory(${GFLAGS_DIR})
 

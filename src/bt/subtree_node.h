@@ -52,9 +52,8 @@ public:
         Node::OnAborted();
     }
 
-    async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx,
-                                         const std::string& base_path) override {
-        if (subtree_root_ && !co_await subtree_root_->Init(L, ctx, base_path)) {
+    async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx) override {
+        if (subtree_root_ && !co_await subtree_root_->Init(L, ctx)) {
             set_last_error(subtree_root_->last_error());
             co_return false;
         }

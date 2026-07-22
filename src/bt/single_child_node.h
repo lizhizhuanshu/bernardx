@@ -16,8 +16,7 @@ class SingleChildNode : public Node {
 public:
     void Reset() override;
     void OnAborted() override;
-    async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx,
-                                         const std::string& base_path) override;
+    async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx) override;
 
     Node* child() const { return child_.get(); }
 

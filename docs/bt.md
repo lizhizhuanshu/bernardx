@@ -1,0 +1,299 @@
+# 行为树 (bt 模块)
+
+UE4/5 风格行为树：**Lua table 描述结构**、Lua 脚本承载逻辑、黑板做节点间数据共享、传感器异步感知、装饰器做条件中止。
+
+```lua
+local bt = require('bt')
+```
+
+| 函数 | 说明 |
+|------|------|
+| `bt.run(opts)` | 加载并运行行为树直到完成或超时（协程异步，yield 挂起、完成后恢复） |
+| `bt.notify(event, data)` | 发送事件到事件队列（下个 tick 写入黑板 `_event_{name}`） |
+| `bt.get_status()` | 状态：`"idle"` / `"running"` / `"success"` / `"failure"` |
+
+## bt.run(opts)
+
+一站式入口，依次完成：从 Lua table 构建 Node 树 → 初始化 Script → 初始化 Sensor → 激活初始路径 Sensor → 进入 tick 循环（直到完成、达到 `max_step` 或 `timeout`）。重复调用会先停止并清理之前的树。
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `tree` | `table` | **是** | 根节点定义（行为树拓扑，见下） |
+| `subtrees` | `table` | 否 | 子树定义：`{名字 = 节点定义, ...}` |
+| `sensors` | `table` | 否 | 传感器配置：`{名字 = {interval, args, path}, ...}` |
+| `max_step` | `integer` | 否 | 最大 tick 步数，未设置则无限 |
+| `timeout` | `integer` | 否 | 超时（毫秒），未设置则不超时 |
+| `interval` | `integer` | 否 | tick 间隔（毫秒），未设置则连续 |
+
+返回 `status, err`：`status` 为 `"success"` / `"failure"` / `"timeout"`，出错为 `nil`；`err` 为错误信息，成功为 `nil`。
+
+```lua
+local status, err = bt.run({
+    tree = {
+        type = 'Sequence',
+        children = {
+            { type = 'Script', path = 'scripts/attack.lua', args = { target = 'enemy' } },
+            { type = 'Subtree', subtree = 'combat' },
+        },
+        sensors = { 'hp' },
+    },
+    subtrees = { combat = { type = 'Sequence', children = { ... } } },
+    sensors = { hp = { interval = 100, path = 'sensors/hp.lua' } },
+    max_step = 100, timeout = 5000, interval = 100,  -- 均可选
+})
+if not status then error("bt.run failed: " .. err)
+elseif status == "timeout" then print("timed out")
+else print("finished:", status) end
+```
+
+## 脚本加载
+
+Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `CodeProvider` 加载（与主脚本 `require()` / `loadfile()` 共用同一加载器）。`path` 相对 `CodeProvider` 的搜索路径解析——请将 `scripts/`、`sensors/` 等脚本目录纳入 `CodeProvider` 搜索路径。
+
+**`bt.run` 不再有 `project_path`/目录加载**：树拓扑由 `tree`/`subtrees` table 直接提供，不经文件或 JSON。
+
+## 节点速查表
+
+节点用 Lua table 表达。每个节点必须有 `type`，通用可选字段：`name`、`decorators`（装饰器数组）、`sensors`（传感器名数组）。
+
+| 类型 | 分类 | 必填字段 | 子节点 | 说明 |
+|------|------|---------|--------|------|
+| `Selector` | 复合 | `type` | `children` | OR 逻辑，任一成功即成功 |
+| `Sequence` | 复合 | `type` | `children` | AND 逻辑，全部成功才成功 |
+| `Parallel` | 复合 | `type` | `children` | 并行，策略控制结果 |
+| `RandomSelector` | 复合 | `type` | `children` | 随机顺序 OR |
+| `RandomSequence` | 复合 | `type` | `children` | 随机顺序 AND |
+| `Script` | 叶子 | `type`,`path` | 无 | 执行 Lua 脚本，`args` 传参 |
+| `Subtree` | 叶子 | `type`,`subtree` | 无 | 引用 subtrees 子树 |
+| `Wait` | 叶子 | `type` | 无 | 等待指定毫秒数 |
+| `Repeat` | 包装 | `type` | `children[1]` | 重复执行子节点 |
+| `RetryUntilSuccessful` | 包装 | `type` | `children[1]` | 失败时重试 |
+| `BlackboardCondition` | 装饰器 | `type`,`key` | — | 黑板条件判断 |
+| `Inverter` | 装饰器 | `type` | — | 反转结果 |
+| `ForceSuccess` | 装饰器 | `type` | — | 强制成功 |
+| `ForceFailure` | 装饰器 | `type` | — | 强制失败 |
+
+## 运行机制（每个 tick）
+
+1. **处理事件** — `bt.notify()` 推入的事件写入黑板（`_event_{name}`）
+2. **执行传感器** — 到期且激活的 Sensor 运行，结果写黑板
+3. **评估装饰器** — 条件从满足变为不满足时触发节点中止（`OnAborted`）
+4. **Tick 树** — 从根节点执行行为树
+5. **更新传感器激活** — 按活跃路径激活/停用 Sensor
+6. **树完成时重置** — 返回 `success`/`failure` 时停用所有 Sensor 并重置树
+
+## 节点详解
+
+### 复合节点 (Composite)
+
+通过 `children` 数组配置，Running 时记忆当前位置。
+
+| 节点 | 逻辑 |
+|------|------|
+| `Selector` | 依次 tick，首个 Success 即 Success，全 Failure 才 Failure |
+| `Sequence` | 依次 tick，首个 Failure 即 Failure，全 Success 才 Success |
+| `RandomSelector` | 同 Selector，每次 Reset 后随机排列子节点顺序 |
+| `RandomSequence` | 同 Sequence，每次 Reset 后随机排列子节点顺序 |
+
+`Parallel` 同时执行所有子节点，策略控制判定：
+
+| 字段 | 可选值 | 默认 | 含义 |
+|------|--------|------|------|
+| `success_policy` | `RequireAll` / `RequireOne` | `RequireAll` | 全部成功才成功 / 任一成功即成功 |
+| `failure_policy` | `RequireAll` / `RequireOne` | `RequireOne` | 全部失败才失败 / 任一失败即失败 |
+
+```lua
+{ type = 'Selector', name = '可选名称', children = { ... } }
+```
+
+### 叶子节点 (Leaf)
+
+#### Script — 脚本节点
+
+```lua
+{ type = 'Script', path = 'scripts/attack.lua', name = '可选', args = { target = 'enemy', damage = 100 } }
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `path` | **是** | Lua 脚本路径（相对 `CodeProvider` 搜索路径） |
+| `name` | 否 | 节点名，默认等于 path |
+| `args` | 否 | 传给 `Enter` 的参数对象（值支持 `bool`/`int`/`double`/`string`） |
+
+**脚本格式**：必须 **return 一个 table**，用冒号语法定义回调，`self` 是该 table（存跨 tick 状态）：
+
+```lua
+-- scripts/attack.lua
+local M = {}
+function M:Enter(args) self.target = args.target end   -- 进入活跃时一次
+function M:Tick()                                       -- 必需，协程内每次 tick
+  return self.target and "success" or "failure"
+end
+function M:Exit(reason) end   -- reason: success|failure|aborted|reset
+function M:Abort() end        -- 被中止时，在 Exit 之前
+return M
+```
+
+| 回调 | 签名 | 必需 | 可 yield | 说明 |
+|------|------|------|---------|------|
+| `Enter` | `self:Enter(args)` | 否 | 否 | 进入活跃状态时一次 |
+| `Tick` | `self:Tick()` | **是** | **是** | 每次 tick，返回状态字符串 |
+| `Exit` | `self:Exit(reason)` | 否 | 否 | 离开活跃状态时 |
+| `Abort` | `self:Abort()` | 否 | 否 | 强制中止时（Exit 之前） |
+
+未返回 table 或缺 `Tick` → 加载失败，tick 时返回 Failure。**Tick 返回**：`"success"` / `"failure"`（进 Exit）/ `"running"`（保持活跃，下次 tick 直接 Tick，不再 Enter）；返回 nil 或无法识别的字符串视为 Failure。`Tick` 内可用所有异步 API（`sleep`/`await`/`http.get` 等），异步期间节点挂起 Running，完成后自动恢复。
+
+**生命周期**：首次 tick → `Enter(args)` → `Tick()` →（success/failure: `Exit(reason)` 完成 / running: 下次 tick 直接 `Tick()`）；被装饰器中止 → `Abort()` → `Exit("aborted")`；被重置 → `Exit("reset")`。
+
+**黑板访问**：`require('blackboard')` 后 `bb.get(key)` / `bb.set(key, value)`，值支持 `nil`/`boolean`/`integer`(int64)/`double`/`string`。
+
+#### Subtree — 子树节点
+
+```lua
+{ type = 'Subtree', subtree = 'combat', name = '可选' }
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `subtree` | **是** | `subtrees` table 中定义的子树名 |
+| `name` | 否 | 默认等于 subtree 名 |
+
+支持 `decorators`/`sensors`，子树定义内可引用其他子树（可嵌套）。
+
+#### Wait — 等待节点
+
+```lua
+{ type = 'Wait', ms = 500 }   -- ms 默认 1000
+```
+
+首次 tick 记起始时间，到达前返回 Running，到达后返回 Success。
+
+### 包装节点 (Wrapper)
+
+`children` 数组，仅取第一个子节点；子节点 Running 时返回 Running。
+
+| 节点 | 字段 | 行为 |
+|------|------|------|
+| `Repeat` | `count`（默认 `-1` 无限） | 有限：子成功计数+1，达 count→Success，子失败→Failure；无限：子成功重置继续，子失败→Failure |
+| `RetryUntilSuccessful` | `attempts`（默认 `-1` 无限） | 子成功→Success；失败重置重试，超 attempts→Failure |
+
+### 装饰器 (Decorators)
+
+`decorators` 数组，附加在任意节点上，节点 tick 前评估条件。
+
+**BlackboardCondition** — 根据黑板值决定节点是否执行：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `key` | **是** | 黑板键名 |
+| `operator` | 否 | 默认 `is_set` |
+| `value` | 否 | 期望值（部分 operator 需要） |
+| `abort` | 否 | 中断模式，默认 `None` |
+
+`operator`：`is_set` / `is_not_set`（无需 value）/ `equals` / `not_equals` / `greater_than` / `less_than`（需 value）。`value` 支持 `bool`/`int64`/`double`/`string`，类型不匹配即 false。
+
+`abort`（UE4/5 观察者中止）：`None`（默认）/ `Self`（中断自身执行中的子树）/ `LowerPriority`（中断右侧低优先级节点）/ `Both`。
+
+```lua
+decorators = {
+    { type = 'BlackboardCondition', key = 'hp', operator = 'greater_than', value = 50, abort = 'Self' },
+    { type = 'Inverter' },
+}
+```
+
+**结果修饰**（均接受可选 `abort`）：`Inverter` 反转成功/失败；`ForceSuccess` 始终成功；`ForceFailure` 始终失败。
+
+## 传感器 (Sensors)
+
+按需运行的异步感知模块，声明在节点上。节点进入活跃路径时激活、按 `interval` 周期执行、离开路径时停用。**用途**：条件依赖异步数据（DOM 查询、网络请求）时，由传感器定期把结果写入黑板，`BlackboardCondition` 同步读取缓存值。
+
+### 配置方式
+
+传感器的**脚本与调度配置集中在 `bt.run` 的 `sensors` 参数**（一个 `{名字 = 配置}` 的 table）；节点通过 `sensors = {'名字'}` 数组按名引用。
+
+```lua
+bt.run({
+    tree = {
+        type = 'Script', path = 'scripts/click.lua',
+        sensors = { 'login_visible' },          -- 引用名字
+    },
+    sensors = {
+        login_visible = { interval = 100, path = 'sensors/element_visible.lua', args = { selector = '#login' } },
+        hp = { interval = 50, path = 'sensors/hp.lua' },
+    },
+})
+```
+
+### 配置字段
+
+| 字段 | 必填 | 类型 | 说明 |
+|------|------|------|------|
+| `path` | **是** | string | Lua 脚本路径（相对 `CodeProvider` 搜索路径） |
+| `interval` | 否 | integer | tick 间隔（毫秒），默认 `100` |
+| `args` | 否 | object | 传给 `Enter` 的参数（值支持 `bool`/`int`/`double`/`string`） |
+
+传感器名同时作为**黑板键名**（Tick 返回值写入 `bb[名字]`）。
+
+### 脚本格式
+
+return table，冒号语法定义回调，`self` 存跨 tick 状态：
+
+```lua
+-- sensors/element_visible.lua
+local M = {}
+function M:Enter(args) end                  -- 激活时一次（同步）
+function M:Tick()                           -- 必需，按 interval 周期调用（可 yield）
+  return find("#login-btn") ~= nil          -- 返回值 → bb[名字]
+end
+function M:Exit() end                       -- 停用时一次（同步）
+return M
+```
+
+| 回调 | 必需 | 可 yield | 说明 |
+|------|------|---------|------|
+| `Enter(args)` | 否 | 否 | 激活时一次 |
+| `Tick()` | **是** | **是** | 按 interval 周期，返回值写黑板 |
+| `Exit()` | 否 | 否 | 停用时一次 |
+
+黑板经 `blackboard` 模块（`bb.get`/`bb.set`）访问。
+
+### 生命周期与配合
+
+激活（节点进入活跃路径 root→…→leaf）→ 按 `interval` tick（可 yield）→ 停用（节点离开活跃路径且无其他活跃节点共享）。典型配合：传感器周期写 `bb.login_visible`，`BlackboardCondition` 每次 tick 前同步检查该键，满足则执行脚本、不满足则中止。
+
+## 完整示例
+
+```lua
+local bt = require('bt')
+
+local status, err = bt.run({
+    tree = {
+        type = 'Selector', name = 'ai_root',
+        decorators = {
+            { type = 'BlackboardCondition', key = 'alive', operator = 'is_set', abort = 'Self' },
+        },
+        children = {
+            { type = 'Subtree', subtree = 'combat' },
+            { type = 'Subtree', subtree = 'patrol' },
+            { type = 'Script', path = 'scripts/idle.lua', decorators = { { type = 'ForceSuccess' } } },
+        },
+    },
+    subtrees = {
+        combat = {
+            type = 'Sequence', name = 'combat',
+            decorators = { { type = 'BlackboardCondition', key = 'has_target', operator = 'is_set' } },
+            children = {
+                { type = 'Script', path = 'scripts/aim.lua', name = 'aim' },
+                { type = 'Script', path = 'scripts/attack.lua', name = 'attack' },
+            },
+        },
+        patrol = {
+            type = 'Sequence', name = 'patrol',
+            children = {
+                { type = 'Script', path = 'scripts/find_point.lua' },
+                { type = 'Script', path = 'scripts/move_to.lua' },
+            },
+        },
+    },
+})
+```

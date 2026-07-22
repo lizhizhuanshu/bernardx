@@ -48,22 +48,12 @@ my_project/               ← --dir 指向这里
 ├── src/
 │   ├── main.lua          # 默认入口脚本
 │   └── *.lua             # 其他模块
-├── libs/                 # 第三方 Lua 库（BT 也可 require 这些库）
-├── bt_project/           # 行为树项目（可选，通过 bt.run({project_path=...}) 指定）
-│   ├── trees/            #   行为树 JSON
-│   │   └── ai_main/      #     每个目录 = 一棵行为树
-│   │       ├── root.json
-│   │       ├── sensors.json    # 全局传感器定义（可选）
-│   │       └── subtrees/      # 子树目录（可选）
-│   ├── scripts/          #   脚本节点
-│   └── sensors/          #   传感器脚本
-└── ...
+├── libs/                 # 第三方 Lua 库
+├── scripts/              # BT Script 节点脚本（由 CodeProvider 加载）
+└── sensors/              # BT 传感器脚本（由 CodeProvider 加载）
 ```
 
-行为树项目可以放在任意目录下，通过 `bt.run({project_path = path, ...})` 指定。指定后：
-- 树目录路径相对于项目根目录解析
-- Script/Sensor 节点的脚本路径相对于项目根目录解析
-- BT 内的 `require()` 搜索项目目录 + 主项目的 `libs/`
+行为树结构在 `bt.run` 调用时以 Lua table 直接传入（`tree` / `subtrees` / `sensors`），不经文件或 JSON。Script 节点与传感器的 Lua 脚本仍由 `path` 指定，统一由运行时 `CodeProvider` 加载（与主脚本 `require()` 共用同一加载器）——请将 `scripts/`、`sensors/` 等脚本目录纳入 `CodeProvider` 搜索路径。详见 [行为树文档](bt.md)。
 
 ## 退出码
 

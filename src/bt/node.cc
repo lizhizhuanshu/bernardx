@@ -13,8 +13,7 @@ void Node::Reset() {
 void Node::OnAborted() {
 }
 
-async_simple::coro::Lazy<bool> Node::Init(lua_State* /*L*/, LuaRuntime* /*ctx*/,
-                                            const std::string& /*base_path*/) {
+async_simple::coro::Lazy<bool> Node::Init(lua_State* /*L*/, LuaRuntime* /*ctx*/) {
     co_return true;
 }
 

@@ -25,7 +25,6 @@ public:
 
     async_simple::coro::Lazy<bool> LoadScript(
         lua_State* L, LuaRuntime* ctx,
-        const std::string& base_path,
         const std::string& script_path,
         bool require_abort);
 

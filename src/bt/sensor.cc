@@ -12,8 +12,8 @@ ActiveSensor::~ActiveSensor() {
     Deactivate();
 }
 
-async_simple::coro::Lazy<bool> ActiveSensor::Init(lua_State* L, LuaRuntime* ctx, const std::string& base_path) {
-    if (!co_await host_.LoadScript(L, ctx, base_path, spec_.script_path, false)) {
+async_simple::coro::Lazy<bool> ActiveSensor::Init(lua_State* L, LuaRuntime* ctx) {
+    if (!co_await host_.LoadScript(L, ctx, spec_.script_path, false)) {
         co_return false;
     }
     co_return true;
