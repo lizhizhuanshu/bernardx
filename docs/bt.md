@@ -12,6 +12,63 @@ local bt = require('bt')
 | `bt.notify(event, data)` | 发送事件到事件队列（下个 tick 写入黑板 `_event_{name}`） |
 | `bt.get_status()` | 状态：`"idle"` / `"running"` / `"success"` / `"failure"` |
 
+## 核心机制一览
+
+先用一个微型示例把全部核心件一次串起来：**树拓扑**（`tree`，Lua table）描述结构、**Script**（叶子）用 `Tick` 返回状态驱动流转、**Sensor**（传感器）把感知结果写黑板、**BlackboardCondition**（装饰器）读黑板做条件门。
+
+场景：敌人进入 10 米内则攻击，否则巡逻。
+
+```lua
+local bt = require('bt')
+
+bt.run({
+    tree = {
+        type = 'Selector',                 -- ① 根节点（复合 OR）：依次尝试，首个成功即停
+        sensors = { 'enemy_dist' },        -- ② 传感器挂在根上 → 根总在活跃路径，传感器常驻
+        children = {
+            {   type = 'Script',           -- ④ 动作 A：攻击
+                path = 'scripts/attack.lua',
+                decorators = {             -- ③ 条件门：bb.enemy_dist < 10 才放行
+                    { type = 'BlackboardCondition', key = 'enemy_dist',
+                      operator = 'less_than', value = 10 },
+                },
+            },
+            { type = 'Script', path = 'scripts/patrol.lua' },  -- 动作 B：否则巡逻
+        },
+    },
+    sensors = {
+        enemy_dist = { interval = 100, path = 'sensors/enemy_dist.lua' },
+    },
+})
+```
+
+Sensor 脚本——`Tick` 返回值写入黑板：
+
+```lua
+-- sensors/enemy_dist.lua
+local M = {}
+function M:Tick()
+    return distance_to_nearest()           -- 数值 → bb.enemy_dist（每 100ms 刷新）
+end
+return M
+```
+
+Script 脚本——`Tick` 返回状态字符串驱动节点：
+
+```lua
+-- scripts/attack.lua
+local M = {}
+function M:Tick()
+    swing()
+    return "success"                       -- "success" / "failure" / "running"
+end
+return M
+```
+
+**每个 tick 的数据流**：① Sensor 测距 → 写 `bb.enemy_dist`；② Selector 试 `attack`，`BlackboardCondition` 读 `bb.enemy_dist`——`< 10` 放行 `attack`，否则**跳过** `attack`、落到 `patrol`。
+
+> **核心区别**：Script 与 Sensor 的脚本是**同一种 table 回调**（`return M` + `Enter/Tick/Exit` 冒号语法）。差别只在 `Tick` 的产出——**Script 返回状态字符串**（`"success"`/`"failure"`/`"running"`）控制树如何流转；**Sensor 返回任意值**写入黑板供条件读取。后续各节是对这些件的展开。
+
 ## bt.run(opts)
 
 一站式入口，依次完成：从 Lua table 构建 Node 树 → 初始化 Script → 初始化 Sensor → 激活初始路径 Sensor → 进入 tick 循环（直到完成、达到 `max_step` 或 `timeout`）。重复调用会先停止并清理之前的树。
@@ -236,30 +293,134 @@ bt.run({
 
 ### 脚本格式
 
-return table，冒号语法定义回调，`self` 存跨 tick 状态：
+脚本 return 一个 table，用冒号语法定义回调；`self` 就是这个 table，可自由存放跨 tick 的状态：
 
 ```lua
 -- sensors/element_visible.lua
 local M = {}
-function M:Enter(args) end                  -- 激活时一次（同步）
-function M:Tick()                           -- 必需，按 interval 周期调用（可 yield）
-  return find("#login-btn") ~= nil          -- 返回值 → bb[名字]
+function M:Enter(args) end                  -- 激活时一次（同步，不可 yield）
+function M:Tick()                           -- 必需，按 interval 周期调用（协程，可 yield）
+  return find("#login-btn") ~= nil          -- 第一个返回值 → bb[名字]
 end
-function M:Exit() end                       -- 停用时一次（同步）
+function M:Exit() end                       -- 停用时一次（同步，不可 yield）
 return M
 ```
 
 | 回调 | 必需 | 可 yield | 说明 |
 |------|------|---------|------|
-| `Enter(args)` | 否 | 否 | 激活时一次 |
-| `Tick()` | **是** | **是** | 按 interval 周期，返回值写黑板 |
+| `Enter(args)` | 否 | 否 | 激活时一次，`args` 为配置中的 `args` table |
+| `Tick()` | **是** | **是** | 按 interval 周期，第一个返回值写入黑板 |
 | `Exit()` | 否 | 否 | 停用时一次 |
 
-黑板经 `blackboard` 模块（`bb.get`/`bb.set`）访问。
+脚本里可用 `require('blackboard')` 直接读写黑板：`bb.get(key)` 取值、`bb.set(key, value)` 写值。
 
-### 生命周期与配合
+#### 示例 1：`self` 累计跨 tick 状态
 
-激活（节点进入活跃路径 root→…→leaf）→ 按 `interval` tick（可 yield）→ 停用（节点离开活跃路径且无其他活跃节点共享）。典型配合：传感器周期写 `bb.login_visible`，`BlackboardCondition` 每次 tick 前同步检查该键，满足则执行脚本、不满足则中止。
+`self` 在传感器存活期间持久存在，可缓存计数、上一次的结果等：
+
+```lua
+-- sensors/nearby_count.lua
+local M = {}
+function M:Enter()
+  self.count = 0                    -- 初始化（仅激活时一次）
+end
+function M:Tick()
+  self.count = (self.count or 0) + 1
+  return self.count                 -- → bb.nearby_count
+end
+return M
+```
+
+#### 示例 2：`blackboard` 模块 + Enter/Exit 生命周期
+
+常在 Enter/Exit 里打生命周期标记，供树中其它节点读取：
+
+```lua
+-- sensors/radar.lua
+local M = {}
+function M:Enter()
+  local bb = require('blackboard')
+  bb.set('radar_active', true)      -- 激活 → 置位
+end
+function M:Tick()
+  return detect_targets()           -- → bb.radar
+end
+function M:Exit()
+  local bb = require('blackboard')
+  bb.set('radar_active', false)     -- 停用 → 清位
+end
+return M
+```
+
+#### 示例 3：`args` 从配置传入 Enter
+
+配置里的 `args` 会原样作为参数传给 `Enter`：
+
+```lua
+-- bt.run 配置：
+--   sensors = { threat = { interval = 100, path = 'sensors/threat.lua',
+--                          args = { range = 50, faction = 'enemy' } } }
+local M = {}
+function M:Enter(args)
+  self.range   = args.range         -- 50
+  self.faction = args.faction       -- 'enemy'
+end
+function M:Tick()
+  return count_units(self.faction, self.range)   -- → bb.threat
+end
+return M
+```
+
+#### 异步 Tick
+
+`Tick` 运行在协程中，可 `coroutine.yield()` 等待异步操作（`http`、`async_io` 等）完成后再 return。这正是传感器适合"条件依赖异步数据"的原因——把慢查询挪出主 tick 路径、按 `interval` 刷新缓存值，`BlackboardCondition` 始终同步读取缓存。
+
+### 生命周期与 BlackboardCondition 配合
+
+激活（节点进入活跃路径 root→…→leaf）→ 按 `interval` tick（可 yield）→ 停用（节点离开活跃路径，且无其他活跃节点共享该传感器）。典型链路：传感器周期写黑板，`BlackboardCondition` 在每次 tick 树前同步读黑板、决定是否放行或中止。
+
+完整示例——附近有敌人时进攻。传感器返回**整数**数量，条件用比较运算符判断：
+
+```lua
+bt.run({
+    tree = {
+        type = 'Sequence', name = 'engage',
+        sensors = { 'nearby_enemies' },          -- 节点活跃时该传感器周期运行
+        children = {
+            { type = 'Script', path = 'scripts/attack.lua',
+              decorators = {
+                  { type = 'BlackboardCondition', key = 'nearby_enemies',
+                    operator = 'greater_than', value = 0, abort = 'Self' },
+              },
+            },
+        },
+    },
+    sensors = {
+        nearby_enemies = { interval = 100, path = 'sensors/nearby_enemies.lua' },
+    },
+})
+```
+
+```lua
+-- sensors/nearby_enemies.lua
+local M = {}
+function M:Tick()
+    return #scan_enemies()                       -- 整数数量 → bb.nearby_enemies
+end
+return M
+```
+
+工作流：① `engage` 进入活跃路径 → `nearby_enemies` 激活，每 100ms 把敌人数量写入 `bb.nearby_enemies`；② `BlackboardCondition` 每次 tick 前读该键，`> 0` 则放行 `attack.lua`、否则中止。
+
+> **`is_set` 的坑**：`is_set` 只判断键**是否存在**，不看值真假；而传感器 `Tick` 的返回值会**无条件**写入黑板（返回 `false` 也会把键置上）。所以布尔型条件不要用 `is_set` 配合返回 `true/false` 的传感器——条件一旦首次满足就会一直满足。正确写法二选一：
+> - **数值 + 比较运算符**（推荐，见上例）：`operator = 'greater_than', value = 0`
+> - **布尔 + `equals`**：`operator = 'equals', value = true`
+>
+> 若一定要用 `is_set`，可让传感器在不满足时显式 `return nil`——写 nil 会清除该键，`is_set` 随之变假。
+>
+> **数值类型要一致**：比较/相等运算符要求两侧类型相同（`int64` ↔ `int64` 或 `double` ↔ `double`），否则判定为 type mismatch 直接返回 false。即 `value` 写整数字面量（`0`、`30`）则传感器须返回整数；写小数（`30.0`）则须返回浮点。
+>
+> 可用运算符：`equals`、`not_equals`、`greater_than`、`less_than`、`greater_equal`、`less_equal`（后四个仅适用于数值）、`is_set`、`is_not_set`。比较/相等运算符通过 `value` 字段提供期望值。
 
 ## 完整示例
 
