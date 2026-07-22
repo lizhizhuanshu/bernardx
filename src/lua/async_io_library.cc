@@ -5,6 +5,7 @@ extern "C" {
 #include "lua.h"
 }
 
+#include "library_state.h"
 #include "lua_runtime.h"
 
 #include <asio.hpp>
@@ -26,39 +27,10 @@ extern "C" {
 
 namespace {
 
-int kAsyncStateRegistryKey = 0;
-constexpr const char* kAsyncStateMetatable = "async__state";
 constexpr const char* kFileMetatable = "async__file";
 constexpr const char* kProcessMetatable = "async__process";
 
-int async_state_gc(lua_State* L) {
-    auto* slot = static_cast<std::shared_ptr<AsyncIOState>*>(lua_touserdata(L, 1));
-    if (slot) {
-        slot->~shared_ptr<AsyncIOState>();
-    }
-    return 0;
-}
-
-void SetAsyncState(lua_State* L, std::shared_ptr<AsyncIOState> state) {
-    if (luaL_newmetatable(L, kAsyncStateMetatable)) {
-        lua_pushcfunction(L, async_state_gc);
-        lua_setfield(L, -2, "__gc");
-    }
-    lua_pop(L, 1);
-    auto* slot = static_cast<std::shared_ptr<AsyncIOState>*>(
-        lua_newuserdatauv(L, sizeof(std::shared_ptr<AsyncIOState>), 0));
-    new (slot) std::shared_ptr<AsyncIOState>(std::move(state));
-    luaL_setmetatable(L, kAsyncStateMetatable);
-    lua_rawsetp(L, LUA_REGISTRYINDEX, &kAsyncStateRegistryKey);
-}
-
-std::shared_ptr<AsyncIOState> GetAsyncState(lua_State* L) {
-    lua_rawgetp(L, LUA_REGISTRYINDEX, &kAsyncStateRegistryKey);
-    auto* slot = static_cast<std::shared_ptr<AsyncIOState>*>(lua_touserdata(L, -1));
-    auto state = slot ? *slot : nullptr;
-    lua_pop(L, 1);
-    return state;
-}
+LibraryState<AsyncIOState> g_async_state{"async__state"};
 
 // --- Handle types ---
 
@@ -561,7 +533,7 @@ static int async_open(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
     const char* mode = luaL_optstring(L, 2, "r");
 
-    auto state = GetAsyncState(L);
+    auto state = g_async_state.Get(L);
     if (!state || state->shutting_down.load()) {
         return luaL_error(L, "async library is shutting down");
     }
@@ -595,7 +567,7 @@ static int async_open(lua_State* L) {
 static int async_exec(lua_State* L) {
     const char* cmd = luaL_checkstring(L, 1);
 
-    auto state = GetAsyncState(L);
+    auto state = g_async_state.Get(L);
     if (!state || state->shutting_down.load()) {
         return luaL_error(L, "async library is shutting down");
     }
@@ -685,7 +657,7 @@ void AsyncIOLibrary::Open(lua_State* L) {
 
     auto state = std::shared_ptr<AsyncIOState>(
         new AsyncIOState{std::ref(ioc_), false});
-    SetAsyncState(L, state);
+    g_async_state.Set(L, std::move(state));
 
     lua_newtable(L);
     luaL_Reg funcs[] = {
@@ -698,7 +670,7 @@ void AsyncIOLibrary::Open(lua_State* L) {
 
 void AsyncIOLibrary::Close(lua_State* L) {
     if (!L) return;
-    auto state = GetAsyncState(L);
+    auto state = g_async_state.Get(L);
     if (!state || state->shutting_down.exchange(true)) return;
     // io_context lifecycle is managed externally — just set the flag
 }

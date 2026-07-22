@@ -5,6 +5,7 @@ extern "C" {
 #include "lua.h"
 }
 
+#include "library_state.h"
 #include "lua_runtime.h"
 
 #include <asio.hpp>
@@ -23,41 +24,7 @@ extern "C" {
 
 namespace {
 
-int kHttpStateRegistryKey = 0;
-constexpr const char* kHttpStateMetatable = "http__state";
-
-int http_state_gc(lua_State* L) {
-    auto* slot = static_cast<std::shared_ptr<HttpLibraryState>*>(lua_touserdata(L, 1));
-    if (slot) {
-        slot->~shared_ptr<HttpLibraryState>();
-    }
-    return 0;
-}
-
-void EnsureHttpStateMetatable(lua_State* L) {
-    if (luaL_newmetatable(L, kHttpStateMetatable)) {
-        lua_pushcfunction(L, http_state_gc);
-        lua_setfield(L, -2, "__gc");
-    }
-    lua_pop(L, 1);
-}
-
-void SetHttpState(lua_State* L, std::shared_ptr<HttpLibraryState> state) {
-    EnsureHttpStateMetatable(L);
-    auto* slot = static_cast<std::shared_ptr<HttpLibraryState>*>(
-        lua_newuserdatauv(L, sizeof(std::shared_ptr<HttpLibraryState>), 0));
-    new (slot) std::shared_ptr<HttpLibraryState>(std::move(state));
-    luaL_setmetatable(L, kHttpStateMetatable);
-    lua_rawsetp(L, LUA_REGISTRYINDEX, &kHttpStateRegistryKey);
-}
-
-std::shared_ptr<HttpLibraryState> GetHttpState(lua_State* L) {
-    lua_rawgetp(L, LUA_REGISTRYINDEX, &kHttpStateRegistryKey);
-    auto* slot = static_cast<std::shared_ptr<HttpLibraryState>*>(lua_touserdata(L, -1));
-    auto state = slot ? *slot : nullptr;
-    lua_pop(L, 1);
-    return state;
-}
+LibraryState<HttpLibraryState> g_http_state{"http__state"};
 
 static std::unordered_map<std::string, std::string> parse_headers(lua_State* L, int idx) {
     std::unordered_map<std::string, std::string> headers;
@@ -96,7 +63,7 @@ static int http_del(lua_State* L);
 
 template <typename F>
 static int http_request(lua_State* L, F&& make_lazy) {
-    auto state = GetHttpState(L);
+    auto state = g_http_state.Get(L);
     if (!state || state->shutting_down.load() || !state->exec) {
         return luaL_error(L, "http library is shutting down");
     }
@@ -249,7 +216,7 @@ static int ws_gc(lua_State* L) {
 // http.ws_create(url) -> ws
 static int ws_create(lua_State* L) {
     const char* url = luaL_checkstring(L, 1);
-    auto state = GetHttpState(L);
+    auto state = g_http_state.Get(L);
     if (!state || state->shutting_down.load() || !state->exec) {
         return luaL_error(L, "http library is shutting down");
     }
@@ -493,12 +460,12 @@ void HttpLibrary::Open(lua_State* L) {
     };
     auto state = std::make_shared<HttpLibraryState>();
     state->exec = &exec_;
-    SetHttpState(L, state);
+    g_http_state.Set(L, std::move(state));
     luaL_setfuncs(L, funcs, 0);
 }
 
 void HttpLibrary::Close(lua_State* L) {
     if (!L) return;
-    auto state = GetHttpState(L);
+    auto state = g_http_state.Get(L);
     if (!state || state->shutting_down.exchange(true)) return;
 }
