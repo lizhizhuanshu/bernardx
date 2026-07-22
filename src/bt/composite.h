@@ -13,6 +13,16 @@ extern "C" {
 #include "lua_runtime.h"
 #include "node.h"
 
+class ShuffledIndexTracker;  // defined in bt_utils.h; included only where needed
+
+// Sequential composite policy shared by Selector/Sequence (and their random
+// variants). Encodes the only two behaviours that differ between those nodes;
+// see Composite::TickSequential.
+enum class SeqPolicy {
+    Selector,  // succeed on first success, skip failures
+    Sequence,  // fail on first failure, skip successes
+};
+
 class Composite : public Node {
 public:
     void AddChild(std::unique_ptr<Node> child);
@@ -29,6 +39,11 @@ public:
 
 protected:
     Composite(uint32_t id, std::string type, std::string name);
+
+    // Shared tick loop for Selector/Sequence (and random variants). When
+    // `tracker` is non-null children are visited in its shuffled order.
+    NodeStatus TickSequential(Blackboard& bb, BtEventQueue& events,
+                              SeqPolicy policy, ShuffledIndexTracker* tracker = nullptr);
 
     std::vector<std::unique_ptr<Node>> children_;
     size_t current_child_index_ = 0;

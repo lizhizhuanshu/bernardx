@@ -1,36 +1,10 @@
 #include "random_selector.h"
 
-#include "blackboard.h"
-#include "bt_event_queue.h"
-#include "node.h"
-
 RandomSelector::RandomSelector(uint32_t id, std::string name)
     : Composite(id, "RandomSelector", std::move(name)) {}
 
 NodeStatus RandomSelector::Tick(Blackboard& bb, BtEventQueue& events) {
-    shuffled_tracker_.EnsureShuffled(children_.size());
-
-    const auto& order = shuffled_tracker_.order();
-    for (size_t i = current_child_index_; i < order.size(); ++i) {
-        auto& child = children_[order[i]];
-        if (!child->CheckDecorators(bb)) {
-            continue;
-        }
-        auto status = child->Tick(bb, events);
-        switch (status) {
-            case NodeStatus::kRunning:
-                current_child_index_ = i;
-                return NodeStatus::kRunning;
-            case NodeStatus::kSuccess:
-                current_child_index_ = 0;
-                return NodeStatus::kSuccess;
-            case NodeStatus::kFailure:
-                set_last_error(child->last_error());
-                continue;
-        }
-    }
-    current_child_index_ = 0;
-    return NodeStatus::kFailure;
+    return TickSequential(bb, events, SeqPolicy::Selector, &shuffled_tracker_);
 }
 
 void RandomSelector::Reset() {
