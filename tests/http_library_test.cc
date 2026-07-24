@@ -49,14 +49,34 @@ TEST_F(HttpLibraryTest, RequireReturnsTable) {
     )")).status, LUA_OK);
 }
 
-TEST_F(HttpLibraryTest, HasHttpFunctions) {
+TEST_F(HttpLibraryTest, HasRequestFunction) {
     EXPECT_EQ(AWAIT(rt->RunScript(R"(
         local http = require("http")
-        assert(type(http.get) == "function", "expected http.get")
-        assert(type(http.post) == "function", "expected http.post")
-        assert(type(http.put) == "function", "expected http.put")
-        assert(type(http.del) == "function", "expected http.del")
+        assert(type(http.request) == "function", "expected http.request")
         assert(type(http.ws_create) == "function", "expected http.ws_create")
+        -- verb shortcuts were removed in favor of http.request
+        assert(http.get == nil, "http.get should be removed")
+        assert(http.post == nil, "http.post should be removed")
+        assert(http.put == nil, "http.put should be removed")
+        assert(http.del == nil, "http.del should be removed")
+    )")).status, LUA_OK);
+}
+
+TEST_F(HttpLibraryTest, RequestRequiresUrl) {
+    auto r = AWAIT(rt->RunScript(R"(
+        local http = require("http")
+        http.request({})
+    )"));
+    EXPECT_NE(r.status, LUA_OK);
+}
+
+TEST_F(HttpLibraryTest, RequestDispatchesAllMethods) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local http = require("http")
+        for _, m in ipairs({"GET", "get", "POST", "PUT", "DELETE"}) do
+            local status, body, err = http.request({url = "http://127.0.0.1:1", method = m})
+            assert(err ~= nil, "expected error for method " .. m)
+        end
     )")).status, LUA_OK);
 }
 
@@ -98,13 +118,43 @@ TEST_F(HttpLibraryTest, WsInvalidPropertyErrors) {
     EXPECT_NE(r.status, LUA_OK);
 }
 
-TEST_F(HttpLibraryTest, HttpGetReturnsErrorForInvalidUrl) {
+TEST_F(HttpLibraryTest, HttpRequestReturnsErrorForInvalidUrl) {
     auto r = AWAIT(rt->RunScript(R"(
         local http = require("http")
-        local status, body, err = http.get("http://127.0.0.1:1")
+        local status, body, err = http.request({url = "http://127.0.0.1:1"})
         assert(err ~= nil, "expected error message for connection refused, got nil")
     )"));
     EXPECT_EQ(r.status, LUA_OK);
+}
+
+TEST_F(HttpLibraryTest, RequestHonorsTimeoutMs) {
+    // Blackhole server: accepts the connection but never responds, so the only
+    // way the request completes is via the req-timeout we set below.
+    asio::ip::tcp::acceptor acceptor(
+        ioc, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 0));
+    const auto port = acceptor.local_endpoint().port();
+    asio::ip::tcp::socket sink(ioc);
+    acceptor.async_accept(sink, [](const std::error_code&) {});
+
+    std::string script = R"(
+        local http = require("http")
+        local status, body, err = http.request({
+            url = "http://127.0.0.1:__PORT__/",
+            timeout = 100,
+        })
+        assert(err ~= nil, "expected timeout error")
+    )";
+    script.replace(script.find("__PORT__"), 8, std::to_string(port));
+
+    const auto start = std::chrono::steady_clock::now();
+    auto r = AWAIT(rt->RunScript(script));
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+
+    EXPECT_EQ(r.status, LUA_OK);
+    // Resolved by our 100ms timeout, not cinatra's 60s default.
+    EXPECT_LT(elapsed_ms, 5000);
 }
 
 TEST_F(HttpLibraryTest, RequireCached) {

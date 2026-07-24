@@ -14,6 +14,8 @@ extern "C" {
 #include <async_simple/coro/Lazy.h>
 
 #include <atomic>
+#include <cctype>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -52,17 +54,14 @@ static cinatra::req_content_type parse_content_type(const char* s) {
     return cinatra::req_content_type::none;
 }
 
-// --- HTTP Lua C functions ---
+// --- HTTP Lua C function ---
 
-static int http_get(lua_State* L);
-static int http_post(lua_State* L);
-static int http_put(lua_State* L);
-static int http_del(lua_State* L);
+static int http_request(lua_State* L);
 
 // --- Core HTTP request helper ---
 
 template <typename F>
-static int http_request(lua_State* L, F&& make_lazy) {
+static int do_request(lua_State* L, F&& make_lazy) {
     auto state = g_http_state.Get(L);
     if (!state || state->shutting_down.load() || !state->exec) {
         return luaL_error(L, "http library is shutting down");
@@ -101,53 +100,75 @@ static int http_request(lua_State* L, F&& make_lazy) {
     return rt->Yield(L);
 }
 
-static int http_get(lua_State* L) {
-    const char* url = luaL_checkstring(L, 1);
-    auto headers = parse_headers(L, 2);
-    return http_request(L, [url = std::string(url), headers = std::move(headers)](cinatra::coro_http_client& client) {
-        for (auto& [k, v] : headers) {
-            client.add_header(k, v);
-        }
-        return client.async_get(url);
-    });
+enum class HttpMethod { kGet, kPost, kPut, kDelete };
+
+// Case-insensitive method parsing; "GET" / nil / empty default to GET.
+static HttpMethod parse_method(const char* s) {
+    if (!s || !*s) return HttpMethod::kGet;
+    std::string m(s);
+    for (auto& c : m) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (m == "POST") return HttpMethod::kPost;
+    if (m == "PUT") return HttpMethod::kPut;
+    if (m == "DELETE") return HttpMethod::kDelete;
+    return HttpMethod::kGet;  // "GET" and any unrecognized value
 }
 
-static int http_post(lua_State* L) {
-    const char* url = luaL_checkstring(L, 1);
-    std::string body = lua_isstring(L, 2) ? lua_tostring(L, 2) : "";
-    const char* ct = lua_isstring(L, 3) ? lua_tostring(L, 3) : nullptr;
-    auto headers = parse_headers(L, 4);
-    auto content_type = parse_content_type(ct);
-    return http_request(L, [url = std::string(url), body = std::move(body), content_type, headers = std::move(headers)](cinatra::coro_http_client& client) mutable {
-        for (auto& [k, v] : headers) {
-            client.add_header(k, v);
-        }
-        return client.async_post(url, std::move(body), content_type);
-    });
-}
+// http.request({url=, method=, body=, headers=, content_type=}) -> status, body, err
+static int http_request(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
 
-static int http_put(lua_State* L) {
-    const char* url = luaL_checkstring(L, 1);
-    std::string body = lua_isstring(L, 2) ? lua_tostring(L, 2) : "";
-    const char* ct = lua_isstring(L, 3) ? lua_tostring(L, 3) : nullptr;
-    auto headers = parse_headers(L, 4);
-    auto content_type = parse_content_type(ct);
-    return http_request(L, [url = std::string(url), body = std::move(body), content_type, headers = std::move(headers)](cinatra::coro_http_client& client) mutable {
-        for (auto& [k, v] : headers) {
-            client.add_header(k, v);
-        }
-        return client.async_put(url, std::move(body), content_type);
-    });
-}
+    lua_getfield(L, 1, "url");
+    const char* url = lua_tostring(L, -1);
+    if (!url) {
+        return luaL_error(L, "http.request requires a string 'url'");
+    }
+    std::string url_str = url;
+    lua_pop(L, 1);
 
-static int http_del(lua_State* L) {
-    const char* url = luaL_checkstring(L, 1);
-    auto headers = parse_headers(L, 2);
-    return http_request(L, [url = std::string(url), headers = std::move(headers)](cinatra::coro_http_client& client) {
+    lua_getfield(L, 1, "method");
+    const char* method = lua_isstring(L, -1) ? lua_tostring(L, -1) : nullptr;
+    HttpMethod http_method = parse_method(method);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "body");
+    std::string body = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "content_type");
+    const char* ct = lua_isstring(L, -1) ? lua_tostring(L, -1) : nullptr;
+    cinatra::req_content_type content_type = parse_content_type(ct);
+    lua_pop(L, 1);
+
+    // timeout (optional, milliseconds; <= 0 leaves cinatra's 60s default)
+    lua_getfield(L, 1, "timeout");
+    int64_t timeout_ms = (lua_type(L, -1) == LUA_TNUMBER) ? lua_tointeger(L, -1) : 0;
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "headers");
+    int headers_idx = lua_absindex(L, -1);
+    auto headers = parse_headers(L, headers_idx);
+    lua_pop(L, 1);
+
+    return do_request(L, [url = std::move(url_str), body = std::move(body), content_type,
+                          headers = std::move(headers), http_method,
+                          timeout_ms](cinatra::coro_http_client& client) mutable {
+        if (timeout_ms > 0) {
+            client.set_req_timeout(std::chrono::milliseconds(timeout_ms));
+        }
         for (auto& [k, v] : headers) {
             client.add_header(k, v);
         }
-        return client.async_delete(url, "", cinatra::req_content_type::none);
+        switch (http_method) {
+            case HttpMethod::kPost:
+                return client.async_post(url, std::move(body), content_type);
+            case HttpMethod::kPut:
+                return client.async_put(url, std::move(body), content_type);
+            case HttpMethod::kDelete:
+                return client.async_delete(url, std::move(body), content_type);
+            case HttpMethod::kGet:
+            default:
+                return client.async_get(url);
+        }
     });
 }
 
@@ -451,10 +472,7 @@ void HttpLibrary::Open(lua_State* L) {
     // Create http table
     lua_newtable(L);
     luaL_Reg funcs[] = {
-        {"get", http_get},
-        {"post", http_post},
-        {"put", http_put},
-        {"del", http_del},
+        {"request", http_request},
         {"ws_create", ws_create},
         {nullptr, nullptr}
     };

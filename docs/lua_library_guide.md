@@ -355,7 +355,7 @@ static int obj_newindex(lua_State* L) {
 |------|------|------|
 | 类名 | PascalCase + Library 后缀 | `JsonLibrary`, `HttpLibrary` |
 | 模块名 | 小写单词 | `"json"`, `"http"`, `"bt"` |
-| C 函数 | `模块_方法` snake_case | `json_decode`, `http_get`, `bt_run` |
+| C 函数 | `模块_方法` snake_case | `json_decode`, `http_request`, `bt_run` |
 | Metatable | `模块__类型` | `"http__ws"`, `"http__state"` |
 | Registry Key | 文件作用域静态变量地址 | `static int kMyKey = 0; lua_rawsetp(L, LUA_REGISTRYINDEX, &kMyKey)` |
 | 文件名 | `模块_library.{h,cc}` | `json_library.h`, `http_library.cc` |

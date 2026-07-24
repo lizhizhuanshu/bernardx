@@ -198,7 +198,7 @@ return M
 | `Exit` | `self:Exit(reason)` | 否 | 否 | 离开活跃状态时 |
 | `Abort` | `self:Abort()` | 否 | 否 | 强制中止时（Exit 之前） |
 
-未返回 table 或缺 `Tick` → 加载失败，tick 时返回 Failure。**Tick 返回**：`"success"` / `"failure"`（进 Exit）/ `"running"`（保持活跃，下次 tick 直接 Tick，不再 Enter）；返回 nil 或无法识别的字符串视为 Failure。`Tick` 内可用所有异步 API（`sleep`/`await`/`http.get` 等），异步期间节点挂起 Running，完成后自动恢复。
+未返回 table 或缺 `Tick` → 加载失败，tick 时返回 Failure。**Tick 返回**：`"success"` / `"failure"`（进 Exit）/ `"running"`（保持活跃，下次 tick 直接 Tick，不再 Enter）；返回 nil 或无法识别的字符串视为 Failure。`Tick` 内可用所有异步 API（`sleep`/`await`/`http.request` 等），异步期间节点挂起 Running，完成后自动恢复。
 
 **生命周期**：首次 tick → `Enter(args)` → `Tick()` →（success/failure: `Exit(reason)` 完成 / running: 下次 tick 直接 `Tick()`）；被装饰器中止 → `Abort()` → `Exit("aborted")`；被重置 → `Exit("reset")`。
 

@@ -8,52 +8,41 @@ local http = require('http')
 
 ## HTTP 请求
 
-所有 HTTP 函数都是**协程异步**的——调用时会 yield 挂起，请求完成后自动恢复。
+`http.request` 是**协程异步**的——调用时会 yield 挂起，请求完成后自动恢复。
 
-统一返回值：`status, body, err`
+### http.request(options)
+
+发送一次 HTTP 请求，所有参数通过 `options` 表传入。
+
+```lua
+local status, body, err = http.request({
+    url = "https://example.com/api",
+    method = "POST",            -- 可选，默认 "GET"
+    body = '{"name":"test"}',   -- 可选，默认 ""
+    headers = {                 -- 可选
+        ["Authorization"] = "Bearer xxx",
+    },
+    content_type = "json",      -- 可选
+    timeout = 5000,             -- 可选，毫秒，不传或 <=0 用默认 60s
+})
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| url | string | 是 | 请求 URL |
+| method | string | 否 | HTTP 方法，大小写不敏感；支持 `"GET"` / `"POST"` / `"PUT"` / `"DELETE"`，默认 `"GET"`，未知值回退为 GET |
+| body | string | 否 | 请求体（默认 `""`） |
+| headers | table | 否 | 请求头 `{["Key"] = "Value"}` |
+| content_type | string | 否 | 内容类型（见下表） |
+| timeout | integer | 否 | 请求超时（毫秒），超时后返回 `err`；不传或 `<= 0` 时使用默认 60s |
+
+**返回值：** `status, body, err`
 
 | 返回值 | 类型 | 说明 |
 |--------|------|------|
 | status | integer | HTTP 状态码（200, 404 等），失败时为 0 |
 | body | string/nil | 响应体，失败时为 nil |
 | err | string/nil | 错误信息，成功时为 nil |
-
-### http.get(url [, headers])
-
-```lua
-local status, body, err = http.get("https://example.com/api")
-```
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| url | string | 是 | 请求 URL |
-| headers | table | 否 | 请求头 `{["Key"] = "Value"}` |
-
-### http.post(url, body [, content_type [, headers]])
-
-```lua
-local status, body, err = http.post(
-    "https://example.com/api",
-    '{"name":"test"}',
-    "json",
-    {["Authorization"] = "Bearer xxx"}
-)
-```
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| url | string | 是 | 请求 URL |
-| body | string | 否 | 请求体（默认 `""`） |
-| content_type | string | 否 | 内容类型（见下表） |
-| headers | table | 否 | 请求头 |
-
-### http.put(url, body [, content_type [, headers]])
-
-参数同 `http.post`，发送 HTTP PUT 请求。
-
-### http.del(url [, headers])
-
-参数同 `http.get`，发送 HTTP DELETE 请求。
 
 **content_type 可选值：**
 
@@ -73,7 +62,7 @@ local status, body, err = http.post(
 local http = require('http')
 
 -- GET 请求
-local status, body, err = http.get("https://httpbin.org/get")
+local status, body, err = http.request({url = "https://httpbin.org/get"})
 if err then
     print("error:", err)
 else
@@ -81,13 +70,21 @@ else
 end
 
 -- POST JSON
-local s, b, e = http.post("https://httpbin.org/post", '{"key":"value"}', "json")
+local s, b, e = http.request({
+    url = "https://httpbin.org/post",
+    method = "POST",
+    body = '{"key":"value"}',
+    content_type = "json",
+})
 print(s, b)
 
 -- 带自定义 header
-local s, b, e = http.get("https://api.example.com/data", {
-    ["Accept"] = "application/json",
-    ["X-Token"] = "abc123"
+local s, b, e = http.request({
+    url = "https://api.example.com/data",
+    headers = {
+        ["Accept"] = "application/json",
+        ["X-Token"] = "abc123",
+    },
 })
 ```
 
