@@ -469,18 +469,9 @@ local status, err = bt.run({
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `trace_paths` | `bool` | `true` | 是否采集路径数据。关闭后 `dump_paths()` 返回空 |
-| `print_paths` | `bool` | `false` | 树结束(成功/失败/超时)时自动把路径报告打印到日志 |
+| `trace_paths` | `bool` | `true` | 是否采集路径数据。关闭后 `dump_paths()` / `path_report()` 返回空 |
 
-采集默认开启(数据常备、事后可回溯);自动打印默认关闭(保持日志干净)。需要时显式 `print_paths = true`,或随时调 `bt.dump_paths()` 取数。
-
-```lua
-local status = bt.run({
-    tree = { ... },
-    max_step = 100, timeout = 5000,
-    print_paths = true,   -- 结束时自动打印报告
-})
-```
+采集默认开启(数据常备、事后可回溯)。报告**不自动打印** —— 通过下面的 API 自行获取字符串,由你决定何时打印 / 记录 / 上报。
 
 ### bt.dump_paths()
 
@@ -505,9 +496,20 @@ local p = bt.dump_paths()
 
 `paths[i].leaf_status` 是该路径末端叶子的返回分布;`root_status` 是整树返回分布(Repeat/Retry 会把叶子 success 改写成 running,两者分开看才不误导)。
 
+### bt.path_report()
+
+返回三视图报告的**字符串**(A 路径热度 + B 树形热力图 + C 切换时间线)。由你决定何时获取、如何输出:
+
+```lua
+bt.run({ tree = { ... }, max_step = 100 })   -- 采集(默认开)
+print(bt.path_report())                       -- 自行打印 / 写文件 / 发日志
+```
+
+末态(成功/失败/超时/异常)会自动标记,`bt.run` 结束后调 `path_report()` 即得完整末态报告;运行中也可随时调,取当时的中间快照。
+
 ### 报告三视图
 
-`print_paths = true` 时自动打印的报告分三段:
+`bt.path_report()` 返回的报告分三段:
 
 - **A 路径热度列表** —— 相同活跃路径合并计数、按次数降序,带 tick 区间、占比、叶子返回分布、末态标记。回答"卡在哪条路径、多久"。
 - **B 树形热力图** —— 每个节点被经过的 tick 数叠在树拓扑上,复合节点标 `[当前/总数]` 进度,`Parallel` 标 `∥parallel(N)`。回答"哪个分支是热点"。

@@ -1799,3 +1799,17 @@ TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
     EXPECT_EQ(std::get<int64_t>(r.values[0]), 0);  // not collected
     EXPECT_EQ(std::get<bool>(r.values[1]), false);
 }
+
+TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.run({tree={type='Wait', ms=999999}, max_step=2, interval=1})
+        local report = bt.path_report()
+        return type(report), #report > 0, string.find(report, '路径报告') ~= nil
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 3u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "string");
+    EXPECT_EQ(std::get<bool>(r.values[1]), true);
+    EXPECT_EQ(std::get<bool>(r.values[2]), true);  // contains report header
+}

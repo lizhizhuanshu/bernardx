@@ -41,13 +41,10 @@ static async_simple::coro::Lazy<void> RunTreeAsync(
     int max_step,
     int64_t timeout_ms,
     int64_t interval_ms,
-    bool trace_paths,
-    bool print_paths) {
-    auto finish = [&](NodeStatus s, const char* note) {
-        if (engine->generation() != expected_generation) return;
-        engine->path_tracer().MarkCurrentTerminal(s, note);
-        if (print_paths) {
-            spdlog::info("{}", engine->path_tracer().RenderReport());
+    bool trace_paths) {
+    auto mark_terminal = [&](NodeStatus s, const char* note) {
+        if (engine->generation() == expected_generation) {
+            engine->path_tracer().MarkCurrentTerminal(s, note);
         }
     };
     try {
@@ -81,14 +78,14 @@ static async_simple::coro::Lazy<void> RunTreeAsync(
             auto status = engine->TickOnce();
 
             if (status != NodeStatus::kRunning) {
-                finish(status, nullptr);
+                mark_terminal(status, nullptr);
                 rt->PushResume(handle, {std::string(NodeStatusToString(status))});
                 co_return;
             }
 
             steps++;
             if (max_step > 0 && steps >= max_step) {
-                finish(NodeStatus::kRunning, "timeout");
+                mark_terminal(NodeStatus::kRunning, "timeout");
                 engine->Stop();
                 rt->PushResume(handle, {std::string("timeout")});
                 co_return;
@@ -98,7 +95,7 @@ static async_simple::coro::Lazy<void> RunTreeAsync(
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - start_time).count();
                 if (elapsed >= timeout_ms) {
-                    finish(NodeStatus::kRunning, "timeout");
+                    mark_terminal(NodeStatus::kRunning, "timeout");
                     engine->Stop();
                     rt->PushResume(handle, {std::string("timeout")});
                     co_return;
@@ -111,7 +108,7 @@ static async_simple::coro::Lazy<void> RunTreeAsync(
             }
         }
     } catch (const std::exception& e) {
-        finish(NodeStatus::kRunning, "exception");
+        mark_terminal(NodeStatus::kRunning, "exception");
         rt->PushResume(handle, {nullptr, std::string(e.what())});
     }
 }
@@ -165,11 +162,6 @@ int bt_run(lua_State* L) {
     if (lua_isboolean(L, -1)) trace_paths = lua_toboolean(L, -1);
     lua_pop(L, 1);
 
-    bool print_paths = false;
-    lua_getfield(L, 1, "print_paths");
-    if (lua_isboolean(L, -1)) print_paths = lua_toboolean(L, -1);
-    lua_pop(L, 1);
-
     // Stop any previous tree
     engine->Stop();
 
@@ -203,7 +195,7 @@ int bt_run(lua_State* L) {
             std::move(parse_result.root),
             engine->generation(),
             max_step, timeout_ms, interval_ms,
-            trace_paths, print_paths)
+            trace_paths)
         .via(rt_ctx->executor())
         .detach();
 
@@ -229,6 +221,11 @@ int bt_dump_paths(lua_State* L) {
     return 1;
 }
 
+int bt_path_report(lua_State* L) {
+    lua_pushstring(L, GetEngine(L)->path_tracer().RenderReport().c_str());
+    return 1;
+}
+
 }  // namespace
 
 BehaviorTreeLibrary::BehaviorTreeLibrary(std::shared_ptr<Blackboard> bb)
@@ -248,6 +245,7 @@ void BehaviorTreeLibrary::Open(lua_State* L) {
         {"notify", bt_notify},
         {"get_status", bt_get_status},
         {"dump_paths", bt_dump_paths},
+        {"path_report", bt_path_report},
         {nullptr, nullptr}
     };
 
