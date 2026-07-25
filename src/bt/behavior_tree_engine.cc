@@ -7,8 +7,10 @@
 #include "bt_utils.h"
 #include "composite.h"
 #include "lua_runtime.h"
+#include "parallel.h"
 #include "single_child_node.h"
 #include "subtree_node.h"
+#include "time_utils.h"
 
 BehaviorTreeEngine::BehaviorTreeEngine(std::shared_ptr<Blackboard> bb)
     : blackboard_(bb ? std::move(bb) : std::make_shared<Blackboard>()) {}
@@ -22,6 +24,8 @@ void BehaviorTreeEngine::SetRoot(std::unique_ptr<Node> root) {
     root_ = std::move(root);
     event_queue_.Drain();
     last_status_ = NodeStatus::kRunning;
+    tracer_.SnapshotTopology(root_.get());
+    tracer_.Reset();
 }
 
 void BehaviorTreeEngine::Stop() {
@@ -30,6 +34,8 @@ void BehaviorTreeEngine::Stop() {
     event_queue_.Drain();
     ClearDecoratorState();
     last_status_ = NodeStatus::kRunning;
+    // NOTE: tracer data is intentionally preserved across Stop() so callers
+    // can still dump_paths() after a timeout/abort. The next SetRoot() rebuilds.
     generation_++;
 }
 
@@ -58,16 +64,30 @@ async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitScriptNodesAsync(l
 NodeStatus BehaviorTreeEngine::TickOnce() {
     if (!root_) return NodeStatus::kFailure;
 
+    tracer_.BeginTick();
+
     HandleEvents();
     TickSensors();
 
     EvaluateAllAbortMonitors();
 
     if (!EvaluateDecorators(root_.get())) {
+        // Root decorator gate blocked the tick — tree is effectively stuck.
+        // Still sample the (unchanged) active path so the report surfaces this.
+        std::vector<std::vector<Node*>> paths;
+        CollectActivePaths(root_.get(), paths);
+        tracer_.OnTickDone(paths, NodeStatus::kRunning, NowMs(), "root 装饰器阻塞");
+        last_status_ = NodeStatus::kRunning;
         return NodeStatus::kRunning;
     }
 
-    auto status = root_->Tick(*blackboard_, event_queue_);
+    auto status = root_->TickAndRecord(*blackboard_, event_queue_);
+
+    {
+        std::vector<std::vector<Node*>> paths;
+        CollectActivePaths(root_.get(), paths);
+        tracer_.OnTickDone(paths, status, NowMs(), nullptr);
+    }
 
     if (status == NodeStatus::kRunning) {
         UpdateActiveSensors();
@@ -104,8 +124,13 @@ bool BehaviorTreeEngine::EvaluateDecorators(Node* node) {
                     PropagateAbort(node, AbortMode::kLowerPriority);
                 }
             }
-            node_state[dec.get()] = now;
+            // Record the flip for the path-trace timeline, but skip the very
+            // first observation (no prior state) to avoid tick-0 spam.
+            if (it != node_state.end()) {
+                tracer_.OnDecoratorFlip(node, dec.get(), was, now);
+            }
         }
+        node_state[dec.get()] = now;  // always remember, so real flips are detected
 
         if (!now) {
             return false;
@@ -325,6 +350,67 @@ void BehaviorTreeEngine::CollectActiveNodes(Node* node, std::set<Node*>& out) {
     if (sub && sub->subtree_root()) {
         CollectActiveNodes(sub->subtree_root(), out);
     }
+}
+
+void BehaviorTreeEngine::CollectActivePaths(Node* node,
+                                            std::vector<std::vector<Node*>>& out) {
+    if (!node) return;
+
+    // Parallel: fan out to one chain per child (parallel semantics — every
+    // child is concurrently active).
+    if (auto* par = dynamic_cast<Parallel*>(node)) {
+        std::vector<std::vector<Node*>> child_paths;
+        for (const auto& child : par->children()) {
+            CollectActivePaths(child.get(), child_paths);
+        }
+        if (child_paths.empty()) {
+            out.push_back({node});
+        } else {
+            for (auto& cp : child_paths) {
+                cp.insert(cp.begin(), node);
+                out.push_back(std::move(cp));
+            }
+        }
+        return;
+    }
+
+    // Sequential composite (Selector/Sequence/Random*): the current child only.
+    if (auto* comp = dynamic_cast<Composite*>(node)) {
+        Node* cur = (comp->current_child_index() < comp->children().size())
+                        ? comp->children()[comp->current_child_index()].get()
+                        : nullptr;
+        if (cur) {
+            std::vector<std::vector<Node*>> sub;
+            CollectActivePaths(cur, sub);
+            for (auto& s : sub) {
+                s.insert(s.begin(), node);
+                out.push_back(std::move(s));
+            }
+        } else {
+            out.push_back({node});
+        }
+        return;
+    }
+
+    // SingleChild (Repeat/Retry/Subtree): its one child. SubtreeNode is a
+    // SingleChildNode whose child() is the subtree root, so subtrees unfold.
+    if (auto* single = dynamic_cast<SingleChildNode*>(node)) {
+        Node* cur = single->child();
+        if (cur) {
+            std::vector<std::vector<Node*>> sub;
+            CollectActivePaths(cur, sub);
+            for (auto& s : sub) {
+                s.insert(s.begin(), node);
+                out.push_back(std::move(s));
+            }
+        } else {
+            out.push_back({node});
+        }
+        return;
+    }
+
+    // Leaf.
+    out.push_back({node});
 }
 
 bool BehaviorTreeEngine::HasAbortLowerPriority(const Node* node) {

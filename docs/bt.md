@@ -458,3 +458,66 @@ local status, err = bt.run({
     },
 })
 ```
+
+## 路径记录 (path tracer)
+
+行为树每个 tick 记录**活跃路径**(root → 当前执行的叶子),相同路径合并计数。事后通过报告或 `bt.dump_paths()` 回溯"树走了哪条路、每条走了多久、何时为何切换",定位卡死或异常切换。
+
+`Parallel` 同时执行所有子节点,因此一个 tick 会产出**多条路径**(每个子节点一条);签名仍是单条 id 链,计数语义见下。
+
+### 开关
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `trace_paths` | `bool` | `true` | 是否采集路径数据。关闭后 `dump_paths()` 返回空 |
+| `print_paths` | `bool` | `false` | 树结束(成功/失败/超时)时自动把路径报告打印到日志 |
+
+采集默认开启(数据常备、事后可回溯);自动打印默认关闭(保持日志干净)。需要时显式 `print_paths = true`,或随时调 `bt.dump_paths()` 取数。
+
+```lua
+local status = bt.run({
+    tree = { ... },
+    max_step = 100, timeout = 5000,
+    print_paths = true,   -- 结束时自动打印报告
+})
+```
+
+### bt.dump_paths()
+
+返回一个 table,含本 run(自上次 `bt.run` 起)的全部路径数据:
+
+```lua
+local p = bt.dump_paths()
+-- p.total_ticks        总 tick 数
+-- p.path_occurrences   路径出现总次数 (无 Parallel = total_ticks;有 Parallel >= total_ticks)
+-- p.terminal           末态 status ("success"/"failure"/"running")
+-- p.has_terminal       是否到达末态 (timeout/exception 也算)
+-- p.terminal_note      末态备注 ("timeout"/"exception"/"root 装饰器阻塞" 或 nil)
+-- p.tracing            trace_paths 当前值
+-- p.paths = { { sig_ids={...}, names={...}, count=, first_tick=, last_tick=,
+--               leaf_id=, is_terminal=, leaf_status={success=,failure=,running=},
+--               root_status={success=,failure=,running=} }, ... }
+-- p.nodes  = { { id=, name=, type=, parent_id=, child_ids={...},
+--                decorators={...}, visits=, composite_progress= }, ... }
+-- p.switches = { { tick=, from={...}, to={...} }, ... }      -- 路径切换事件
+-- p.dec_flips = { { tick=, node_id=, node_name=, desc=, was=, now= }, ... }  -- 装饰器翻转
+```
+
+`paths[i].leaf_status` 是该路径末端叶子的返回分布;`root_status` 是整树返回分布(Repeat/Retry 会把叶子 success 改写成 running,两者分开看才不误导)。
+
+### 报告三视图
+
+`print_paths = true` 时自动打印的报告分三段:
+
+- **A 路径热度列表** —— 相同活跃路径合并计数、按次数降序,带 tick 区间、占比、叶子返回分布、末态标记。回答"卡在哪条路径、多久"。
+- **B 树形热力图** —— 每个节点被经过的 tick 数叠在树拓扑上,复合节点标 `[当前/总数]` 进度,`Parallel` 标 `∥parallel(N)`。回答"哪个分支是热点"。
+- **C 切换时间线** —— 路径切换事件按 tick 排列,关联触发切换的装饰器翻转。回答"行为何时、为何切换"。
+
+### 计数语义
+
+- 无 Parallel 的树:每个 tick 一条路径,`∑路径count = total_ticks`。
+- 有 Parallel 的树:Parallel 那个 tick 产出 N 条路径(N = 子节点数),`∑路径count = path_occurrences ≥ total_ticks`;A 列表占比分母用 `path_occurrences`。Parallel 下每个子节点独立成路径、各自计数 —— 卡死的并行分支无处遁形。
+
+### 末态与卡死定位
+
+`terminal` 反映树结束时的状态;`timeout`/`exception` 时 `terminal = "running"`、`has_terminal = true`,`terminal_note` 标明原因。`paths` 中 `is_terminal = true` 的路径就是树最终停留的那条 —— 排查卡死优先看它。若末态是"root 装饰器阻塞",说明根节点的装饰器条件一直不满足,树根本没进执行。

@@ -27,7 +27,7 @@ NodeStatus Composite::TickSequential(Blackboard& bb, BtEventQueue& events,
             continue;  // Selector: skip children whose decorators fail
         }
 
-        switch (child->Tick(bb, events)) {
+        switch (child->TickAndRecord(bb, events)) {
             case NodeStatus::kRunning:
                 current_child_index_ = i;
                 return NodeStatus::kRunning;

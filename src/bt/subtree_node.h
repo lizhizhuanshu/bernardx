@@ -26,7 +26,7 @@ public:
         if (!child_->CheckDecorators(bb)) {
             return NodeStatus::kFailure;
         }
-        auto status = child_->Tick(bb, events);
+        auto status = child_->TickAndRecord(bb, events);
         if (status == NodeStatus::kFailure && !child_->last_error().empty()) {
             set_last_error(child_->last_error());
         }

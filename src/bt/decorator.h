@@ -18,6 +18,10 @@ public:
 
     const std::string& type() const { return type_; }
 
+    // Human-readable summary for path-trace reports (e.g.
+    // "key=hp op=greater_than val=50"). Base returns the decorator type.
+    virtual std::string Describe() const { return type_; }
+
 protected:
     explicit Decorator(std::string type, AbortMode abort_mode = AbortMode::kNone)
         : type_(std::move(type)), abort_mode_(abort_mode) {}

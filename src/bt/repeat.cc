@@ -17,7 +17,7 @@ NodeStatus Repeat::Tick(Blackboard& bb, BtEventQueue& events) {
     }
 
     if (max_count_ == kInfinite) {
-        auto status = child_->Tick(bb, events);
+        auto status = child_->TickAndRecord(bb, events);
         if (status == NodeStatus::kFailure) {
             set_last_error(child_->last_error());
             return NodeStatus::kFailure;
@@ -33,7 +33,7 @@ NodeStatus Repeat::Tick(Blackboard& bb, BtEventQueue& events) {
         return NodeStatus::kSuccess;
     }
 
-    auto status = child_->Tick(bb, events);
+    auto status = child_->TickAndRecord(bb, events);
     if (status == NodeStatus::kRunning) {
         return NodeStatus::kRunning;
     }

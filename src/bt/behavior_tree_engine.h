@@ -15,6 +15,7 @@ extern "C" {
 #include "blackboard.h"
 #include "bt_event_queue.h"
 #include "node.h"
+#include "path_tracer.h"
 #include "sensor.h"
 #include "types.h"
 
@@ -55,6 +56,11 @@ public:
     // Generation counter — incremented on Stop(). Async init checks this to detect stale operations.
     uint64_t generation() const { return generation_; }
 
+    // Path tracing — records per-tick active paths for post-mortem reports.
+    PathTracer& path_tracer() { return tracer_; }
+    const PathTracer& path_tracer() const { return tracer_; }
+    void SetTracing(bool on) { tracer_.set_tracing(on); }
+
 private:
     using DecoratorState = std::unordered_map<Node*, std::unordered_map<Decorator*, bool>>;
 
@@ -70,6 +76,10 @@ private:
     void TickSensors();
     void UpdateActiveSensors();
     void CollectActiveNodes(Node* node, std::set<Node*>& out);
+    // Ordered, possibly multi-chain active path(s). Parallel fans out to one
+    // chain per child; other composites/single-child nodes follow their active
+    // child; leaves yield a single [self] chain.
+    void CollectActivePaths(Node* node, std::vector<std::vector<Node*>>& out);
     void CollectAbortMonitoringNodes(Node* node, std::set<Node*>& out);
     void ActivateNodeSensors(Node* node);
     void DeactivateNodeSensors(Node* node, const std::set<Node*>& still_active);
@@ -87,4 +97,6 @@ private:
     std::string last_error_;
     NodeStatus last_status_ = NodeStatus::kRunning;
     uint64_t generation_ = 0;
+
+    PathTracer tracer_;
 };

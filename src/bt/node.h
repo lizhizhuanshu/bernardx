@@ -24,6 +24,18 @@ public:
     virtual ~Node() = default;
 
     virtual NodeStatus Tick(Blackboard& bb, BtEventQueue& events) = 0;
+
+    // Non-virtual wrapper that records this node's own Tick() return into
+    // last_tick_status_ for path tracing. Internal parent→child invocations
+    // must use this (not Tick) so every node — including leaves — has its
+    // last status populated. The recorded value reflects the node's TRUE
+    // return: wrappers that rewrite status (Repeat/Retry) do so AFTER this
+    // returns, leaving the child's recorded value untouched.
+    NodeStatus TickAndRecord(Blackboard& bb, BtEventQueue& events) {
+        last_tick_status_ = Tick(bb, events);
+        return last_tick_status_;
+    }
+
     virtual void Reset();
     virtual void OnAborted();
 
@@ -42,6 +54,8 @@ public:
     const std::string& last_error() const { return last_error_; }
     void set_last_error(std::string err) { last_error_ = std::move(err); }
 
+    NodeStatus last_tick_status() const { return last_tick_status_; }
+
     void AddDecorator(std::unique_ptr<Decorator> dec);
 
     const std::vector<std::unique_ptr<Decorator>>& decorators() const { return decorators_; }
@@ -59,6 +73,7 @@ protected:
     std::string name_;
     std::string description_;
     std::string last_error_;
+    NodeStatus last_tick_status_ = NodeStatus::kRunning;
     std::vector<std::unique_ptr<Decorator>> decorators_;
     std::vector<SensorSpec> sensor_specs_;
 };

@@ -20,7 +20,7 @@ NodeStatus RetryUntilSuccessful::Tick(Blackboard& bb, BtEventQueue& events) {
         return NodeStatus::kRunning;
     }
 
-    auto status = child_->Tick(bb, events);
+    auto status = child_->TickAndRecord(bb, events);
     if (status == NodeStatus::kSuccess) {
         return NodeStatus::kSuccess;
     }

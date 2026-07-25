@@ -1,8 +1,34 @@
 #include "blackboard_condition.h"
 
+#include <cstddef>
+#include <string>
+
 #include <spdlog/spdlog.h>
 
 #include "blackboard.h"
+
+namespace {
+std::string LuaValueToString(const LuaValue& v) {
+    return std::visit(
+        [](const auto& x) -> std::string {
+            using T = std::decay_t<decltype(x)>;
+            if constexpr (std::is_same_v<T, std::nullptr_t>) {
+                return "nil";
+            } else if constexpr (std::is_same_v<T, bool>) {
+                return x ? "true" : "false";
+            } else if constexpr (std::is_same_v<T, int64_t>) {
+                return std::to_string(x);
+            } else if constexpr (std::is_same_v<T, double>) {
+                return std::to_string(x);
+            } else if constexpr (std::is_same_v<T, std::string>) {
+                return "\"" + x + "\"";
+            } else {
+                return "<ref>";
+            }
+        },
+        v);
+}
+}  // namespace
 
 BlackboardCondition::BlackboardCondition(std::string key, std::string op,
                                          std::optional<LuaValue> expected,
@@ -11,6 +37,14 @@ BlackboardCondition::BlackboardCondition(std::string key, std::string op,
       key_(std::move(key)),
       op_(std::move(op)),
       expected_(std::move(expected)) {}
+
+std::string BlackboardCondition::Describe() const {
+    std::string s = "key=" + key_ + " op=" + op_;
+    if (expected_.has_value()) {
+        s += " val=" + LuaValueToString(*expected_);
+    }
+    return s;
+}
 
 bool BlackboardCondition::Evaluate(Blackboard& bb) {
     if (op_ == "is_set") {

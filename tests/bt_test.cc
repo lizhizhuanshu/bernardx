@@ -1674,3 +1674,128 @@ TEST_F(AbortPropagationTest, LowerPriorityAbortPreemptsSibling) {
     // now passes (flag set) → no_args succeeds → Selector succeeds
     EXPECT_EQ(*s, "success");
 }
+
+// --- PathTracer Tests ---
+
+TEST(PathTracerTest, SinglePathCount) {
+    BehaviorTreeEngine engine;
+    auto leaf = std::make_unique<MockNode>(2, "leaf", NodeStatus::kRunning);
+    auto seq = std::make_unique<Sequence>(1, "seq");
+    seq->AddChild(std::move(leaf));
+    engine.SetRoot(std::move(seq));
+    for (int i = 0; i < 5; ++i) engine.TickOnce();
+
+    auto& tr = engine.path_tracer();
+    EXPECT_EQ(tr.tick_count(), 5u);
+    EXPECT_EQ(tr.path_count(), 1u);
+    EXPECT_EQ(tr.count_for({1, 2}), 5u);
+    EXPECT_EQ(tr.visits(1), 5);
+    EXPECT_EQ(tr.visits(2), 5);
+}
+
+TEST(PathTracerTest, RepeatLeafStatusIndependent) {
+    // Repeat wraps a success leaf; the leaf records success each tick, but
+    // Repeat rewrites its own return to running. Path stats must show BOTH.
+    BehaviorTreeEngine engine;
+    auto leaf = std::make_unique<MockNode>(2, "leaf", NodeStatus::kSuccess);
+    auto rep = std::make_unique<Repeat>(1, "rep", -1, std::move(leaf));
+    engine.SetRoot(std::move(rep));
+    for (int i = 0; i < 3; ++i) engine.TickOnce();
+
+    auto& tr = engine.path_tracer();
+    EXPECT_EQ(tr.count_for({1, 2}), 3u);
+    EXPECT_EQ(tr.leaf_status_count({1, 2}, NodeStatus::kSuccess), 3);
+    EXPECT_EQ(tr.root_status_count({1, 2}, NodeStatus::kRunning), 3);
+    EXPECT_EQ(tr.root_status_count({1, 2}, NodeStatus::kSuccess), 0);
+}
+
+TEST(PathTracerTest, ParallelFansOutMultiplePaths) {
+    BehaviorTreeEngine engine;
+    auto a = std::make_unique<MockNode>(2, "a", NodeStatus::kRunning);
+    auto b = std::make_unique<MockNode>(3, "b", NodeStatus::kRunning);
+    auto par = std::make_unique<Parallel>(1, "par");
+    par->AddChild(std::move(a));
+    par->AddChild(std::move(b));
+    engine.SetRoot(std::move(par));
+    for (int i = 0; i < 4; ++i) engine.TickOnce();
+
+    auto& tr = engine.path_tracer();
+    EXPECT_EQ(tr.tick_count(), 4u);
+    EXPECT_EQ(tr.path_count(), 2u);
+    EXPECT_EQ(tr.count_for({1, 2}), 4u);
+    EXPECT_EQ(tr.count_for({1, 3}), 4u);
+    EXPECT_EQ(tr.path_occurrences(), 8u);  // 2 paths × 4 ticks
+    EXPECT_EQ(tr.visits(1), 4);            // Parallel deduped per tick
+    EXPECT_EQ(tr.visits(2), 4);
+    EXPECT_EQ(tr.visits(3), 4);
+}
+
+TEST(PathTracerTest, ResetBetweenRuns) {
+    BehaviorTreeEngine engine;
+    engine.SetRoot(std::make_unique<MockNode>(1, "a", NodeStatus::kRunning));
+    engine.TickOnce();
+    EXPECT_EQ(engine.path_tracer().count_for({1}), 1u);
+    // New run: parser ids restart at 1 — data must not leak across runs.
+    engine.SetRoot(std::make_unique<MockNode>(1, "b", NodeStatus::kRunning));
+    engine.TickOnce();
+    auto& tr = engine.path_tracer();
+    EXPECT_EQ(tr.path_count(), 1u);
+    EXPECT_EQ(tr.count_for({1}), 1u);
+}
+
+TEST(PathTracerTest, RootDecoratorBlockedStillSampled) {
+    BehaviorTreeEngine engine;
+    auto leaf = std::make_unique<MockNode>(2, "leaf", NodeStatus::kSuccess);
+    auto root = std::make_unique<Sequence>(1, "root");
+    root->AddChild(std::move(leaf));
+    root->AddDecorator(std::make_unique<BlackboardCondition>("gate", "is_set"));
+    engine.SetRoot(std::move(root));
+    engine.TickOnce();  // gate absent → root blocked
+
+    auto& tr = engine.path_tracer();
+    EXPECT_EQ(tr.tick_count(), 1u);
+    EXPECT_EQ(tr.count_for({1, 2}), 1u);  // path still sampled
+}
+
+TEST(PathTracerTest, DecoratorFlipRecorded) {
+    BehaviorTreeEngine engine;
+    auto leaf = std::make_unique<MockNode>(2, "leaf", NodeStatus::kSuccess);
+    auto root = std::make_unique<Sequence>(1, "root");
+    root->AddChild(std::move(leaf));
+    root->AddDecorator(std::make_unique<BlackboardCondition>("gate", "is_set"));
+    engine.SetRoot(std::move(root));
+    engine.TickOnce();  // gate absent, dec first seen false (no flip)
+    EXPECT_EQ(engine.path_tracer().dec_flip_count(), 0u);
+    engine.blackboard().Set("gate", LuaValue(static_cast<int64_t>(1)));
+    engine.TickOnce();  // gate set → dec flips false→true
+    EXPECT_EQ(engine.path_tracer().dec_flip_count(), 1u);
+}
+
+TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.run({tree={type='Wait', ms=999999}, max_step=3, interval=1})
+        local p = bt.dump_paths()
+        return p.total_ticks, p.path_occurrences, #p.paths, p.terminal, p.has_terminal
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 5u);
+    EXPECT_EQ(std::get<int64_t>(r.values[0]), 3);              // total_ticks
+    EXPECT_EQ(std::get<int64_t>(r.values[1]), 3);              // path_occurrences (no Parallel)
+    EXPECT_EQ(std::get<int64_t>(r.values[2]), 1);              // 1 path (Wait)
+    EXPECT_EQ(std::get<std::string>(r.values[3]), "running");  // terminal
+    EXPECT_EQ(std::get<bool>(r.values[4]), true);              // has_terminal (timeout)
+}
+
+TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.run({tree={type='Wait', ms=999999}, max_step=3, interval=1, trace_paths=false})
+        local p = bt.dump_paths()
+        return p.total_ticks, p.tracing
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_EQ(std::get<int64_t>(r.values[0]), 0);  // not collected
+    EXPECT_EQ(std::get<bool>(r.values[1]), false);
+}

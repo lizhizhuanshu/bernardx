@@ -13,6 +13,10 @@ public:
                         AbortMode abort_mode = AbortMode::kNone);
 
     bool Evaluate(Blackboard& bb) override;
+    std::string Describe() const override;
+
+    const std::string& key() const { return key_; }
+    const std::string& op() const { return op_; }
 
 private:
     bool EvaluateOp(const LuaValue& actual) const;

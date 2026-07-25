@@ -22,7 +22,7 @@ NodeStatus Parallel::Tick(Blackboard& bb, BtEventQueue& events) {
             ++failure_count;
             continue;
         }
-        auto status = child->Tick(bb, events);
+        auto status = child->TickAndRecord(bb, events);
         switch (status) {
             case NodeStatus::kSuccess:
                 ++success_count;
