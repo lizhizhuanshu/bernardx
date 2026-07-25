@@ -205,10 +205,6 @@ int bt_exec(lua_State* L) {
     luaL_checktype(L, 1, LUA_TTABLE);
 
     auto st = engine->state();
-    if (st == BehaviorTreeEngine::BtState::kRunning) {
-        lua_pushstring(L, "running");  // no-op: already running
-        return 1;
-    }
     if (st != BehaviorTreeEngine::BtState::kReady &&
         st != BehaviorTreeEngine::BtState::kPaused) {
         lua_pushnil(L);
@@ -239,16 +235,17 @@ int bt_exec(lua_State* L) {
     auto rt_ctx = LuaRuntime::FromLuaState(L);
     if (!rt_ctx) { lua_pushnil(L); lua_pushstring(L, "no LuaRuntime"); return 2; }
 
+    // exec blocks (yields) until the run finishes; the RunLoop resumes us with
+    // the status. pause/resume is host-level (network) and applies during.
     engine->ClearOutcome();
-    engine->clear_await_handle();
     engine->set_state(BehaviorTreeEngine::BtState::kRunning);
+    AsyncHandle handle = rt_ctx->PreYield(L);
+    engine->set_await_handle(handle);
     uint64_t gen = engine->generation();
     RunLoop(rt_ctx, engine->shared_from_this(), gen, max_step, timeout_ms, interval_ms)
         .via(rt_ctx->executor())
         .detach();
-
-    lua_pushstring(L, "running");
-    return 1;  // non-blocking: caller may now pause/resume/dump/await
+    return lua_yield(L, 0);
 }
 
 int bt_goto_path(lua_State* L) {
@@ -290,35 +287,6 @@ int bt_stop(lua_State* L) {
     engine->Stop();
     engine->set_state(BehaviorTreeEngine::BtState::kIdle);
     return 0;
-}
-
-int bt_await(lua_State* L) {
-    auto* engine = GetEngine(L);
-    auto rt_ctx = LuaRuntime::FromLuaState(L);
-    if (!rt_ctx) { lua_pushnil(L); lua_pushstring(L, "no LuaRuntime"); return 2; }
-
-    if (engine->last_outcome().done) {
-        const auto& o = engine->last_outcome();
-        if (o.error.empty()) { lua_pushstring(L, o.status.c_str()); return 1; }
-        lua_pushnil(L);
-        lua_pushstring(L, o.error.c_str());
-        return 2;
-    }
-    if (engine->has_await_handle()) {
-        lua_pushnil(L);
-        lua_pushstring(L, "already awaiting");
-        return 2;
-    }
-    auto st = engine->state();
-    if (st != BehaviorTreeEngine::BtState::kRunning &&
-        st != BehaviorTreeEngine::BtState::kPaused) {
-        lua_pushnil(L);
-        lua_pushstring(L, "nothing running");
-        return 2;
-    }
-    AsyncHandle h = rt_ctx->PreYield(L);
-    engine->set_await_handle(h);
-    return lua_yield(L, 0);
 }
 
 int bt_notify(lua_State* L) {
@@ -364,7 +332,6 @@ void BehaviorTreeLibrary::Open(lua_State* L) {
         {"exec", bt_exec},
         {"goto_path", bt_goto_path},
         {"stop", bt_stop},
-        {"await", bt_await},
         {"notify", bt_notify},
         {"get_status", bt_get_status},
         {"dump_paths", bt_dump_paths},

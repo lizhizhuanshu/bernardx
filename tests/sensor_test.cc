@@ -71,8 +71,7 @@ TEST_F(SensorActivationTest, SensorOnActivePathIsActivated) {
             },
             sensors = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -99,8 +98,7 @@ TEST_F(SensorActivationTest, SensorOnInactiveBranchNotActivated) {
             },
             sensors = { sensor_b = {path = 'sensors/tracking_b.lua', interval = 50} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -126,8 +124,7 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenBranchLeavesActivePath) {
             },
             sensors = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -161,8 +158,7 @@ TEST_F(SensorActivationTest, BothBranchesActivatedSequentially) {
                 sensor_b = {path = 'sensors/tracking_b.lua', interval = 50},
             },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -185,8 +181,7 @@ TEST_F(SensorActivationTest, AllSensorsDeactivatedWhenTreeCompletes) {
             },
             sensors = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -220,8 +215,7 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenAnotherSelectorBranchTakesOver
                 sensor_b = {path = 'sensors/tracking_b.lua', interval = 50},
             },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -254,8 +248,7 @@ TEST_F(AbortSensorTest, LowerPriorityKeepsSensorActive) {
             },
             sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -283,8 +276,7 @@ TEST_F(AbortSensorTest, NoAbortDeactivatesSensor) {
             },
             sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -312,8 +304,7 @@ TEST_F(AbortSensorTest, BothKeepsSensorActive) {
             },
             sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -341,8 +332,7 @@ TEST_F(AbortSensorTest, SelfAbortDeactivatesSensor) {
             },
             sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -367,8 +357,7 @@ TEST_F(AbortSensorTest, NoDecoratorDeactivatesSensor) {
             },
             sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -396,8 +385,7 @@ TEST_F(AbortSensorTest, SecondSensorWithAbortAlsoMonitored) {
             },
             sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -454,8 +442,7 @@ TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
                 sensor_c = {path = 'sensors/counting_c.lua', interval = 10},
             },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -500,8 +487,7 @@ TEST_F(DeepSensorTest, FiveLevelAbortMonitoringAcrossDepths) {
             },
             sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -541,8 +527,7 @@ TEST_F(DeepSensorTest, FiveLevelNoAbortSensorDeactivatedAtDepth) {
             },
             sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -610,8 +595,7 @@ TEST_F(DeepSensorTest, FiveLevelMultipleAbortSensorsAtDifferentDepths) {
                 sensor_c = {path = 'sensors/counting_c.lua', interval = 10},
             },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -635,8 +619,7 @@ TEST_F(SensorInitTest, SensorWithBasicScript) {
             },
             sensors = { hp = {path = 'sensors/basic.lua', interval = 50} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -656,8 +639,7 @@ TEST_F(SensorInitTest, SensorWithAsyncRequire) {
             },
             sensors = { data = {path = 'sensors/with_require.lua', interval = 50} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -721,8 +703,7 @@ TEST_F(SensorInitTest, SensorOnCompositeNode) {
             },
             sensors = { hp = {path = 'sensors/basic.lua', interval = 50} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -745,8 +726,7 @@ TEST_F(SensorInitTest, MultipleSensorsOnTree) {
                 data = {path = 'sensors/with_require.lua', interval = 100},
             },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));
@@ -766,8 +746,7 @@ TEST_F(SensorInitTest, SensorFullLifecycle) {
             },
             sensors = { full = {path = 'sensors/full_lifecycle.lua', interval = 50} },
         })
-        bt.exec({interval = 10})
-        local status, err = bt.await()
+        local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
     )"));

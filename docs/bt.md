@@ -9,8 +9,7 @@ local bt = require('bt')
 | 函数 | 说明 |
 |------|------|
 | `bt.ready(opts)` | 构建树 + 初始化脚本/传感器 + 激活（协程 yield，完成后恢复）。返回 `"ready"` 或 `nil, err` |
-| `bt.exec(opts)` | 启动后台 tick 循环（按 `interval`），**立即返回** `"running"`（不阻塞），可随后暂停/`dump_paths`/`await` |
-| `bt.await()` | 阻塞等待本次 run 结束；返回 `"success"`/`"failure"`/`"timeout"`/`"stopped"` 或 `nil, err` |
+| `bt.exec(opts)` | 启动后台 tick 并**阻塞**到本次 run 结束（协程 yield）；返回 `"success"`/`"failure"`/`"timeout"`/`"stopped"` 或 `nil, err`。期间可被宿主暂停/恢复 |
 | `bt.goto_path(names)` | 跳到指定节点名路径（如 `{"combat","attack"}`），重置树让叶子重新 Enter |
 | `bt.stop()` | 停止并清理当前树 |
 | `bt.notify(event, data)` | 发送事件到事件队列（下个 tick 写入黑板 `_event_{name}`） |
@@ -47,8 +46,7 @@ bt.ready({
         enemy_dist = { interval = 100, path = 'sensors/enemy_dist.lua' },
     },
 })
-bt.exec({ interval = 100 })                -- 后台 tick；可随时暂停（宿主）/dump_paths
-local status = bt.await()                  -- 阻塞等完成（或超时）
+local status = bt.exec({ interval = 100 }) -- 阻塞到完成/超时；期间可被宿主暂停/恢复
 ```
 
 Sensor 脚本——`Tick` 返回值写入黑板：
@@ -78,9 +76,9 @@ return M
 
 > **核心区别**：Script 与 Sensor 的脚本是**同一种 table 回调**（`return M` + `Enter/Tick/Exit` 冒号语法）。差别只在 `Tick` 的产出——**Script 返回状态字符串**（`"success"`/`"failure"`/`"running"`）控制树如何流转；**Sensor 返回任意值**写入黑板供条件读取。后续各节是对这些件的展开。
 
-## 生命周期 API（ready / exec / await / goto_path / stop）
+## 生命周期 API（ready / exec / goto_path / stop）
 
-行为树采用**分离的生命周期**：`ready` 构建+初始化（协程 yield），`exec` 启动后台 tick（非阻塞），`await` 阻塞等结束。暂停/恢复由宿主控制（见下）。
+行为树采用**分离的生命周期**：`ready` 构建+初始化（协程 yield），`exec` 启动后台 tick 并**阻塞到结束**（返回 status）。暂停/恢复由宿主控制（见下）。
 
 状态机：`idle → ready → running ↔ paused → success/failure →（stop）idle`。
 
@@ -99,7 +97,7 @@ return M
 
 ### bt.exec(opts)
 
-启动后台 tick 循环（按 `interval` 间隔），**立即返回** `"running"`（不阻塞 Lua）；调用方可随后暂停/恢复（宿主）、`dump_paths`、`path_report`、`await`。
+启动后台 tick 循环（按 `interval` 间隔）并**阻塞**（协程 yield）到本次 run 结束，返回 `"success"` / `"failure"` / `"timeout"` / `"stopped"`，或 `nil, err`。阻塞期间可被宿主暂停/恢复；`dump_paths` / `path_report` 在 `exec` 返回后调用。
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -107,11 +105,7 @@ return M
 | `max_step` | `integer` | 否 | 最大 tick 步数，未设置则无限 |
 | `timeout` | `integer` | 否 | 超时（毫秒），未设置则不超时 |
 
-已 running 时再 `exec` 是 no-op（返回 `"running"`）。从 `success`/`failure` 再 `exec` 报错（重新 `ready`）。
-
-### bt.await()
-
-阻塞等待本次 run 结束，返回 `"success"` / `"failure"` / `"timeout"` / `"stopped"`，或 `nil, err`。若 run 已结束，立即返回结果（不 yield）。
+从 `success`/`failure` 再 `exec` 报错（重新 `ready`）。`ready`/`paused` 之外的状态调 `exec` 均报错。
 
 ### 暂停 / 恢复（宿主级）
 
@@ -123,7 +117,7 @@ return M
 
 ### bt.stop()
 
-停止并清理当前树（`get_status()` → `"idle"`）。若 `await` 在等待会以 `"stopped"` 恢复。
+停止并清理当前树（`get_status()` → `"idle"`）。若 `exec` 正阻塞会以 `"stopped"` 恢复。
 
 ### 典型用法
 
@@ -137,9 +131,8 @@ bt.ready({
     sensors = { hp = { interval = 100, path = 'sensors/hp.lua' } },
     trace_paths = true,
 })
-bt.exec({ interval = 100, max_step = 1000, timeout = 5000 })
--- 此处可：宿主 pause/resume；bt.dump_paths() 看中间快照；bt.goto_path({...})（需先暂停）
-local status, err = bt.await()
+local status, err = bt.exec({ interval = 100, max_step = 1000, timeout = 5000 })
+-- 阻塞期间：宿主可 pause/resume。exec 返回后：bt.path_report()/bt.dump_paths()
 if not status then error("bt failed: " .. err)
 elseif status == "timeout" then print("timed out")
 else print("finished:", status) end
@@ -444,7 +437,6 @@ bt.ready({
     },
 })
 bt.exec({ interval = 100 })
-bt.await()
 ```
 
 ```lua
@@ -503,8 +495,7 @@ bt.ready({
         },
     },
 })
-bt.exec({ interval = 100 })
-local status, err = bt.await()
+local status, err = bt.exec({ interval = 100 })
 ```
 
 ## 路径记录 (path tracer)
@@ -551,11 +542,10 @@ local p = bt.dump_paths()
 ```lua
 bt.ready({ tree = { ... } })                  -- 采集(默认开)
 bt.exec({ interval = 10, max_step = 100 })
-bt.await()
 print(bt.path_report())                       -- 自行打印 / 写文件 / 发日志
 ```
 
-末态(成功/失败/超时/异常)会自动标记,`bt.await()` 返回后调 `path_report()` 即得完整末态报告;运行中也可随时调,取当时的中间快照。
+末态(成功/失败/超时/异常)会自动标记,`bt.exec()` 返回后调 `path_report()` 即得完整末态报告。
 
 ### 报告三视图
 
