@@ -538,9 +538,15 @@ TEST_F(BehaviorTreeLibraryTest, RequireReturnsTable) {
 TEST_F(BehaviorTreeLibraryTest, HasAllFunctions) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        return type(bt.run) == 'function'
+        return type(bt.ready) == 'function'
+            and type(bt.exec) == 'function'
+            and type(bt.goto_path) == 'function'
+            and type(bt.stop) == 'function'
+            and type(bt.await) == 'function'
             and type(bt.notify) == 'function'
             and type(bt.get_status) == 'function'
+            and type(bt.dump_paths) == 'function'
+            and type(bt.path_report) == 'function'
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 1u);
@@ -563,7 +569,7 @@ TEST_F(BehaviorTreeLibraryTest, RunInvalidJson) {
     // New API has no JSON string; missing the required `tree` table yields an error.
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({})
+        local status, err = bt.ready({})
         return status, err or 'nil'
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -577,7 +583,7 @@ TEST_F(BehaviorTreeLibraryTest, RunInvalidJsonReturnsSpecificError) {
     // A Script node with no path is rejected during parsing.
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({tree = {type = 'Script'}})
+        local status, err = bt.ready({tree = {type = 'Script'}})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -590,7 +596,7 @@ TEST_F(BehaviorTreeLibraryTest, RunInvalidJsonReturnsSpecificError) {
 TEST_F(BehaviorTreeLibraryTest, RunUnknownNodeType) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({tree = {type = 'UnknownType'}})
+        local status, err = bt.ready({tree = {type = 'UnknownType'}})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -629,10 +635,10 @@ TEST_F(BehaviorTreeLibraryTest, GetBlackboardAsTable) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, RunLoadAndTick) {
-    // x.lua does not exist → script init fails → bt.run returns nil + error.
+    // x.lua does not exist → script init fails → bt.ready returns nil + error.
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
+        local status, err = bt.ready({
             tree = {type = 'Selector', children = {{type = 'Script', path = 'x.lua'}}}
         })
         return status, err
@@ -649,7 +655,7 @@ TEST_F(BehaviorTreeLibraryTest, RunWithoutPathOrJson) {
     // No `tree` field → error mentions "tree".
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({})
+        local status, err = bt.ready({})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -819,9 +825,9 @@ protected:
 TEST_F(ScriptNodeIntegrationTest, SelfStateInEnterAndTick) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/bt_module.lua'}
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/bt_module.lua'}})
+        bt.exec({interval = 10})
+        local status, err = bt.await()
         if not status then return false, err end
         return true, status
     )");
@@ -831,9 +837,9 @@ TEST_F(ScriptNodeIntegrationTest, SelfStateInEnterAndTick) {
 TEST_F(ScriptNodeIntegrationTest, ExitReasonAsParameter) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/check_reason.lua'}
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/check_reason.lua'}})
+        bt.exec({interval = 10})
+        local status, err = bt.await()
         if not status then return false, err end
         return true, status
     )");
@@ -843,9 +849,9 @@ TEST_F(ScriptNodeIntegrationTest, ExitReasonAsParameter) {
 TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/with_args.lua', args = {target = 'enemy', damage = 100}}
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/with_args.lua', args = {target = 'enemy', damage = 100}}})
+        bt.exec({interval = 10})
+        local status, err = bt.await()
         if not status then return false, err end
         return true, status
     )");
@@ -855,9 +861,9 @@ TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
 TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/bool_args.lua', args = {enabled = true}}
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/bool_args.lua', args = {enabled = true}}})
+        bt.exec({interval = 10})
+        local status, err = bt.await()
         if not status then return false, err end
         return true, status
     )");
@@ -867,9 +873,9 @@ TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
 TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/counter.lua'}
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/counter.lua'}})
+        bt.exec({interval = 10})
+        local status, err = bt.await()
         if not status then return false, err end
         return true, status
     )");
@@ -879,9 +885,9 @@ TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
 TEST_F(ScriptNodeIntegrationTest, NoArgsStillWorks) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/no_args.lua'}
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/no_args.lua'}})
+        bt.exec({interval = 10})
+        local status, err = bt.await()
         if not status then return false, err end
         return true, status
     )");
@@ -891,7 +897,7 @@ TEST_F(ScriptNodeIntegrationTest, NoArgsStillWorks) {
 TEST_F(ScriptNodeIntegrationTest, ScriptNotFoundReturnsError) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
+        local status, err = bt.ready({
             tree = {type = 'Script', path = 'scripts/nonexistent.lua'}
         })
         return status, err
@@ -907,9 +913,9 @@ TEST_F(ScriptNodeIntegrationTest, ScriptNotFoundReturnsError) {
 TEST_F(ScriptNodeIntegrationTest, ScriptRuntimeErrorReturnsError) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/runtime_error.lua'}
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/runtime_error.lua'}})
+        bt.exec({interval = 10})
+        local status, err = bt.await()
         if not status then return false, err end
         return true, status
     )"));
@@ -924,9 +930,9 @@ TEST_F(ScriptNodeIntegrationTest, ScriptRuntimeErrorReturnsError) {
 TEST_F(ScriptNodeIntegrationTest, NodeReturnsFailureIsNotError) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/returns_failure.lua'}
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/returns_failure.lua'}})
+        bt.exec({interval = 10})
+        local status, err = bt.await()
         if not status then return false, err end
         return true, status
     )"));
@@ -938,7 +944,7 @@ TEST_F(ScriptNodeIntegrationTest, NodeReturnsFailureIsNotError) {
 TEST_F(ScriptNodeIntegrationTest, InitErrorInSequenceStopsEarly) {
     auto r = AWAIT_BT(rt->RunScript(
         "local bt = require('bt')\n"
-        "local status, err = bt.run({\n"
+        "local status, err = bt.ready({\n"
         "    tree = {type = 'Sequence', children = {\n"
         "        {type = 'Script', path = 'scripts/nonexistent.lua'},\n"
         "        {type = 'Script', path = 'scripts/no_args.lua'},\n"
@@ -954,7 +960,7 @@ TEST_F(ScriptNodeIntegrationTest, InitErrorInSequenceStopsEarly) {
     EXPECT_NE(err->find("nonexistent.lua"), std::string::npos);
 }
 
-// --- bt.run() max_step / timeout / interval Tests ---
+// --- bt lifecycle exec() max_step / timeout / interval Tests ---
 
 class BtRunOptionsTest : public ::testing::Test {
 protected:
@@ -986,10 +992,9 @@ protected:
 TEST_F(BtRunOptionsTest, MaxStepStopsTree) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/run_forever.lua'},
-            max_step = 2
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/run_forever.lua'}})
+        bt.exec({max_step = 2, interval = 10})
+        local status, err = bt.await()
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1002,10 +1007,9 @@ TEST_F(BtRunOptionsTest, MaxStepStopsTree) {
 TEST_F(BtRunOptionsTest, MaxStepNotReachedTreeCompletes) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/run_3_ticks.lua'},
-            max_step = 100
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/run_3_ticks.lua'}})
+        bt.exec({max_step = 100, interval = 10})
+        local status, err = bt.await()
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1018,10 +1022,9 @@ TEST_F(BtRunOptionsTest, MaxStepNotReachedTreeCompletes) {
 TEST_F(BtRunOptionsTest, TimeoutStopsTree) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/run_forever.lua'},
-            timeout = 1
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/run_forever.lua'}})
+        bt.exec({timeout = 1, interval = 10})
+        local status, err = bt.await()
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1034,10 +1037,9 @@ TEST_F(BtRunOptionsTest, TimeoutStopsTree) {
 TEST_F(BtRunOptionsTest, TimeoutNotReachedTreeCompletes) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/run_3_ticks.lua'},
-            timeout = 60000
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/run_3_ticks.lua'}})
+        bt.exec({timeout = 60000, interval = 10})
+        local status, err = bt.await()
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1050,10 +1052,9 @@ TEST_F(BtRunOptionsTest, TimeoutNotReachedTreeCompletes) {
 TEST_F(BtRunOptionsTest, IntervalAccepted) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/run_3_ticks.lua'},
-            interval = 10
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/run_3_ticks.lua'}})
+        bt.exec({interval = 10})
+        local status, err = bt.await()
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1065,11 +1066,9 @@ TEST_F(BtRunOptionsTest, IntervalAccepted) {
 TEST_F(BtRunOptionsTest, CombinedMaxStepAndInterval) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.run({
-            tree = {type = 'Script', path = 'scripts/run_forever.lua'},
-            max_step = 3,
-            interval = 10
-        })
+        bt.ready({tree = {type = 'Script', path = 'scripts/run_forever.lua'}})
+        bt.exec({max_step = 3, interval = 10})
+        local status, err = bt.await()
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1615,7 +1614,7 @@ TEST_F(AbortPropagationTest, SelfAbortTerminatesTree) {
         local bt = require('bt')
         local bb = require('blackboard')
         bb.set("go", true)
-        local status, err = bt.run({
+        bt.ready({
             tree = {
                 type = 'Sequence',
                 children = {
@@ -1627,9 +1626,10 @@ TEST_F(AbortPropagationTest, SelfAbortTerminatesTree) {
                         }
                     }
                 }
-            },
-            max_step = 20, interval = 10
+            }
         })
+        bt.exec({max_step = 20, interval = 10})
+        local status = bt.await()
         return status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1646,7 +1646,7 @@ TEST_F(AbortPropagationTest, LowerPriorityAbortPreemptsSibling) {
     auto r = AWAIT_ABORT(rt->RunScript(R"(
         local bt = require('bt')
         local bb = require('blackboard')
-        local status, err = bt.run({
+        bt.ready({
             tree = {
                 type = 'Selector',
                 children = {
@@ -1662,9 +1662,10 @@ TEST_F(AbortPropagationTest, LowerPriorityAbortPreemptsSibling) {
                         path = 'scripts/run_then_set_flag.lua'
                     }
                 }
-            },
-            max_step = 20, interval = 10
+            }
         })
+        bt.exec({max_step = 20, interval = 10})
+        local status = bt.await()
         return status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1774,7 +1775,9 @@ TEST(PathTracerTest, DecoratorFlipRecorded) {
 TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.run({tree={type='Wait', ms=999999}, max_step=3, interval=1})
+        bt.ready({tree={type='Wait', ms=999999}})
+        bt.exec({max_step=3, interval=1})
+        bt.await()
         local p = bt.dump_paths()
         return p.total_ticks, p.path_occurrences, #p.paths, p.terminal, p.has_terminal
     )"));
@@ -1790,7 +1793,9 @@ TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
 TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.run({tree={type='Wait', ms=999999}, max_step=3, interval=1, trace_paths=false})
+        bt.ready({tree={type='Wait', ms=999999}, trace_paths=false})
+        bt.exec({max_step=3, interval=1})
+        bt.await()
         local p = bt.dump_paths()
         return p.total_ticks, p.tracing
     )"));
@@ -1803,7 +1808,9 @@ TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
 TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.run({tree={type='Wait', ms=999999}, max_step=2, interval=1})
+        bt.ready({tree={type='Wait', ms=999999}})
+        bt.exec({max_step=2, interval=1})
+        bt.await()
         local report = bt.path_report()
         return type(report), #report > 0, string.find(report, '路径报告') ~= nil
     )"));
@@ -1812,4 +1819,102 @@ TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
     EXPECT_EQ(std::get<std::string>(r.values[0]), "string");
     EXPECT_EQ(std::get<bool>(r.values[1]), true);
     EXPECT_EQ(std::get<bool>(r.values[2]), true);  // contains report header
+}
+
+// --- lifecycle API: goto_path / exec / await / pause ---
+
+TEST_F(BehaviorTreeLibraryTest, GotoPathLegal) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.ready({tree={type='Sequence', name='root', children={
+            {type='Wait', name='w1', ms=99999},
+            {type='Wait', name='w2', ms=99999}}}})
+        local ok, err = bt.goto_path({'root', 'w2'})
+        return ok, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_GE(r.values.size(), 1u);
+    EXPECT_EQ(std::get<bool>(r.values[0]), true);
+}
+
+TEST_F(BehaviorTreeLibraryTest, GotoPathNameNotFound) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.ready({tree={type='Sequence', name='root', children={
+            {type='Wait', name='w1', ms=99999}}}})
+        local ok, err = bt.goto_path({'root', 'nope'})
+        return ok, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[0]));
+    EXPECT_NE(std::get<std::string>(r.values[1]).find("no child"), std::string::npos);
+}
+
+TEST_F(BehaviorTreeLibraryTest, GotoPathRejectsParallel) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.ready({tree={type='Parallel', name='par', children={
+            {type='Wait', name='w1', ms=99999}}}})
+        local ok, err = bt.goto_path({'par', 'w1'})
+        return ok, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[0]));
+    EXPECT_NE(std::get<std::string>(r.values[1]).find("Parallel"), std::string::npos);
+}
+
+TEST_F(BehaviorTreeLibraryTest, GotoPathIllegalWhileRunning) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.ready({tree={type='Sequence', name='root', children={
+            {type='Wait', name='w1', ms=99999},
+            {type='Wait', name='w2', ms=99999}}}})
+        bt.exec({interval=10, max_step=100})
+        local ok, err = bt.goto_path({'root', 'w2'})  -- running → reject
+        bt.stop()
+        return ok, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[0]));
+    EXPECT_NE(std::get<std::string>(r.values[1]).find("running"), std::string::npos);
+}
+
+TEST_F(BehaviorTreeLibraryTest, ExecWhileRunningIsNoOp) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.ready({tree={type='Wait', ms=99999}})
+        bt.exec({interval=10, max_step=5})
+        local s = bt.exec({interval=10})  -- already running → no-op
+        bt.await()
+        return s
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "running");
+}
+
+TEST_F(BehaviorTreeLibraryTest, AwaitAfterDoneReturnsImmediately) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.ready({tree={type='Wait', ms=99999}})
+        bt.exec({interval=10, max_step=2})
+        local s1 = bt.await()           -- waits for timeout
+        local s2 = bt.await()           -- already done → returns outcome immediately
+        return s1, s2
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "timeout");
+    EXPECT_EQ(std::get<std::string>(r.values[1]), "timeout");
+}
+
+TEST_F(BehaviorTreeLibraryTest, RuntimePauseResumeFlag) {
+    EXPECT_FALSE(rt->paused());
+    rt->Pause();
+    EXPECT_TRUE(rt->paused());
+    rt->Resume();
+    EXPECT_FALSE(rt->paused());
 }

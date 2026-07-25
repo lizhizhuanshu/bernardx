@@ -757,6 +757,14 @@ void LuaRuntime::Interrupt() {
     });
 }
 
+void LuaRuntime::Pause() {
+    paused_.store(true, std::memory_order_release);
+}
+
+void LuaRuntime::Resume() {
+    paused_.store(false, std::memory_order_release);
+}
+
 // --- Shutdown ---
 
 void LuaRuntime::Shutdown() {
@@ -1063,7 +1071,15 @@ LuaRuntime::Ptr LuaRuntime::Builder::Create() {
         [self](lua_State* co) { LuaRuntime::SetExtraspace(co, self); });
     rt->timer_mgr_ = std::make_unique<TimerManager>(
         rt->executor_,
-        [self](AsyncHandle handle) { self->DoResume(handle, {}); },
+        [self](AsyncHandle handle) {
+            if (self->paused_.load(std::memory_order_acquire)) {
+                // Paused: a sleeping coroutine must NOT resume until the
+                // runtime resumes. Re-arm a short retry instead of resuming.
+                self->timer_mgr_->AddSleepTimer(NowMs() + 20, handle);
+            } else {
+                self->DoResume(handle, {});
+            }
+        },
         [self](int fn_ref) {
             lua_State* co = self->AcquireCoroutine();
             lua_rawgeti(co, LUA_REGISTRYINDEX, fn_ref);

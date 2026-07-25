@@ -8,9 +8,16 @@ local bt = require('bt')
 
 | 函数 | 说明 |
 |------|------|
-| `bt.run(opts)` | 加载并运行行为树直到完成或超时（协程异步，yield 挂起、完成后恢复） |
+| `bt.ready(opts)` | 构建树 + 初始化脚本/传感器 + 激活（协程 yield，完成后恢复）。返回 `"ready"` 或 `nil, err` |
+| `bt.exec(opts)` | 启动后台 tick 循环（按 `interval`），**立即返回** `"running"`（不阻塞），可随后暂停/`dump_paths`/`await` |
+| `bt.await()` | 阻塞等待本次 run 结束；返回 `"success"`/`"failure"`/`"timeout"`/`"stopped"` 或 `nil, err` |
+| `bt.goto_path(names)` | 跳到指定节点名路径（如 `{"combat","attack"}`），重置树让叶子重新 Enter |
+| `bt.stop()` | 停止并清理当前树 |
 | `bt.notify(event, data)` | 发送事件到事件队列（下个 tick 写入黑板 `_event_{name}`） |
-| `bt.get_status()` | 状态：`"idle"` / `"running"` / `"success"` / `"failure"` |
+| `bt.get_status()` | 状态：`"idle"`/`"ready"`/`"running"`/`"paused"`/`"success"`/`"failure"` |
+| `bt.dump_paths()` / `bt.path_report()` | 路径记录数据/报告（见[路径记录](#路径记录-path-tracer)） |
+
+> **暂停/恢复**是宿主级：经网络 `kPause`/`kResume` → `BernardXEngine::Pause/Resume` → `LuaRuntime` 暂停标志，**不由 Lua 脚本调用**。暂停时 bt 后台 tick 与 `sleep` 都停止推进（树状态保留）；`http`/`async_io` 当前照常。恢复后继续。
 
 ## 核心机制一览
 
@@ -21,7 +28,7 @@ local bt = require('bt')
 ```lua
 local bt = require('bt')
 
-bt.run({
+bt.ready({
     tree = {
         type = 'Selector',                 -- ① 根节点（复合 OR）：依次尝试，首个成功即停
         sensors = { 'enemy_dist' },        -- ② 传感器挂在根上 → 根总在活跃路径，传感器常驻
@@ -40,6 +47,8 @@ bt.run({
         enemy_dist = { interval = 100, path = 'sensors/enemy_dist.lua' },
     },
 })
+bt.exec({ interval = 100 })                -- 后台 tick；可随时暂停（宿主）/dump_paths
+local status = bt.await()                  -- 阻塞等完成（或超时）
 ```
 
 Sensor 脚本——`Tick` 返回值写入黑板：
@@ -69,45 +78,79 @@ return M
 
 > **核心区别**：Script 与 Sensor 的脚本是**同一种 table 回调**（`return M` + `Enter/Tick/Exit` 冒号语法）。差别只在 `Tick` 的产出——**Script 返回状态字符串**（`"success"`/`"failure"`/`"running"`）控制树如何流转；**Sensor 返回任意值**写入黑板供条件读取。后续各节是对这些件的展开。
 
-## bt.run(opts)
+## 生命周期 API（ready / exec / await / goto_path / stop）
 
-一站式入口，依次完成：从 Lua table 构建 Node 树 → 初始化 Script → 初始化 Sensor → 激活初始路径 Sensor → 进入 tick 循环（直到完成、达到 `max_step` 或 `timeout`）。重复调用会先停止并清理之前的树。
+行为树采用**分离的生命周期**：`ready` 构建+初始化（协程 yield），`exec` 启动后台 tick（非阻塞），`await` 阻塞等结束。暂停/恢复由宿主控制（见下）。
+
+状态机：`idle → ready → running ↔ paused → success/failure →（stop）idle`。
+
+### bt.ready(opts)
+
+构建 Node 树 → 初始化 Script → 初始化 Sensor → 激活初始 Sensor。**协程 yield**，完成后恢复，返回 `"ready"` 或 `nil, err`（parse/init 错）。
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `tree` | `table` | **是** | 根节点定义（行为树拓扑，见下） |
 | `subtrees` | `table` | 否 | 子树定义：`{名字 = 节点定义, ...}` |
 | `sensors` | `table` | 否 | 传感器配置：`{名字 = {interval, args, path}, ...}` |
+| `trace_paths` | `bool` | 否 | 是否采集路径数据（默认 `true`，见[路径记录](#路径记录-path-tracer)） |
+
+`ready` 在 running/paused 时调用会报错（先 `stop`）。
+
+### bt.exec(opts)
+
+启动后台 tick 循环（按 `interval` 间隔），**立即返回** `"running"`（不阻塞 Lua）；调用方可随后暂停/恢复（宿主）、`dump_paths`、`path_report`、`await`。
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `interval` | `integer` | **是** | tick 间隔（毫秒），必须 > 0 |
 | `max_step` | `integer` | 否 | 最大 tick 步数，未设置则无限 |
 | `timeout` | `integer` | 否 | 超时（毫秒），未设置则不超时 |
-| `interval` | `integer` | 否 | tick 间隔（毫秒），未设置则连续 |
 
-返回 `status, err`：`status` 为 `"success"` / `"failure"` / `"timeout"`，出错为 `nil`；`err` 为错误信息，成功为 `nil`。
+已 running 时再 `exec` 是 no-op（返回 `"running"`）。从 `success`/`failure` 再 `exec` 报错（重新 `ready`）。
+
+### bt.await()
+
+阻塞等待本次 run 结束，返回 `"success"` / `"failure"` / `"timeout"` / `"stopped"`，或 `nil, err`。若 run 已结束，立即返回结果（不 yield）。
+
+### 暂停 / 恢复（宿主级）
+
+由宿主经网络消息（`kPause`/`kResume`）→ `BernardXEngine::Pause/Resume` → `LuaRuntime` 暂停标志控制，**不由 Lua 脚本调用**。暂停时：bt 后台 tick 不推进（`get_status()` 返回 `"paused"`），`sleep`（`timer_manager` 的 `on_sleep` 回调检查暂停标志）也不 resume——到 resume 后才完成；**`http`/`async_io` 等其它异步当前照常**（后续可能纳入）。恢复后从原位置继续。
+
+### bt.goto_path(names)
+
+跳到指定节点名路径（如 `{"combat", "attack"}`）：设置复合节点 `current_child_index` + 重置全树，叶子从 `Enter` 重新跑。仅 `ready`/`paused`/终态可用（运行中先暂停）。**限制**：不能穿 `Parallel`（无单活跃子）和 `Random*`（shuffle 顺序不可控）；`Wait` 计时重始；`Script` 的异步协程进度不可恢复（从 `Enter` 重跑）。
+
+### bt.stop()
+
+停止并清理当前树（`get_status()` → `"idle"`）。若 `await` 在等待会以 `"stopped"` 恢复。
+
+### 典型用法
 
 ```lua
-local status, err = bt.run({
-    tree = {
-        type = 'Sequence',
-        children = {
-            { type = 'Script', path = 'scripts/attack.lua', args = { target = 'enemy' } },
-            { type = 'Subtree', subtree = 'combat' },
-        },
-        sensors = { 'hp' },
-    },
+bt.ready({
+    tree = { type = 'Sequence', children = {
+        { type = 'Script', path = 'scripts/attack.lua', args = { target = 'enemy' } },
+        { type = 'Subtree', subtree = 'combat' },
+    }},
     subtrees = { combat = { type = 'Sequence', children = { ... } } },
     sensors = { hp = { interval = 100, path = 'sensors/hp.lua' } },
-    max_step = 100, timeout = 5000, interval = 100,  -- 均可选
+    trace_paths = true,
 })
-if not status then error("bt.run failed: " .. err)
+bt.exec({ interval = 100, max_step = 1000, timeout = 5000 })
+-- 此处可：宿主 pause/resume；bt.dump_paths() 看中间快照；bt.goto_path({...})（需先暂停）
+local status, err = bt.await()
+if not status then error("bt failed: " .. err)
 elseif status == "timeout" then print("timed out")
 else print("finished:", status) end
+print(bt.path_report())
 ```
 
 ## 脚本加载
 
 Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `CodeProvider` 加载（与主脚本 `require()` / `loadfile()` 共用同一加载器）。`path` 相对 `CodeProvider` 的搜索路径解析——请将 `scripts/`、`sensors/` 等脚本目录纳入 `CodeProvider` 搜索路径。
 
-**`bt.run` 不再有 `project_path`/目录加载**：树拓扑由 `tree`/`subtrees` table 直接提供，不经文件或 JSON。
+**`bt.ready` 不再有 `project_path`/目录加载**：树拓扑由 `tree`/`subtrees` table 直接提供，不经文件或 JSON。
 
 ## 节点速查表
 
@@ -266,10 +309,10 @@ decorators = {
 
 ### 配置方式
 
-传感器的**脚本与调度配置集中在 `bt.run` 的 `sensors` 参数**（一个 `{名字 = 配置}` 的 table）；节点通过 `sensors = {'名字'}` 数组按名引用。
+传感器的**脚本与调度配置集中在 `bt.ready` 的 `sensors` 参数**（一个 `{名字 = 配置}` 的 table）；节点通过 `sensors = {'名字'}` 数组按名引用。
 
 ```lua
-bt.run({
+bt.ready({
     tree = {
         type = 'Script', path = 'scripts/click.lua',
         sensors = { 'login_visible' },          -- 引用名字
@@ -279,6 +322,7 @@ bt.run({
         hp = { interval = 50, path = 'sensors/hp.lua' },
     },
 })
+bt.exec({ interval = 100 })
 ```
 
 ### 配置字段
@@ -357,7 +401,7 @@ return M
 配置里的 `args` 会原样作为参数传给 `Enter`：
 
 ```lua
--- bt.run 配置：
+-- bt.ready 配置：
 --   sensors = { threat = { interval = 100, path = 'sensors/threat.lua',
 --                          args = { range = 50, faction = 'enemy' } } }
 local M = {}
@@ -382,7 +426,7 @@ return M
 完整示例——附近有敌人时进攻。传感器返回**整数**数量，条件用比较运算符判断：
 
 ```lua
-bt.run({
+bt.ready({
     tree = {
         type = 'Sequence', name = 'engage',
         sensors = { 'nearby_enemies' },          -- 节点活跃时该传感器周期运行
@@ -399,6 +443,8 @@ bt.run({
         nearby_enemies = { interval = 100, path = 'sensors/nearby_enemies.lua' },
     },
 })
+bt.exec({ interval = 100 })
+bt.await()
 ```
 
 ```lua
@@ -427,7 +473,7 @@ return M
 ```lua
 local bt = require('bt')
 
-local status, err = bt.run({
+bt.ready({
     tree = {
         type = 'Selector', name = 'ai_root',
         decorators = {
@@ -457,6 +503,8 @@ local status, err = bt.run({
         },
     },
 })
+bt.exec({ interval = 100 })
+local status, err = bt.await()
 ```
 
 ## 路径记录 (path tracer)
@@ -475,7 +523,7 @@ local status, err = bt.run({
 
 ### bt.dump_paths()
 
-返回一个 table,含本 run(自上次 `bt.run` 起)的全部路径数据:
+返回一个 table,含本 run(自上次 `bt.ready` 起)的全部路径数据:
 
 ```lua
 local p = bt.dump_paths()
@@ -501,11 +549,13 @@ local p = bt.dump_paths()
 返回三视图报告的**字符串**(A 路径热度 + B 树形热力图 + C 切换时间线)。由你决定何时获取、如何输出:
 
 ```lua
-bt.run({ tree = { ... }, max_step = 100 })   -- 采集(默认开)
+bt.ready({ tree = { ... } })                  -- 采集(默认开)
+bt.exec({ interval = 10, max_step = 100 })
+bt.await()
 print(bt.path_report())                       -- 自行打印 / 写文件 / 发日志
 ```
 
-末态(成功/失败/超时/异常)会自动标记,`bt.run` 结束后调 `path_report()` 即得完整末态报告;运行中也可随时调,取当时的中间快照。
+末态(成功/失败/超时/异常)会自动标记,`bt.await()` 返回后调 `path_report()` 即得完整末态报告;运行中也可随时调,取当时的中间快照。
 
 ### 报告三视图
 

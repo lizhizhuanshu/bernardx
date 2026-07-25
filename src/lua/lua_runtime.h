@@ -143,6 +143,13 @@ public:
 
     void Interrupt();
 
+    // Reversible pause: a paused runtime's background coroutines (e.g. a bt
+    // tick loop) should skip their work until Resume(). Set by the host
+    // (BernardXEngine::Pause), not by Lua scripts.
+    void Pause();
+    void Resume();
+    bool paused() const { return paused_.load(std::memory_order_acquire); }
+
     AsyncHandle PreYield(lua_State* co);
     static int Yield(lua_State* L);
 
@@ -221,6 +228,7 @@ private:
 
     std::atomic<bool> shutting_down_{false};
     std::atomic<bool> interrupted_{false};
+    std::atomic<bool> paused_{false};
     std::unordered_map<AsyncHandle, PendingEntry> pending_;
 
     std::unique_ptr<TimerManager> timer_mgr_;

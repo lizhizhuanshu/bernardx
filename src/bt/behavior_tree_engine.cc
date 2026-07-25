@@ -8,6 +8,8 @@
 #include "composite.h"
 #include "lua_runtime.h"
 #include "parallel.h"
+#include "random_selector.h"
+#include "random_sequence.h"
 #include "single_child_node.h"
 #include "subtree_node.h"
 #include "time_utils.h"
@@ -44,12 +46,70 @@ void BehaviorTreeEngine::Notify(const std::string& event_name, LuaValue data) {
 }
 
 std::string BehaviorTreeEngine::GetStatus() const {
-    if (!root_) return "idle";
-    switch (last_status_) {
-        case NodeStatus::kSuccess: return "success";
-        case NodeStatus::kFailure: return "failure";
-        default: return "running";
+    switch (state_) {
+        case BtState::kIdle: return "idle";
+        case BtState::kReady: return "ready";
+        case BtState::kRunning: return "running";
+        case BtState::kPaused: return "paused";
+        case BtState::kSuccess: return "success";
+        case BtState::kFailure: return "failure";
     }
+    return "idle";
+}
+
+std::optional<std::string> BehaviorTreeEngine::GotoPath(
+    const std::vector<std::string>& names) {
+    if (state_ == BtState::kRunning) {
+        return "goto_path illegal while running; pause first";
+    }
+    if (!root_) return "no tree loaded; call ready first";
+    if (names.empty()) return "empty path";
+
+    // Walk the live tree, recording (composite, child index) positions to set.
+    struct Pos { Composite* comp; size_t idx; };
+    std::vector<Pos> positions;
+    Node* cursor = root_.get();
+    if (cursor->name() != names[0]) {
+        return "path[0] '" + names[0] + "' does not match root '" + cursor->name() + "'";
+    }
+    for (size_t i = 1; i < names.size(); ++i) {
+        const std::string& target = names[i];
+        if (dynamic_cast<Parallel*>(cursor)) {
+            return "goto_path cannot traverse a Parallel node ('" + cursor->name() + "')";
+        }
+        if (dynamic_cast<RandomSelector*>(cursor) ||
+            dynamic_cast<RandomSequence*>(cursor)) {
+            return "goto_path unsupported through " + cursor->type();
+        }
+        if (auto* comp = dynamic_cast<Composite*>(cursor)) {
+            size_t j = 0;
+            for (; j < comp->children().size(); ++j) {
+                if (comp->children()[j] && comp->children()[j]->name() == target) break;
+            }
+            if (j == comp->children().size()) {
+                return "no child named '" + target + "' under '" + cursor->name() + "'";
+            }
+            positions.push_back({comp, j});
+            cursor = comp->children()[j].get();
+        } else if (auto* single = dynamic_cast<SingleChildNode*>(cursor)) {
+            Node* child = single->child();
+            if (!child || child->name() != target) {
+                return "single-child node '" + cursor->name() + "' child is '" +
+                       (child ? child->name() : std::string("none")) + "', not '" + target + "'";
+            }
+            cursor = child;
+        } else {
+            return "path descends into leaf '" + cursor->name() + "' before exhausting names";
+        }
+    }
+    // Reset the whole tree (clears composite indices, leaf coroutine/counters,
+    // Wait timers), then re-apply the recorded indices to position the path.
+    root_->Reset();
+    for (const auto& p : positions) {
+        p.comp->set_current_child_index(p.idx);
+    }
+    ClearDecoratorState();
+    return std::nullopt;
 }
 
 async_simple::coro::Lazy<std::string> BehaviorTreeEngine::InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx) {
