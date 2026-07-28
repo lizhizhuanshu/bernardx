@@ -29,6 +29,7 @@ extern "C" {
 #include "script_node.h"
 #include "selector.h"
 #include "sequence.h"
+#include "resume_sequence.h"
 #include "subtree_node.h"
 #include "types.h"
 #include "wait_node.h"
@@ -240,6 +241,8 @@ std::unique_ptr<Node> ParseComposite(lua_State* L, int idx, const std::string& t
         node = std::make_unique<Selector>(id, name);
     } else if (type == "Sequence") {
         node = std::make_unique<Sequence>(id, name);
+    } else if (type == "ResumeSequence") {
+        node = std::make_unique<ResumeSequence>(id, name);
     } else if (type == "Parallel") {
         auto sp = ReadStringField(L, idx, "success_policy", "RequireAll");
         auto fp = ReadStringField(L, idx, "failure_policy", "RequireOne");
@@ -403,8 +406,8 @@ std::unique_ptr<Node> ParseNode(lua_State* L, int idx, ParseContext& ctx) {
         return nullptr;
     }
 
-    if (type == "Selector" || type == "Sequence" || type == "Parallel" ||
-        type == "RandomSelector" || type == "RandomSequence") {
+    if (type == "Selector" || type == "Sequence" || type == "ResumeSequence" ||
+        type == "Parallel" || type == "RandomSelector" || type == "RandomSequence") {
         return ParseComposite(L, idx, type, ctx);
     }
     if (type == "Script") return ParseScriptLeaf(L, idx, ctx);

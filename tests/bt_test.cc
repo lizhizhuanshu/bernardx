@@ -23,6 +23,7 @@
 #include "script_node.h"
 #include "selector.h"
 #include "sequence.h"
+#include "resume_sequence.h"
 #include "sensor.h"
 #include "subtree_node.h"
 #include "repeat.h"
@@ -218,6 +219,142 @@ TEST(SequenceTest, RunningResumesFromSameChild) {
     static_cast<MockNode*>(seq->children()[1].get())->set_status(NodeStatus::kSuccess);
     EXPECT_EQ(seq->Tick(bb, events), NodeStatus::kSuccess);
     EXPECT_FALSE(seq->has_started());
+}
+
+// --- ResumeSequence Tests ---
+
+TEST(ResumeSequenceTest, AllSkippedReturnsFailure) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto rs = std::make_unique<ResumeSequence>(1, "rs");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    a->AddDecorator(std::make_unique<BlackboardCondition>("x", "is_set"));
+    auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
+    b->AddDecorator(std::make_unique<BlackboardCondition>("y", "is_set"));
+    rs->AddChild(std::unique_ptr<MockNode>(a));
+    rs->AddChild(std::unique_ptr<MockNode>(b));
+
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kFailure);
+    EXPECT_EQ(a->tick_count, 0);
+    EXPECT_EQ(b->tick_count, 0);
+}
+
+TEST(ResumeSequenceTest, AdvancesThroughSuccesses) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto rs = std::make_unique<ResumeSequence>(1, "rs");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
+    rs->AddChild(std::unique_ptr<MockNode>(a));
+    rs->AddChild(std::unique_ptr<MockNode>(b));
+
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(a->tick_count, 1);
+    EXPECT_EQ(b->tick_count, 1);
+}
+
+TEST(ResumeSequenceTest, RunningRemembersPosition) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto rs = std::make_unique<ResumeSequence>(1, "rs");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    auto* b = new MockNode(3, "b", NodeStatus::kRunning);
+    rs->AddChild(std::unique_ptr<MockNode>(a));
+    rs->AddChild(std::unique_ptr<MockNode>(b));
+
+    // tick 1: entry=0, a Success (advance to 1), b Running (remember 1)
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(a->tick_count, 1);
+    EXPECT_EQ(b->tick_count, 1);
+
+    // tick 2: resumes from b -- a is NOT re-scanned (memory, not reactive)
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(a->tick_count, 1);
+    EXPECT_EQ(b->tick_count, 2);
+
+    // b now succeeds -> whole node succeeds
+    static_cast<MockNode*>(rs->children()[1].get())->set_status(NodeStatus::kSuccess);
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(b->tick_count, 3);
+}
+
+TEST(ResumeSequenceTest, FailurePropagatesAndStops) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto rs = std::make_unique<ResumeSequence>(1, "rs");
+    rs->AddChild(std::make_unique<MockNode>(2, "a", NodeStatus::kSuccess));
+    rs->AddChild(std::make_unique<MockNode>(3, "b", NodeStatus::kFailure));
+    rs->AddChild(std::make_unique<MockNode>(4, "c", NodeStatus::kSuccess));
+
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kFailure);
+    // c sits after the failing b and is never reached
+    EXPECT_EQ(static_cast<MockNode*>(rs->children()[2].get())->tick_count, 0);
+}
+
+TEST(ResumeSequenceTest, SkipsChildrenWhoseDecoratorFails) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto rs = std::make_unique<ResumeSequence>(1, "rs");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    a->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
+    auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
+    rs->AddChild(std::unique_ptr<MockNode>(a));
+    rs->AddChild(std::unique_ptr<MockNode>(b));
+
+    // a's decorator fails -> skip; b runs and succeeds
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(a->tick_count, 0);
+    EXPECT_EQ(b->tick_count, 1);
+}
+
+TEST(ResumeSequenceTest, ResumesAtCurrentStepAfterInterrupt) {
+    // Steps 1,2 are done (bb.step=2), step3 pending. Entry scan skips 1,2.
+    // An upstream popup aborts this node; on re-entry it re-scans and still
+    // resumes at step3 -- the interrupt-recovery case.
+    Blackboard bb;
+    BtEventQueue events;
+    bb.Set("step", LuaValue(static_cast<int64_t>(2)));
+
+    auto rs = std::make_unique<ResumeSequence>(1, "rs");
+    auto* s1 = new MockNode(2, "step1", NodeStatus::kSuccess);
+    s1->AddDecorator(std::make_unique<BlackboardCondition>(
+        "step", "less_than", LuaValue(static_cast<int64_t>(1))));
+    auto* s2 = new MockNode(3, "step2", NodeStatus::kSuccess);
+    s2->AddDecorator(std::make_unique<BlackboardCondition>(
+        "step", "less_than", LuaValue(static_cast<int64_t>(2))));
+    auto* s3 = new MockNode(4, "step3", NodeStatus::kRunning);
+    s3->AddDecorator(std::make_unique<BlackboardCondition>(
+        "step", "less_than", LuaValue(static_cast<int64_t>(3))));
+    rs->AddChild(std::unique_ptr<MockNode>(s1));
+    rs->AddChild(std::unique_ptr<MockNode>(s2));
+    rs->AddChild(std::unique_ptr<MockNode>(s3));
+
+    // First tick: entry scan skips s1,s2 (done), resumes at s3 -> Running
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(s1->tick_count, 0);
+    EXPECT_EQ(s2->tick_count, 0);
+    EXPECT_EQ(s3->tick_count, 1);
+
+    // Upstream popup aborts this node -> OnAborted clears the entry so the
+    // next tick re-scans top-to-bottom (skipping s1,s2 again).
+    rs->OnAborted();
+
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(s1->tick_count, 0);
+    EXPECT_EQ(s2->tick_count, 0);
+    EXPECT_EQ(s3->tick_count, 2);
+
+    // s3 finishes -> node succeeds.
+    static_cast<MockNode*>(rs->children()[2].get())->set_status(NodeStatus::kSuccess);
+    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(s3->tick_count, 3);
+}
+
+TEST(ResumeSequenceParseTest, ParsesTypeAndChildren) {
+    auto node = ParseLuaTree("{type='ResumeSequence', children={{type='Wait',ms=10}}}");
+    ASSERT_NE(node, nullptr);
+    EXPECT_EQ(node->type(), "ResumeSequence");
+    EXPECT_EQ(static_cast<Composite*>(node.get())->children().size(), 1u);
 }
 
 // --- Parallel Tests ---

@@ -153,6 +153,7 @@ Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `
 |------|------|---------|--------|------|
 | `Selector` | 复合 | `type` | `children` | OR 逻辑，任一成功即成功 |
 | `Sequence` | 复合 | `type` | `children` | AND 逻辑，全部成功才成功 |
+| `ResumeSequence` | 复合 | `type` | `children` | 条件门控序列，首次/恢复时从上到下找入口，之后按位置记忆推进 |
 | `Parallel` | 复合 | `type` | `children` | 并行，策略控制结果 |
 | `RandomSelector` | 复合 | `type` | `children` | 随机顺序 OR |
 | `RandomSequence` | 复合 | `type` | `children` | 随机顺序 AND |
@@ -187,6 +188,7 @@ Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `
 | `Sequence` | 依次 tick，首个 Failure 即 Failure，全 Success 才 Success |
 | `RandomSelector` | 同 Selector，每次 Reset 后随机排列子节点顺序 |
 | `RandomSequence` | 同 Sequence，每次 Reset 后随机排列子节点顺序 |
+| `ResumeSequence` | 首次/恢复时从上到下找首个描述(decorator)成立的子节点作为入口，之后按 Sequence 记忆位置推进；无描述成立则 Failure |
 
 `Parallel` 同时执行所有子节点，策略控制判定：
 
@@ -197,6 +199,18 @@ Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `
 
 ```lua
 { type = 'Selector', name = '可选名称', children = { ... } }
+```
+
+`ResumeSequence` 与其它复合节点不同：**首次进入（或被上层打断恢复后）从上到下找首个 `decorators` 成立的子节点作为入口，之后按 Sequence 记忆位置推进、不重新扫描**；只有 `Reset`/`OnAborted`（被上层节点打断）才触发重新找入口。无描述成立则 Failure。适合"按步骤执行、被上层节点打断后恢复时自动回到当前步骤"的场景——已完成的步骤因描述不再成立被跳过，自然落到当前该做的步骤继续。
+
+```lua
+-- 上层 Selector 处理弹窗并打断本节点；ResumeSequence 恢复时跳过已完成步骤
+{ type = 'ResumeSequence', children = {
+    { type = 'Script', path = 'step1.lua',
+      decorators = {{key = 'step', op = 'less_than', expected = 1}} },
+    { type = 'Script', path = 'step2.lua',
+      decorators = {{key = 'step', op = 'less_than', expected = 2}} },
+}}
 ```
 
 ### 叶子节点 (Leaf)

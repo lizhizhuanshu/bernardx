@@ -116,6 +116,7 @@ add_library(bernardx_lib STATIC
     src/bt/composite.cc
     src/bt/selector.cc
     src/bt/sequence.cc
+    src/bt/resume_sequence.cc
     src/bt/parallel.cc
     src/bt/inverter.cc
     src/bt/force_success.cc
