@@ -1,18 +1,14 @@
 #pragma once
 
-#include <memory>
+#include <string>
 
-#include "decorator.h"
+#include "single_child_node.h"
 
-class Inverter : public Decorator {
+// Inverts the wrapped child's terminal result: Success <-> Failure. Running is
+// passed through unchanged (an in-progress child has no result to invert yet).
+class Inverter : public SingleChildNode {
 public:
-    Inverter(AbortMode abort_mode = AbortMode::kNone);
+    Inverter(uint32_t id, std::string name, std::unique_ptr<Node> child);
 
-    void set_child(std::unique_ptr<Decorator> child);
-    Decorator* child() const { return child_.get(); }
-
-    bool Evaluate(Blackboard& bb) override;
-
-private:
-    std::unique_ptr<Decorator> child_;
+    NodeStatus Tick(Blackboard& bb, BtEventQueue& events) override;
 };

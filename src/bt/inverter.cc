@@ -1,13 +1,20 @@
 #include "inverter.h"
 
-Inverter::Inverter(AbortMode abort_mode)
-    : Decorator("Inverter", abort_mode) {}
+Inverter::Inverter(uint32_t id, std::string name, std::unique_ptr<Node> child)
+    : SingleChildNode(id, "Inverter", std::move(name), std::move(child)) {}
 
-void Inverter::set_child(std::unique_ptr<Decorator> child) {
-    child_ = std::move(child);
-}
-
-bool Inverter::Evaluate(Blackboard& bb) {
-    if (!child_) return true;
-    return !child_->Evaluate(bb);
+NodeStatus Inverter::Tick(Blackboard& bb, BtEventQueue& events) {
+    if (!child_) {
+        set_last_error("no child node");
+        return NodeStatus::kFailure;
+    }
+    if (!child_->CheckDecorators(bb)) {
+        set_last_error("child decorator condition not met");
+        return NodeStatus::kFailure;
+    }
+    auto status = child_->TickAndRecord(bb, events);
+    if (status == NodeStatus::kRunning) {
+        return NodeStatus::kRunning;
+    }
+    return (status == NodeStatus::kSuccess) ? NodeStatus::kFailure : NodeStatus::kSuccess;
 }

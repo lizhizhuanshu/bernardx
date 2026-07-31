@@ -534,29 +534,66 @@ TEST(BlackboardConditionTest, MissingKeyWithOperatorReturnsFalse) {
     EXPECT_FALSE(cond.Evaluate(bb));
 }
 
-TEST(InverterTest, InvertsTrue) {
+TEST(InverterTest, FlipsSuccessToFailure) {
     Blackboard bb;
-    bb.Set("alive", LuaValue(true));
-
-    Inverter inv;
-    auto child = std::make_unique<BlackboardCondition>("alive", "is_set");
-    inv.set_child(std::move(child));
-    EXPECT_FALSE(inv.Evaluate(bb));
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
+    Inverter inv(1, "inv", std::unique_ptr<Node>(child));
+    EXPECT_EQ(inv.Tick(bb, events), NodeStatus::kFailure);
 }
 
-TEST(InverterTest, InvertsFalse) {
+TEST(InverterTest, FlipsFailureToSuccess) {
     Blackboard bb;
-    // "alive" not set, so is_set returns false, inverter returns true
-    Inverter inv;
-    auto child = std::make_unique<BlackboardCondition>("alive", "is_set");
-    inv.set_child(std::move(child));
-    EXPECT_TRUE(inv.Evaluate(bb));
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kFailure);
+    Inverter inv(1, "inv", std::unique_ptr<Node>(child));
+    EXPECT_EQ(inv.Tick(bb, events), NodeStatus::kSuccess);
 }
 
-TEST(ForceSuccessTest, AlwaysTrue) {
+TEST(InverterTest, PassthroughRunning) {
     Blackboard bb;
-    ForceSuccess fs;
-    EXPECT_TRUE(fs.Evaluate(bb));
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kRunning);
+    Inverter inv(1, "inv", std::unique_ptr<Node>(child));
+    EXPECT_EQ(inv.Tick(bb, events), NodeStatus::kRunning);
+}
+
+TEST(InverterTest, NoChildFails) {
+    Blackboard bb;
+    BtEventQueue events;
+    Inverter inv(1, "inv", nullptr);
+    EXPECT_EQ(inv.Tick(bb, events), NodeStatus::kFailure);
+}
+
+TEST(ForceSuccessTest, ForcesFailureToSuccess) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kFailure);
+    ForceSuccess fs(1, "fs", std::unique_ptr<Node>(child));
+    EXPECT_EQ(fs.Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(ForceSuccessTest, KeepsSuccess) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
+    ForceSuccess fs(1, "fs", std::unique_ptr<Node>(child));
+    EXPECT_EQ(fs.Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(ForceSuccessTest, PassthroughRunning) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kRunning);
+    ForceSuccess fs(1, "fs", std::unique_ptr<Node>(child));
+    EXPECT_EQ(fs.Tick(bb, events), NodeStatus::kRunning);
+}
+
+TEST(ForceSuccessTest, NoChildFails) {
+    Blackboard bb;
+    BtEventQueue events;
+    ForceSuccess fs(1, "fs", nullptr);
+    EXPECT_EQ(fs.Tick(bb, events), NodeStatus::kFailure);
 }
 
 // --- BehaviorTreeEngine Tests ---
@@ -1219,10 +1256,35 @@ TEST_F(BtRunOptionsTest, CombinedMaxStepAndInterval) {
 
 // --- ForceFailure Tests ---
 
-TEST(ForceFailureTest, AlwaysFalse) {
+TEST(ForceFailureTest, ForcesSuccessToFailure) {
     Blackboard bb;
-    ForceFailure ff;
-    EXPECT_FALSE(ff.Evaluate(bb));
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
+    ForceFailure ff(1, "ff", std::unique_ptr<Node>(child));
+    EXPECT_EQ(ff.Tick(bb, events), NodeStatus::kFailure);
+}
+
+TEST(ForceFailureTest, KeepsFailure) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kFailure);
+    ForceFailure ff(1, "ff", std::unique_ptr<Node>(child));
+    EXPECT_EQ(ff.Tick(bb, events), NodeStatus::kFailure);
+}
+
+TEST(ForceFailureTest, PassthroughRunning) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new MockNode(2, "child", NodeStatus::kRunning);
+    ForceFailure ff(1, "ff", std::unique_ptr<Node>(child));
+    EXPECT_EQ(ff.Tick(bb, events), NodeStatus::kRunning);
+}
+
+TEST(ForceFailureTest, NoChildFails) {
+    Blackboard bb;
+    BtEventQueue events;
+    ForceFailure ff(1, "ff", nullptr);
+    EXPECT_EQ(ff.Tick(bb, events), NodeStatus::kFailure);
 }
 
 // --- Repeat Tests ---

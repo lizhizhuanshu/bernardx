@@ -1,8 +1,20 @@
 #include "force_failure.h"
 
-ForceFailure::ForceFailure(AbortMode abort_mode)
-    : Decorator("ForceFailure", abort_mode) {}
+ForceFailure::ForceFailure(uint32_t id, std::string name, std::unique_ptr<Node> child)
+    : SingleChildNode(id, "ForceFailure", std::move(name), std::move(child)) {}
 
-bool ForceFailure::Evaluate(Blackboard& /*bb*/) {
-    return false;
+NodeStatus ForceFailure::Tick(Blackboard& bb, BtEventQueue& events) {
+    if (!child_) {
+        set_last_error("no child node");
+        return NodeStatus::kFailure;
+    }
+    if (!child_->CheckDecorators(bb)) {
+        set_last_error("child decorator condition not met");
+        return NodeStatus::kFailure;
+    }
+    auto status = child_->TickAndRecord(bb, events);
+    if (status == NodeStatus::kRunning) {
+        return NodeStatus::kRunning;
+    }
+    return NodeStatus::kFailure;
 }

@@ -138,32 +138,12 @@ void ApplyDecorators(const json& j, Node* node) {
             if (dec_j.contains("value")) expected = ParseLuaValue(dec_j["value"]);
             node->AddDecorator(std::make_unique<BlackboardCondition>(
                 std::move(key), std::move(op), std::move(expected), abort));
-        } else if (dec_type == "Inverter") {
-            auto dec = std::make_unique<Inverter>(abort);
-            if (dec_j.contains("child") && dec_j["child"].is_object()) {
-                const auto& child_j = dec_j["child"];
-                if (child_j.contains("type") && child_j["type"].is_string()) {
-                    std::string child_type = child_j["type"].get<std::string>();
-                    if (child_type == "BlackboardCondition" && child_j.contains("key") &&
-                        child_j["key"].is_string()) {
-                        std::string ckey = child_j["key"].get<std::string>();
-                        std::string cop = child_j.value("operator", "is_set");
-                        std::optional<LuaValue> cexpected;
-                        if (child_j.contains("value")) cexpected = ParseLuaValue(child_j["value"]);
-                        dec->set_child(std::make_unique<BlackboardCondition>(
-                            std::move(ckey), std::move(cop), std::move(cexpected), abort));
-                    } else if (child_type == "ForceSuccess") {
-                        dec->set_child(std::make_unique<ForceSuccess>(abort));
-                    } else if (child_type == "ForceFailure") {
-                        dec->set_child(std::make_unique<ForceFailure>(abort));
-                    }
-                }
-            }
-            node->AddDecorator(std::move(dec));
-        } else if (dec_type == "ForceSuccess") {
-            node->AddDecorator(std::make_unique<ForceSuccess>(abort));
-        } else if (dec_type == "ForceFailure") {
-            node->AddDecorator(std::make_unique<ForceFailure>(abort));
+        } else if (dec_type == "ForceSuccess" || dec_type == "ForceFailure" ||
+                   dec_type == "Inverter") {
+            // These are SingleChildNode wrappers now, not decorators. Guide the
+            // user to the new schema instead of silently dropping the entry.
+            spdlog::warn("TreeParser: '{}' is a wrapper node, not a decorator; "
+                         "use it as a node in 'children' instead", dec_type);
         } else {
             spdlog::warn("TreeParser: unknown decorator type '{}'", dec_type);
         }
@@ -359,6 +339,42 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseWait(const json& j, ParseCo
     co_return node;
 }
 
+async_simple::coro::Lazy<std::unique_ptr<Node>> ParseForceSuccess(const json& j, ParseContext& ctx) {
+    auto child = co_await ParseSingleChild(j, ctx, "ForceSuccess node requires at least one child");
+    if (!child) co_return nullptr;
+    std::string name = j.value("name", "ForceSuccess");
+    uint32_t id = ctx.next_id++;
+    auto node = std::make_unique<ForceSuccess>(id, std::move(name), std::move(child));
+    ApplyDecorators(j, node.get());
+    ApplySensors(j, node.get(), ctx);
+    ReadDescription(j, node.get());
+    co_return node;
+}
+
+async_simple::coro::Lazy<std::unique_ptr<Node>> ParseForceFailure(const json& j, ParseContext& ctx) {
+    auto child = co_await ParseSingleChild(j, ctx, "ForceFailure node requires at least one child");
+    if (!child) co_return nullptr;
+    std::string name = j.value("name", "ForceFailure");
+    uint32_t id = ctx.next_id++;
+    auto node = std::make_unique<ForceFailure>(id, std::move(name), std::move(child));
+    ApplyDecorators(j, node.get());
+    ApplySensors(j, node.get(), ctx);
+    ReadDescription(j, node.get());
+    co_return node;
+}
+
+async_simple::coro::Lazy<std::unique_ptr<Node>> ParseInverter(const json& j, ParseContext& ctx) {
+    auto child = co_await ParseSingleChild(j, ctx, "Inverter node requires at least one child");
+    if (!child) co_return nullptr;
+    std::string name = j.value("name", "Inverter");
+    uint32_t id = ctx.next_id++;
+    auto node = std::make_unique<Inverter>(id, std::move(name), std::move(child));
+    ApplyDecorators(j, node.get());
+    ApplySensors(j, node.get(), ctx);
+    ReadDescription(j, node.get());
+    co_return node;
+}
+
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseNode(const json& j, ParseContext& ctx) {
     if (!j.is_object()) {
         SetError(ctx, "node definition must be a JSON object");
@@ -379,6 +395,9 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseNode(const json& j, ParseCo
     if (type == "Repeat") co_return co_await ParseRepeat(j, ctx);
     if (type == "RetryUntilSuccessful") co_return co_await ParseRetry(j, ctx);
     if (type == "Wait") co_return co_await ParseWait(j, ctx);
+    if (type == "ForceSuccess") co_return co_await ParseForceSuccess(j, ctx);
+    if (type == "ForceFailure") co_return co_await ParseForceFailure(j, ctx);
+    if (type == "Inverter") co_return co_await ParseInverter(j, ctx);
 
     SetError(ctx, "unknown node type '" + type + "'");
     co_return nullptr;

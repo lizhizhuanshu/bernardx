@@ -90,6 +90,9 @@ Script 与传感器的 **Lua 脚本**仍由 `path` 指定，经 `CodeProvider` �
 | `Wait` | 叶子 | `params` | 等待 `params.ms` 毫秒（默认 1000） |
 | `Repeat` | 包装 | `params` | 重复执行子节点（`params.count`，默认 -1 无限） |
 | `RetryUntilSuccessful` | 包装 | `params` | 失败重试（`params.attempts`，默认 -1 无限） |
+| `ForceSuccess` | 包装 | - | 执行子节点，结束态强制为 Success（Running 透传） |
+| `ForceFailure` | 包装 | - | 执行子节点，结束态强制为 Failure（Running 透传） |
+| `Inverter` | 包装 | - | 反转子节点结束态 Success↔Failure（Running 透传） |
 
 **Parallel 策略**（`params.success_policy` / `params.failure_policy`，均 `RequireAll`/`RequireOne`）：默认 `RequireAll` / `RequireOne`。
 
@@ -140,12 +143,11 @@ return M
 | `value` | 否 | 期望值（`bool`/`int`/`double`/`string`，类型不匹配即 false） |
 | `abort` | 否 | 观察者中止：`None`（默认）/`Self`/`LowerPriority`/`Both` |
 
-**结果修饰**（均接受可选 `abort`）：`Inverter`（反转成功/失败）、`ForceSuccess`、`ForceFailure`。
+> 结果修饰（`Inverter`/`ForceSuccess`/`ForceFailure`）是**包装节点**，见上方[节点类型](#节点类型)，作为 `children` 中的节点使用，而非装饰器。
 
 ```json
 "decorators":[
-  {"type":"BlackboardCondition","key":"hp","operator":"greater_than","value":50,"abort":"Self"},
-  {"type":"Inverter"}
+  {"type":"BlackboardCondition","key":"hp","operator":"greater_than","value":50,"abort":"Self"}
 ]
 ```
 
@@ -192,7 +194,7 @@ return M
   "children": [
     { "type": "Subtree", "path": "@bt/combat.json" },
     { "type": "Subtree", "path": "@bt/patrol.json" },
-    { "type": "Script", "path": "scripts/idle.lua", "decorators": [ {"type":"ForceSuccess"} ] }
+    { "type": "ForceSuccess", "children": [ { "type": "Script", "path": "scripts/idle.lua" } ] }
   ]
 }
 ```
