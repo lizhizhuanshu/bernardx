@@ -107,7 +107,7 @@ add_library(bernardx_lib STATIC
     src/lua/file_system_resource_provider.cc
     src/bt/behavior_tree_engine.cc
     src/bt/path_tracer.cc
-    src/bt/lua_tree_parser.cc
+    src/bt/tree_parser.cc
     src/bt/single_child_node.cc
     src/bt/lua_script_host.cc
     src/bt/script_node.cc

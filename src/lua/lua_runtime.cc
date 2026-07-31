@@ -1022,6 +1022,11 @@ LuaRuntime::Builder& LuaRuntime::Builder::WithCodeProvider(std::shared_ptr<CodeP
     return *this;
 }
 
+LuaRuntime::Builder& LuaRuntime::Builder::WithResourceProvider(std::shared_ptr<ResourceProvider> provider) {
+    resource_provider_ = std::move(provider);
+    return *this;
+}
+
 LuaRuntime::Builder& LuaRuntime::Builder::WithExecutor(async_simple::Executor& executor) {
     executor_ = &executor;
     return *this;
@@ -1095,6 +1100,7 @@ LuaRuntime::Ptr LuaRuntime::Builder::Create() {
         });
 
     rt->SetCodeProvider(code_provider_);
+    rt->SetResourceProvider(resource_provider_);
     rt->SetExecutor(rt->executor_);
     rt->SetCModules(c_modules_);
     rt->SetLibraries(libraries_);

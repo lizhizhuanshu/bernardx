@@ -16,6 +16,7 @@
 #include "fs_library.h"
 #include "blackboard_library.h"
 #include "file_system_code_provider.h"
+#include "file_system_resource_provider.h"
 #include "lua_runtime.h"
 #include "blackboard.h"
 
@@ -37,6 +38,7 @@ int main(int argc, char* argv[]) {
     std::thread io_thread([&ioc]() { ioc.run(); });
 
     auto code_provider = std::make_shared<FileSystemCodeProvider>(dir);
+    auto resource_provider = std::make_shared<FileSystemResourceProvider>(dir);
     auto blackboard = std::make_shared<Blackboard>();
     auto bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
     auto bt_lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
@@ -47,6 +49,7 @@ int main(int argc, char* argv[]) {
     async_simple::executors::SimpleExecutor executor(1);
     auto rt = LuaRuntime::Builder()
                   .WithCodeProvider(code_provider)
+                  .WithResourceProvider(resource_provider)
                   .WithExecutor(executor)
                   .RegisterLibrary(bb_lib)
                   .RegisterLibrary(bt_lib)

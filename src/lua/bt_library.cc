@@ -13,15 +13,38 @@ extern "C" {
 
 #include "behavior_tree_engine.h"
 #include "lua_runtime.h"
-#include "lua_tree_parser.h"
 #include "lua_value_utils.h"
 #include "node.h"
+#include "resource_provider.h"
+#include "tree_parser.h"
 #include "types.h"
 
 namespace {
 
 BehaviorTreeEngine* GetEngine(lua_State* L) {
     return static_cast<BehaviorTreeEngine*>(lua_touserdata(L, lua_upvalueindex(1)));
+}
+
+// Read a string field from table `tbl` ("" if missing/not a string).
+std::string ReadStringOpt(lua_State* L, int tbl, const char* key) {
+    std::string result;
+    lua_getfield(L, tbl, key);
+    if (lua_isstring(L, -1)) {
+        size_t len = 0;
+        const char* s = lua_tolstring(L, -1, &len);
+        result.assign(s, len);
+    }
+    lua_pop(L, 1);
+    return result;
+}
+
+// Read a boolean field from table `tbl` (`def` if missing/not a boolean).
+bool ReadBoolOpt(lua_State* L, int tbl, const char* key, bool def) {
+    bool result = def;
+    lua_getfield(L, tbl, key);
+    if (lua_isboolean(L, -1)) result = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    return result;
 }
 
 const char* NodeStatusToString(NodeStatus s) {
@@ -32,16 +55,32 @@ const char* NodeStatusToString(NodeStatus s) {
     }
 }
 
-// --- ready: build + init scripts/sensors + activate (yields until done) ---
+// --- ready: load+parse JSON defs, init scripts/sensors, activate (yields) ---
 static async_simple::coro::Lazy<void> ReadyAsync(
     std::shared_ptr<LuaRuntime> rt,
     AsyncHandle handle,
     BehaviorTreeEngine::Ptr engine,
-    std::unique_ptr<Node> root,
+    std::string root_path,
+    std::string sensor_defs_path,
+    std::shared_ptr<ResourceProvider> provider,
     bool trace_paths,
     uint64_t expected_generation) {
+    auto parse_result = co_await TreeParser::LoadAndParse(root_path, sensor_defs_path, provider);
+    if (engine->generation() != expected_generation) {
+        // Stopped mid-load; unblock the awaiter so it doesn't hang.
+        rt->PushResume(handle, {std::string("stopped")});
+        co_return;
+    }
+    if (!parse_result.root) {
+        engine->set_state(BehaviorTreeEngine::BtState::kIdle);
+        rt->PushResume(handle, {nullptr, parse_result.error.empty()
+                                         ? std::string("failed to parse tree")
+                                         : std::move(parse_result.error)});
+        co_return;
+    }
+
     std::string err;
-    engine->SetRoot(std::move(root));
+    engine->SetRoot(std::move(parse_result.root));
     engine->SetTracing(trace_paths);
     if (engine->generation() == expected_generation) {
         auto e1 = co_await engine->InitScriptNodesAsync(rt->main_state(), rt.get());
@@ -155,37 +194,20 @@ int bt_ready(lua_State* L) {
         return 2;
     }
 
-    lua_getfield(L, 1, "root");
-    int root_idx = lua_absindex(L, -1);
-    if (!lua_istable(L, root_idx)) {
-        lua_pop(L, 1);
+    // root: path to the root node JSON file ("@rel" resource or absolute). Required.
+    std::string root_path = ReadStringOpt(L, 1, "root");
+    if (root_path.empty()) {
         lua_pushnil(L);
-        lua_pushstring(L, "root (table) required");
+        lua_pushstring(L, "root (string path) required");
         return 2;
     }
-    lua_getfield(L, 1, "subtrees");
-    if (!lua_istable(L, -1)) { lua_pop(L, 1); lua_newtable(L); }
-    int subtrees_idx = lua_absindex(L, -1);
-    lua_getfield(L, 1, "sensor_defs");
-    if (!lua_istable(L, -1)) { lua_pop(L, 1); lua_newtable(L); }
-    int sensor_defs_idx = lua_absindex(L, -1);
-
-    bool trace_paths = true;
-    lua_getfield(L, 1, "trace_paths");
-    if (lua_isboolean(L, -1)) trace_paths = lua_toboolean(L, -1);
-    lua_pop(L, 1);
+    // sensor_defs: path to the sensor definitions JSON file. Optional.
+    std::string sensor_defs_path = ReadStringOpt(L, 1, "sensor_defs");
+    bool trace_paths = ReadBoolOpt(L, 1, "trace_paths", true);
 
     auto rt_ctx = LuaRuntime::FromLuaState(L);
-    if (!rt_ctx) { lua_pop(L, 3); lua_pushnil(L); lua_pushstring(L, "no LuaRuntime"); return 2; }
-    if (!rt_ctx->executor()) { lua_pop(L, 3); lua_pushnil(L); lua_pushstring(L, "executor required"); return 2; }
-
-    auto parse_result = LuaTreeParser::Parse(L, root_idx, subtrees_idx, sensor_defs_idx);
-    lua_pop(L, 3);
-    if (!parse_result.root) {
-        lua_pushnil(L);
-        lua_pushstring(L, parse_result.error.empty() ? "failed to parse tree" : parse_result.error.c_str());
-        return 2;
-    }
+    if (!rt_ctx) { lua_pushnil(L); lua_pushstring(L, "no LuaRuntime"); return 2; }
+    if (!rt_ctx->executor()) { lua_pushnil(L); lua_pushstring(L, "executor required"); return 2; }
 
     engine->Stop();
     engine->ClearOutcome();
@@ -194,7 +216,8 @@ int bt_ready(lua_State* L) {
     auto handle = rt_ctx->PreYield(L);
     uint64_t gen = engine->generation();
     ReadyAsync(rt_ctx, handle, engine->shared_from_this(),
-               std::move(parse_result.root), trace_paths, gen)
+               std::move(root_path), std::move(sensor_defs_path),
+               rt_ctx->shared_resource_provider(), trace_paths, gen)
         .via(rt_ctx->executor())
         .detach();
     return lua_yield(L, 0);

@@ -22,6 +22,7 @@ extern "C" {
 
 #include "code_provider.h"
 #include "coroutine_pool.h"
+#include "resource_provider.h"
 #include "lua_extension.h"
 #include "lua_library.h"
 #include "lua_types.h"
@@ -119,9 +120,13 @@ public:
     std::shared_ptr<CodeProvider> shared_code_provider() const { return code_provider_; }
     void set_shared_code_provider(std::shared_ptr<CodeProvider> provider) { code_provider_ = std::move(provider); }
 
+    std::shared_ptr<ResourceProvider> shared_resource_provider() const { return resource_provider_; }
+    void set_shared_resource_provider(std::shared_ptr<ResourceProvider> provider) { resource_provider_ = std::move(provider); }
+
     // --- Internal accessors (used by builtin helpers in .cc) ---
 
     CodeProvider* code_provider() const { return code_provider_.get(); }
+    ResourceProvider* resource_provider() const { return resource_provider_.get(); }
     async_simple::Executor* executor() const { return executor_; }
     lua_State* main_state() const { return main_L_; }
     std::optional<lua_CFunction> find_c_module(const std::string& name) const;
@@ -162,6 +167,7 @@ public:
         friend class LuaRuntime;
     public:
         Builder& WithCodeProvider(std::shared_ptr<CodeProvider> provider);
+        Builder& WithResourceProvider(std::shared_ptr<ResourceProvider> provider);
         Builder& WithExecutor(async_simple::Executor& executor);
         Builder& Register(const std::string& name, lua_CFunction openf);
         Builder& RegisterExtension(std::shared_ptr<LuaExtension> extension);
@@ -171,6 +177,7 @@ public:
 
     private:
         std::shared_ptr<CodeProvider> code_provider_;
+        std::shared_ptr<ResourceProvider> resource_provider_;
         async_simple::Executor* executor_ = nullptr;
         std::unordered_map<std::string, lua_CFunction> c_modules_;
         std::vector<std::shared_ptr<LuaExtension>> extensions_;
@@ -195,6 +202,7 @@ private:
 
     // Configuration setters (used by Builder)
     void SetCodeProvider(std::shared_ptr<CodeProvider> provider) { code_provider_ = std::move(provider); }
+    void SetResourceProvider(std::shared_ptr<ResourceProvider> provider) { resource_provider_ = std::move(provider); }
     void SetExecutor(async_simple::Executor* executor) { executor_ = executor; }
     void SetCModules(std::unordered_map<std::string, lua_CFunction> modules) { c_modules_ = std::move(modules); }
     void SetExtensions(std::vector<std::shared_ptr<LuaExtension>> extensions) { extensions_ = std::move(extensions); }
@@ -219,6 +227,7 @@ private:
     lua_State* main_L_ = nullptr;
 
     std::shared_ptr<CodeProvider> code_provider_;
+    std::shared_ptr<ResourceProvider> resource_provider_;
     std::vector<std::shared_ptr<LuaExtension>> extensions_;
     async_simple::Executor* executor_ = nullptr;
 

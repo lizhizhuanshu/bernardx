@@ -31,29 +31,15 @@
 #include "random_selector.h"
 #include "random_sequence.h"
 #include "wait_node.h"
-#include "lua_tree_parser.h"
+#include "tree_parser.h"
+#include "memory_resource_provider.h"
 #include "file_system_code_provider.h"
 
-extern "C" {
-#include "lauxlib.h"
-#include "lua.h"
-}
-
 namespace {
-// Parse a Lua table expression (e.g. "{type='Selector',...}") into a Node tree
-// using LuaTreeParser, bypassing the JSON-based TreeParser (removed).
-// Used by BehaviorTreeEngineTest as a replacement for the deleted engine->Load(json).
-std::unique_ptr<Node> ParseLuaTree(const std::string& lua_expr) {
-    lua_State* L = luaL_newstate();
-    if (luaL_dostring(L, ("return " + lua_expr).c_str()) != LUA_OK || !lua_istable(L, -1)) {
-        lua_close(L);
-        return nullptr;
-    }
-    lua_newtable(L);  // subtrees (empty)
-    lua_newtable(L);  // sensor_defs (empty)
-    auto result = LuaTreeParser::Parse(L, -3, -2, -1);
-    lua_close(L);
-    return std::move(result.root);
+// Parse a root node JSON object (e.g. {"type":"Selector",...}) into a Node tree.
+// Used by BehaviorTreeEngineTest for sync node-tree construction (no file loading).
+std::unique_ptr<Node> ParseJsonTree(const std::string& json) {
+    return std::move(TreeParser::Parse(json).root);
 }
 }  // namespace
 
@@ -351,7 +337,7 @@ TEST(ResumeSequenceTest, ResumesAtCurrentStepAfterInterrupt) {
 }
 
 TEST(ResumeSequenceParseTest, ParsesTypeAndChildren) {
-    auto node = ParseLuaTree("{type='ResumeSequence', children={{type='Wait',ms=10}}}");
+    auto node = ParseJsonTree(R"({"type":"ResumeSequence","children":[{"type":"Wait","ms":10}]})");
     ASSERT_NE(node, nullptr);
     EXPECT_EQ(node->type(), "ResumeSequence");
     EXPECT_EQ(static_cast<Composite*>(node.get())->children().size(), 1u);
@@ -589,8 +575,8 @@ protected:
 };
 
 TEST_F(BehaviorTreeEngineTest, LoadValidTree) {
-    engine->SetRoot(ParseLuaTree(
-        "{type='Selector',children={{type='Script',path='a.lua'},{type='Script',path='b.lua'}}}"));
+    engine->SetRoot(ParseJsonTree(
+        R"({"type":"Selector","children":[{"type":"Script","path":"a.lua"},{"type":"Script","path":"b.lua"}]})"));
     EXPECT_TRUE(engine->IsLoaded());
 }
 
@@ -599,8 +585,8 @@ TEST_F(BehaviorTreeEngineTest, StatusBeforeLoad) {
 }
 
 TEST_F(BehaviorTreeEngineTest, TickOnceOnLoadedTree) {
-    engine->SetRoot(ParseLuaTree(
-        "{type='Selector',children={{type='Script',path='nonexistent.lua'}}}"));
+    engine->SetRoot(ParseJsonTree(
+        R"({"type":"Selector","children":[{"type":"Script","path":"nonexistent.lua"}]})"));
     EXPECT_TRUE(engine->IsLoaded());
 
     auto status = engine->TickOnce();
@@ -608,8 +594,8 @@ TEST_F(BehaviorTreeEngineTest, TickOnceOnLoadedTree) {
 }
 
 TEST_F(BehaviorTreeEngineTest, StopResetsTree) {
-    engine->SetRoot(ParseLuaTree(
-        "{type='Selector',children={{type='Script',path='nonexistent.lua'}}}"));
+    engine->SetRoot(ParseJsonTree(
+        R"({"type":"Selector","children":[{"type":"Script","path":"nonexistent.lua"}]})"));
     engine->Stop();
     EXPECT_EQ(engine->GetStatus(), "idle");
 }
@@ -623,8 +609,8 @@ TEST_F(BehaviorTreeEngineTest, BlackboardPersistsAcrossLoad) {
     engine->blackboard().Set("x", LuaValue(static_cast<int64_t>(42)));
     EXPECT_TRUE(engine->blackboard().Has("x"));
 
-    engine->SetRoot(ParseLuaTree(
-        "{type='Selector',children={{type='Script',path='a.lua'}}}"));
+    engine->SetRoot(ParseJsonTree(
+        R"({"type":"Selector","children":[{"type":"Script","path":"a.lua"}]})"));
     // SetRoot preserves blackboard state
     EXPECT_TRUE(engine->blackboard().Has("x"));
 }
@@ -645,7 +631,9 @@ protected:
         blackboard = std::make_shared<Blackboard>();
         bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
         lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
+        resource_provider = std::make_shared<MemoryResourceProvider>();
         rt = LuaRuntime::Builder()
+            .WithResourceProvider(resource_provider)
             .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
             .Create();
@@ -655,9 +643,15 @@ protected:
         lib->engine()->Stop();
     }
 
+    // Register a root node JSON (referenced from Lua as root = "@root").
+    void PutRoot(std::string json) { resource_provider->Put("root", std::move(json)); }
+    // Register sensor definitions JSON (referenced as sensor_defs = "@sensors").
+    void PutSensors(std::string json) { resource_provider->Put("sensors", std::move(json)); }
+
     std::shared_ptr<Blackboard> blackboard;
     std::shared_ptr<BlackboardLibrary> bb_lib;
     std::shared_ptr<BehaviorTreeLibrary> lib;
+    std::shared_ptr<MemoryResourceProvider> resource_provider;
     LuaRuntime::Ptr rt;
 };
 
@@ -717,9 +711,10 @@ TEST_F(BehaviorTreeLibraryTest, RunInvalidJson) {
 
 TEST_F(BehaviorTreeLibraryTest, RunInvalidJsonReturnsSpecificError) {
     // A Script node with no path is rejected during parsing.
+    PutRoot(R"({"type":"Script"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.ready({root = {type = 'Script'}})
+        local status, err = bt.ready({root = "@root"})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -730,9 +725,10 @@ TEST_F(BehaviorTreeLibraryTest, RunInvalidJsonReturnsSpecificError) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, RunUnknownNodeType) {
+    PutRoot(R"({"type":"UnknownType"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.ready({root = {type = 'UnknownType'}})
+        local status, err = bt.ready({root = "@root"})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -772,11 +768,10 @@ TEST_F(BehaviorTreeLibraryTest, GetBlackboardAsTable) {
 
 TEST_F(BehaviorTreeLibraryTest, RunLoadAndTick) {
     // x.lua does not exist → script init fails → bt.ready returns nil + error.
+    PutRoot(R"({"type":"Selector","children":[{"type":"Script","path":"x.lua"}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.ready({
-            root = {type = 'Selector', children = {{type = 'Script', path = 'x.lua'}}}
-        })
+        local status, err = bt.ready({root = "@root"})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -884,10 +879,10 @@ TEST(DecoratorOnNodeTest, AddDecorator) {
 
 TEST(DecoratorOnNodeTest, EngineManagesDecoratorState) {
     auto engine = std::make_shared<BehaviorTreeEngine>();
-    engine->SetRoot(ParseLuaTree(
-        "{type='Selector',"
-        "decorators={{type='BlackboardCondition',key='hp',operator='is_set'}},"
-        "children={{type='Script',path='a.lua'}}}"));
+    engine->SetRoot(ParseJsonTree(
+        R"({"type":"Selector",)"
+        R"("decorators":[{"type":"BlackboardCondition","key":"hp","operator":"is_set"}],)"
+        R"("children":[{"type":"Script","path":"a.lua"}]})"));
     EXPECT_TRUE(engine->IsLoaded());
 }
 
@@ -926,9 +921,11 @@ protected:
         lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
         tests_dir_ = std::filesystem::absolute(
             std::filesystem::path(__FILE__).parent_path()).string();
+        resource_provider = std::make_shared<MemoryResourceProvider>();
         rt = LuaRuntime::Builder()
             .WithCodeProvider(std::make_shared<FileSystemCodeProvider>(
                 std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts", tests_dir_ + "/sensors"}))
+            .WithResourceProvider(resource_provider)
             .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
             .Create();
@@ -937,6 +934,9 @@ protected:
     void TearDown() override {
         lib->engine()->Stop();
     }
+
+    void PutRoot(std::string json) { resource_provider->Put("root", std::move(json)); }
+    void PutSensors(std::string json) { resource_provider->Put("sensors", std::move(json)); }
 
     std::string RunBtScript(const std::string& lua_code) {
         auto r = AWAIT_BT(rt->RunScript(lua_code));
@@ -954,14 +954,16 @@ protected:
     std::shared_ptr<Blackboard> blackboard;
     std::shared_ptr<BlackboardLibrary> bb_lib;
     std::shared_ptr<BehaviorTreeLibrary> lib;
+    std::shared_ptr<MemoryResourceProvider> resource_provider;
     LuaRuntime::Ptr rt;
     std::string tests_dir_;
 };
 
 TEST_F(ScriptNodeIntegrationTest, SelfStateInEnterAndTick) {
+    PutRoot(R"({"type":"Script","path":"scripts/bt_module.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/bt_module.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -970,9 +972,10 @@ TEST_F(ScriptNodeIntegrationTest, SelfStateInEnterAndTick) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, ExitReasonAsParameter) {
+    PutRoot(R"({"type":"Script","path":"scripts/check_reason.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/check_reason.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -981,9 +984,10 @@ TEST_F(ScriptNodeIntegrationTest, ExitReasonAsParameter) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
+    PutRoot(R"({"type":"Script","path":"scripts/with_args.lua","params":{"target":"enemy","damage":100}})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/with_args.lua', params = {target = 'enemy', damage = 100}}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -992,9 +996,10 @@ TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
+    PutRoot(R"({"type":"Script","path":"scripts/bool_args.lua","params":{"enabled":true}})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/bool_args.lua', params = {enabled = true}}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -1003,9 +1008,10 @@ TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
+    PutRoot(R"({"type":"Script","path":"scripts/counter.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/counter.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -1014,9 +1020,10 @@ TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, NoArgsStillWorks) {
+    PutRoot(R"({"type":"Script","path":"scripts/no_args.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/no_args.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -1025,11 +1032,10 @@ TEST_F(ScriptNodeIntegrationTest, NoArgsStillWorks) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, ScriptNotFoundReturnsError) {
+    PutRoot(R"({"type":"Script","path":"scripts/nonexistent.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.ready({
-            root = {type = 'Script', path = 'scripts/nonexistent.lua'}
-        })
+        local status, err = bt.ready({root = "@root"})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1041,9 +1047,10 @@ TEST_F(ScriptNodeIntegrationTest, ScriptNotFoundReturnsError) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, ScriptRuntimeErrorReturnsError) {
+    PutRoot(R"({"type":"Script","path":"scripts/runtime_error.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/runtime_error.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -1057,9 +1064,10 @@ TEST_F(ScriptNodeIntegrationTest, ScriptRuntimeErrorReturnsError) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, NodeReturnsFailureIsNotError) {
+    PutRoot(R"({"type":"Script","path":"scripts/returns_failure.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/returns_failure.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -1070,14 +1078,12 @@ TEST_F(ScriptNodeIntegrationTest, NodeReturnsFailureIsNotError) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, InitErrorInSequenceStopsEarly) {
+    PutRoot(R"({"type":"Sequence","children":[)"
+            R"({"type":"Script","path":"scripts/nonexistent.lua"},)"
+            R"({"type":"Script","path":"scripts/no_args.lua"}]})");
     auto r = AWAIT_BT(rt->RunScript(
         "local bt = require('bt')\n"
-        "local status, err = bt.ready({\n"
-        "    root = {type = 'Sequence', children = {\n"
-        "        {type = 'Script', path = 'scripts/nonexistent.lua'},\n"
-        "        {type = 'Script', path = 'scripts/no_args.lua'},\n"
-        "    }}\n"
-        "})\n"
+        "local status, err = bt.ready({root = '@root'})\n"
         "return status, err\n"
     ));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1098,9 +1104,11 @@ protected:
         lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
         tests_dir_ = std::filesystem::absolute(
             std::filesystem::path(__FILE__).parent_path()).string();
+        resource_provider = std::make_shared<MemoryResourceProvider>();
         rt = LuaRuntime::Builder()
             .WithCodeProvider(std::make_shared<FileSystemCodeProvider>(
                 std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts", tests_dir_ + "/sensors"}))
+            .WithResourceProvider(resource_provider)
             .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
             .Create();
@@ -1110,17 +1118,22 @@ protected:
         lib->engine()->Stop();
     }
 
+    void PutRoot(std::string json) { resource_provider->Put("root", std::move(json)); }
+    void PutSensors(std::string json) { resource_provider->Put("sensors", std::move(json)); }
+
     std::shared_ptr<Blackboard> blackboard;
     std::shared_ptr<BlackboardLibrary> bb_lib;
     std::shared_ptr<BehaviorTreeLibrary> lib;
+    std::shared_ptr<MemoryResourceProvider> resource_provider;
     LuaRuntime::Ptr rt;
     std::string tests_dir_;
 };
 
 TEST_F(BtRunOptionsTest, MaxStepStopsTree) {
+    PutRoot(R"({"type":"Script","path":"scripts/run_forever.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/run_forever.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({max_step = 2, interval = 10})
         return status, err
     )"));
@@ -1132,9 +1145,10 @@ TEST_F(BtRunOptionsTest, MaxStepStopsTree) {
 }
 
 TEST_F(BtRunOptionsTest, MaxStepNotReachedTreeCompletes) {
+    PutRoot(R"({"type":"Script","path":"scripts/run_3_ticks.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/run_3_ticks.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({max_step = 100, interval = 10})
         return status, err
     )"));
@@ -1146,9 +1160,10 @@ TEST_F(BtRunOptionsTest, MaxStepNotReachedTreeCompletes) {
 }
 
 TEST_F(BtRunOptionsTest, TimeoutStopsTree) {
+    PutRoot(R"({"type":"Script","path":"scripts/run_forever.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/run_forever.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({timeout = 1, interval = 10})
         return status, err
     )"));
@@ -1160,9 +1175,10 @@ TEST_F(BtRunOptionsTest, TimeoutStopsTree) {
 }
 
 TEST_F(BtRunOptionsTest, TimeoutNotReachedTreeCompletes) {
+    PutRoot(R"({"type":"Script","path":"scripts/run_3_ticks.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/run_3_ticks.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({timeout = 60000, interval = 10})
         return status, err
     )"));
@@ -1174,9 +1190,10 @@ TEST_F(BtRunOptionsTest, TimeoutNotReachedTreeCompletes) {
 }
 
 TEST_F(BtRunOptionsTest, IntervalAccepted) {
+    PutRoot(R"({"type":"Script","path":"scripts/run_3_ticks.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/run_3_ticks.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({interval = 10})
         return status, err
     )"));
@@ -1187,9 +1204,10 @@ TEST_F(BtRunOptionsTest, IntervalAccepted) {
 }
 
 TEST_F(BtRunOptionsTest, CombinedMaxStepAndInterval) {
+    PutRoot(R"({"type":"Script","path":"scripts/run_forever.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/run_forever.lua'}})
+        bt.ready({root = "@root"})
         local status, err = bt.exec({max_step = 3, interval = 10})
         return status, err
     )"));
@@ -1707,9 +1725,11 @@ protected:
         lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
         tests_dir_ = std::filesystem::absolute(
             std::filesystem::path(__FILE__).parent_path()).string();
+        resource_provider = std::make_shared<MemoryResourceProvider>();
         rt = LuaRuntime::Builder()
             .WithCodeProvider(std::make_shared<FileSystemCodeProvider>(
                 std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts", tests_dir_ + "/sensors"}))
+            .WithResourceProvider(resource_provider)
             .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
             .Create();
@@ -1719,9 +1739,13 @@ protected:
         lib->engine()->Stop();
     }
 
+    void PutRoot(std::string json) { resource_provider->Put("root", std::move(json)); }
+    void PutSensors(std::string json) { resource_provider->Put("sensors", std::move(json)); }
+
     std::shared_ptr<Blackboard> blackboard;
     std::shared_ptr<BlackboardLibrary> bb_lib;
     std::shared_ptr<BehaviorTreeLibrary> lib;
+    std::shared_ptr<MemoryResourceProvider> resource_provider;
     LuaRuntime::Ptr rt;
     std::string tests_dir_;
 };
@@ -1732,24 +1756,14 @@ TEST_F(AbortPropagationTest, SelfAbortTerminatesTree) {
     // Script runs then clears "go" after 2 ticks. abort=Self on the Script.
     // When "go" is cleared, the decorator transitions true→false, triggering Self abort.
     // Sequence then fails (no more children).
+    PutRoot(R"({"type":"Sequence","children":[)"
+            R"({"type":"Script","path":"scripts/run_then_clear_flag.lua",)"
+            R"("decorators":[{"type":"BlackboardCondition","key":"go","operator":"equals","value":true,"abort":"Self"}]}]})");
     auto r = AWAIT_ABORT(rt->RunScript(R"(
         local bt = require('bt')
         local bb = require('blackboard')
         bb.set("go", true)
-        bt.ready({
-            root = {
-                type = 'Sequence',
-                children = {
-                    {
-                        type = 'Script',
-                        path = 'scripts/run_then_clear_flag.lua',
-                        decorators = {
-                            {type = 'BlackboardCondition', key = 'go', operator = 'equals', value = true, abort = 'Self'}
-                        }
-                    }
-                }
-            }
-        })
+        bt.ready({root = "@root"})
         local status = bt.exec({max_step = 20, interval = 10})
         return status
     )"));
@@ -1764,27 +1778,14 @@ TEST_F(AbortPropagationTest, LowerPriorityAbortPreemptsSibling) {
     // Selector: [no_args (decorator: flag is_set, abort=LowerPriority), run_then_set_flag]
     // run_then_set_flag sets "flag" after 2 ticks.
     // When flag appears, LowerPriority abort fires → second child aborted → first child retries → succeeds.
+    PutRoot(R"({"type":"Selector","children":[)"
+            R"({"type":"Script","path":"scripts/no_args.lua",)"
+            R"("decorators":[{"type":"BlackboardCondition","key":"flag","operator":"is_set","abort":"LowerPriority"}]},)"
+            R"({"type":"Script","path":"scripts/run_then_set_flag.lua"}]})");
     auto r = AWAIT_ABORT(rt->RunScript(R"(
         local bt = require('bt')
         local bb = require('blackboard')
-        bt.ready({
-            root = {
-                type = 'Selector',
-                children = {
-                    {
-                        type = 'Script',
-                        path = 'scripts/no_args.lua',
-                        decorators = {
-                            {type = 'BlackboardCondition', key = 'flag', operator = 'is_set', abort = 'LowerPriority'}
-                        }
-                    },
-                    {
-                        type = 'Script',
-                        path = 'scripts/run_then_set_flag.lua'
-                    }
-                }
-            }
-        })
+        bt.ready({root = "@root"})
         local status = bt.exec({max_step = 20, interval = 10})
         return status
     )"));
@@ -1893,9 +1894,10 @@ TEST(PathTracerTest, DecoratorFlipRecorded) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
+    PutRoot(R"({"type":"Wait","ms":999999})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root={type='Wait', ms=999999}})
+        bt.ready({root = "@root"})
         bt.exec({max_step=3, interval=1})
         local p = bt.dump_paths()
         return p.total_ticks, p.path_occurrences, #p.paths, p.terminal, p.has_terminal
@@ -1910,9 +1912,10 @@ TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
+    PutRoot(R"({"type":"Wait","ms":999999})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root={type='Wait', ms=999999}, trace_paths=false})
+        bt.ready({root = "@root", trace_paths=false})
         bt.exec({max_step=3, interval=1})
         local p = bt.dump_paths()
         return p.total_ticks, p.tracing
@@ -1924,9 +1927,10 @@ TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
+    PutRoot(R"({"type":"Wait","ms":999999})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root={type='Wait', ms=999999}})
+        bt.ready({root = "@root"})
         bt.exec({max_step=2, interval=1})
         local report = bt.path_report()
         return type(report), #report > 0, string.find(report, '路径报告') ~= nil
@@ -1941,11 +1945,12 @@ TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
 // --- lifecycle API: goto_path / exec / await / pause ---
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathLegal) {
+    PutRoot(R"({"type":"Sequence","name":"root","children":[)"
+            R"({"type":"Wait","name":"w1","ms":99999},)"
+            R"({"type":"Wait","name":"w2","ms":99999}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root={type='Sequence', name='root', children={
-            {type='Wait', name='w1', ms=99999},
-            {type='Wait', name='w2', ms=99999}}}})
+        bt.ready({root = "@root"})
         local ok, err = bt.goto_path({'root', 'w2'})
         return ok, err
     )"));
@@ -1955,10 +1960,11 @@ TEST_F(BehaviorTreeLibraryTest, GotoPathLegal) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathNameNotFound) {
+    PutRoot(R"({"type":"Sequence","name":"root","children":[)"
+            R"({"type":"Wait","name":"w1","ms":99999}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root={type='Sequence', name='root', children={
-            {type='Wait', name='w1', ms=99999}}}})
+        bt.ready({root = "@root"})
         local ok, err = bt.goto_path({'root', 'nope'})
         return ok, err
     )"));
@@ -1969,10 +1975,11 @@ TEST_F(BehaviorTreeLibraryTest, GotoPathNameNotFound) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathRejectsParallel) {
+    PutRoot(R"({"type":"Parallel","name":"par","children":[)"
+            R"({"type":"Wait","name":"w1","ms":99999}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.ready({root={type='Parallel', name='par', children={
-            {type='Wait', name='w1', ms=99999}}}})
+        bt.ready({root = "@root"})
         local ok, err = bt.goto_path({'par', 'w1'})
         return ok, err
     )"));

@@ -20,33 +20,38 @@ local bt = require('bt')
 
 ## 核心机制一览
 
-先用一个微型示例把全部核心件一次串起来：**树拓扑**（`root`，Lua table）描述结构、**Script**（叶子）用 `Tick` 返回状态驱动流转、**Sensor**（传感器）把感知结果写黑板、**BlackboardCondition**（装饰器）读黑板做条件门。
+先用一个微型示例把全部核心件一次串起来：**树拓扑**（`root` 指向一个 JSON 文件）描述结构、**Script**（叶子）用 `Tick` 返回状态驱动流转、**Sensor**（传感器）把感知结果写黑板、**BlackboardCondition**（装饰器）读黑板做条件门。
 
-场景：敌人进入 10 米内则攻击，否则巡逻。
+场景：敌人进入 10 米内则攻击，否则巡逻。`root`/`sensor_defs` 都是 JSON 文件路径（`@` 前缀走项目资源，否则绝对路径）。
 
 ```lua
 local bt = require('bt')
 
 bt.ready({
-    root = {
-        type = 'Selector',                 -- ① 根节点（复合 OR）：依次尝试，首个成功即停
-        sensors = { 'enemy_dist' },        -- ② 传感器挂在根上 → 根总在活跃路径，传感器常驻
-        children = {
-            {   type = 'Script',           -- ④ 动作 A：攻击
-                path = 'scripts/attack.lua',
-                decorators = {             -- ③ 条件门：bb.enemy_dist < 10 才放行
-                    { type = 'BlackboardCondition', key = 'enemy_dist',
-                      operator = 'less_than', value = 10 },
-                },
-            },
-            { type = 'Script', path = 'scripts/patrol.lua' },  -- 动作 B：否则巡逻
-        },
-    },
-    sensor_defs = {
-        enemy_dist = { interval = 100, path = 'sensors/enemy_dist.lua' },
-    },
+    root = "@bt/attack_or_patrol.json",        -- 根节点 JSON 文件
+    sensor_defs = "@bt/sensors.json",          -- 传感器定义 JSON 文件
 })
-local status = bt.exec({ interval = 100 }) -- 阻塞到完成/超时；期间可被宿主暂停/恢复
+local status = bt.exec({ interval = 100 })     -- 阻塞到完成/超时；期间可被宿主暂停/恢复
+```
+
+`@bt/attack_or_patrol.json` —— 根节点（复合 OR，首个成功即停；传感器挂在根上常驻）：
+
+```json
+{
+  "type": "Selector",
+  "sensors": ["enemy_dist"],
+  "children": [
+    { "type": "Script", "path": "scripts/attack.lua",
+      "decorators": [ {"type":"BlackboardCondition","key":"enemy_dist","operator":"less_than","value":10} ] },
+    { "type": "Script", "path": "scripts/patrol.lua" }
+  ]
+}
+```
+
+`@bt/sensors.json` —— 传感器脚本与调度配置：
+
+```json
+{ "enemy_dist": { "interval": 100, "path": "sensors/enemy_dist.lua" } }
 ```
 
 Sensor 脚本——`Tick` 返回值写入黑板：
@@ -84,16 +89,40 @@ return M
 
 ### bt.ready(opts)
 
-构建 Node 树 → 初始化 Script → 初始化 Sensor → 激活初始 Sensor。**协程 yield**，完成后恢复，返回 `"ready"` 或 `nil, err`（parse/init 错）。
+加载 JSON 定义文件 → 构建 Node 树 → 初始化 Script → 初始化 Sensor → 激活初始 Sensor。**协程 yield**，完成后恢复，返回 `"ready"` 或 `nil, err`（load/parse/init 错）。
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `root` | `table` | **是** | 根节点定义（行为树拓扑，见下） |
-| `subtrees` | `table` | 否 | 子树定义：`{名字 = 节点定义, ...}` |
-| `sensor_defs` | `table` | 否 | 传感器定义：`{名字 = {interval, params, path}, ...}`（节点用 `sensors = {'名字'}` 按名引用） |
+| `root` | `string` | **是** | 根节点 JSON 文件路径（见[路径解析](#路径解析)） |
+| `sensor_defs` | `string` | 否 | 传感器定义 JSON 文件路径 |
 | `trace_paths` | `bool` | 否 | 是否采集路径数据（默认 `true`，见[路径记录](#路径记录-path-tracer)） |
 
 `ready` 在 running/paused 时调用会报错（先 `stop`）。
+
+#### 路径解析
+
+`root`、`sensor_defs`、以及 Subtree 节点的 `path` 都是字符串路径，统一按以下规则解析：
+
+- `@<相对路径>` —— **项目资源**：由 `ResourceProvider` 在资源根目录下按相对路径加载。
+- `<绝对路径>` —— 直接从文件系统读取。
+
+树拓扑以 JSON 提供，**不再有 `subtrees` 注册表**：Subtree 节点用自己的 `path` 指向另一份子树 JSON 文件（递归，按同样规则解析）。
+
+#### JSON 定义格式
+
+`root` 文件内容就是一个**根节点对象**（结构同下方节点表，键名用 JSON 双引号、字符串用双引号）：
+
+```json
+{
+  "type": "Selector",
+  "sensors": ["enemy_dist"],
+  "children": [ {"type":"Script","path":"scripts/attack.lua"} ]
+}
+```
+
+`sensor_defs` 文件内容是 `{"名字": {"interval": 毫秒, "path": "脚本路径", "params": {...}}}`。`params`/装饰器 `value` 的类型支持 `bool`/`int`/`double`/`string`。
+
+Script 节点与传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `CodeProvider` 加载——请将 `scripts/`、`sensors/` 等脚本目录纳入 `CodeProvider` 搜索路径。
 
 ### bt.exec(opts)
 
@@ -123,12 +152,8 @@ return M
 
 ```lua
 bt.ready({
-    root = { type = 'Sequence', children = {
-        { type = 'Script', path = 'scripts/attack.lua', params = { target = 'enemy' } },
-        { type = 'Subtree', path = 'combat' },
-    }},
-    subtrees = { combat = { type = 'Sequence', children = { ... } } },
-    sensor_defs = { hp = { interval = 100, path = 'sensors/hp.lua' } },
+    root = "@bt/root.json",            -- 根节点 JSON：Sequence → attack + Subtree("combat")
+    sensor_defs = "@bt/sensors.json",  -- 传感器定义
     trace_paths = true,
 })
 local status, err = bt.exec({ interval = 100, max_step = 1000, timeout = 5000 })
@@ -143,7 +168,7 @@ print(bt.path_report())
 
 Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `CodeProvider` 加载（与主脚本 `require()` / `loadfile()` 共用同一加载器）。`path` 相对 `CodeProvider` 的搜索路径解析——请将 `scripts/`、`sensors/` 等脚本目录纳入 `CodeProvider` 搜索路径。
 
-**`bt.ready` 不再有 `project_path`/目录加载**：树拓扑由 `root`/`subtrees` table 直接提供，不经文件或 JSON。
+**`bt.ready` 的树拓扑从 JSON 文件加载**：`root`/`sensor_defs` 是文件路径（`@` 资源或绝对路径，见[路径解析](#路径解析)），Subtree 节点也按 `path` 加载子树 JSON。Script 与传感器的 Lua 脚本则由 `CodeProvider` 经 `path` 加载——两套加载器各管一摊。
 
 ## 节点速查表
 
@@ -158,7 +183,7 @@ Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `
 | `RandomSelector` | 复合 | `type` | `children` | 随机顺序 OR |
 | `RandomSequence` | 复合 | `type` | `children` | 随机顺序 AND |
 | `Script` | 叶子 | `type`,`path` | 无 | 执行 Lua 脚本，`params` 传参 |
-| `Subtree` | 叶子 | `type`,`path` | 无 | 引用 subtrees 子树 |
+| `Subtree` | 叶子 | `type`,`path` | 无 | 按 `path` 加载子树 JSON（递归） |
 | `Wait` | 叶子 | `type` | 无 | 等待指定毫秒数 |
 | `Repeat` | 包装 | `type` | `children[1]` | 重复执行子节点 |
 | `RetryUntilSuccessful` | 包装 | `type` | `children[1]` | 失败时重试 |
@@ -256,16 +281,18 @@ return M
 
 #### Subtree — 子树节点
 
-```lua
-{ type = 'Subtree', path = 'combat', name = '可选' }
+`path` 指向一份**子树 JSON 文件**（内容就是该子树的根节点对象，按[路径解析](#路径解析) 加载，递归，可嵌套引用其它子树）。
+
+```json
+{ "type": "Subtree", "path": "@bt/combat.json", "name": "可选" }
 ```
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `path` | **是** | `subtrees` table 中定义的子树名（按名引用） |
+| `path` | **是** | 子树 JSON 文件路径（`@` 资源或绝对路径） |
 | `name` | 否 | 默认等于 path 值 |
 
-支持 `decorators`/`sensors`，子树定义内可引用其他子树（可嵌套）。
+支持 `decorators`/`sensors`。
 
 #### Wait — 等待节点
 
@@ -316,20 +343,23 @@ decorators = {
 
 ### 配置方式
 
-传感器的**脚本与调度配置集中在 `bt.ready` 的 `sensor_defs` 参数**（一个 `{名字 = 配置}` 的 table）；节点通过 `sensors = {'名字'}` 数组按名引用。
+传感器的**脚本与调度配置集中在 `sensor_defs` JSON 文件**（`bt.ready` 的 `sensor_defs` 参数是其路径）；节点通过 `sensors = ['名字']` 数组按名引用。
 
 ```lua
 bt.ready({
-    root = {
-        type = 'Script', path = 'scripts/click.lua',
-        sensors = { 'login_visible' },          -- 引用名字
-    },
-    sensor_defs = {
-        login_visible = { interval = 100, path = 'sensors/element_visible.lua', params = { selector = '#login' } },
-        hp = { interval = 50, path = 'sensors/hp.lua' },
-    },
+    root = "@bt/click.json",            -- root JSON 内某节点带 "sensors": ["login_visible"]
+    sensor_defs = "@bt/sensors.json",
 })
 bt.exec({ interval = 100 })
+```
+
+`@bt/sensors.json`：
+
+```json
+{
+  "login_visible": { "interval": 100, "path": "sensors/element_visible.lua", "params": { "selector": "#login" } },
+  "hp": { "interval": 50, "path": "sensors/hp.lua" }
+}
 ```
 
 ### 配置字段
@@ -408,9 +438,9 @@ return M
 配置里的 `params` 会原样作为参数传给 `Enter`：
 
 ```lua
--- bt.ready 配置：
---   sensor_defs = { threat = { interval = 100, path = 'sensors/threat.lua',
---                              params = { range = 50, faction = 'enemy' } } }
+-- sensor_defs JSON 中：
+--   { "threat": { "interval": 100, "path": "sensors/threat.lua",
+--                 "params": { "range": 50, "faction": "enemy" } } }
 local M = {}
 function M:Enter(params)
   self.range   = params.range         -- 50
@@ -434,23 +464,29 @@ return M
 
 ```lua
 bt.ready({
-    root = {
-        type = 'Sequence', name = 'engage',
-        sensors = { 'nearby_enemies' },          -- 节点活跃时该传感器周期运行
-        children = {
-            { type = 'Script', path = 'scripts/attack.lua',
-              decorators = {
-                  { type = 'BlackboardCondition', key = 'nearby_enemies',
-                    operator = 'greater_than', value = 0, abort = 'Self' },
-              },
-            },
-        },
-    },
-    sensor_defs = {
-        nearby_enemies = { interval = 100, path = 'sensors/nearby_enemies.lua' },
-    },
+    root = "@bt/engage.json",
+    sensor_defs = "@bt/sensors.json",
 })
 bt.exec({ interval = 100 })
+```
+
+`@bt/engage.json`（Sequence，挂 `nearby_enemies` 传感器；条件 `> 0` 才放行 attack，否则中止）：
+
+```json
+{
+  "type": "Sequence", "name": "engage",
+  "sensors": ["nearby_enemies"],
+  "children": [
+    { "type": "Script", "path": "scripts/attack.lua",
+      "decorators": [ {"type":"BlackboardCondition","key":"nearby_enemies","operator":"greater_than","value":0,"abort":"Self"} ] }
+  ]
+}
+```
+
+`@bt/sensors.json`：
+
+```json
+{ "nearby_enemies": { "interval": 100, "path": "sensors/nearby_enemies.lua" } }
 ```
 
 ```lua
@@ -479,37 +515,47 @@ return M
 ```lua
 local bt = require('bt')
 
-bt.ready({
-    root = {
-        type = 'Selector', name = 'ai_root',
-        decorators = {
-            { type = 'BlackboardCondition', key = 'alive', operator = 'is_set', abort = 'Self' },
-        },
-        children = {
-            { type = 'Subtree', path = 'combat' },
-            { type = 'Subtree', path = 'patrol' },
-            { type = 'Script', path = 'scripts/idle.lua', decorators = { { type = 'ForceSuccess' } } },
-        },
-    },
-    subtrees = {
-        combat = {
-            type = 'Sequence', name = 'combat',
-            decorators = { { type = 'BlackboardCondition', key = 'has_target', operator = 'is_set' } },
-            children = {
-                { type = 'Script', path = 'scripts/aim.lua', name = 'aim' },
-                { type = 'Script', path = 'scripts/attack.lua', name = 'attack' },
-            },
-        },
-        patrol = {
-            type = 'Sequence', name = 'patrol',
-            children = {
-                { type = 'Script', path = 'scripts/find_point.lua' },
-                { type = 'Script', path = 'scripts/move_to.lua' },
-            },
-        },
-    },
-})
+bt.ready({ root = "@bt/ai_root.json" })
 local status, err = bt.exec({ interval = 100 })
+```
+
+`@bt/ai_root.json` —— 根节点引用两份子树 JSON：
+
+```json
+{
+  "type": "Selector", "name": "ai_root",
+  "decorators": [ {"type":"BlackboardCondition","key":"alive","operator":"is_set","abort":"Self"} ],
+  "children": [
+    { "type": "Subtree", "path": "@bt/combat.json" },
+    { "type": "Subtree", "path": "@bt/patrol.json" },
+    { "type": "Script", "path": "scripts/idle.lua", "decorators": [ {"type":"ForceSuccess"} ] }
+  ]
+}
+```
+
+`@bt/combat.json`（子树 JSON 就是该子树的根节点对象；可再引用其它子树，递归）：
+
+```json
+{
+  "type": "Sequence", "name": "combat",
+  "decorators": [ {"type":"BlackboardCondition","key":"has_target","operator":"is_set"} ],
+  "children": [
+    { "type": "Script", "path": "scripts/aim.lua", "name": "aim" },
+    { "type": "Script", "path": "scripts/attack.lua", "name": "attack" }
+  ]
+}
+```
+
+`@bt/patrol.json`：
+
+```json
+{
+  "type": "Sequence", "name": "patrol",
+  "children": [
+    { "type": "Script", "path": "scripts/find_point.lua" },
+    { "type": "Script", "path": "scripts/move_to.lua" }
+  ]
+}
 ```
 
 ## 路径记录 (path tracer)
@@ -554,7 +600,7 @@ local p = bt.dump_paths()
 返回三视图报告的**字符串**(A 路径热度 + B 树形热力图 + C 切换时间线)。由你决定何时获取、如何输出:
 
 ```lua
-bt.ready({ root = { ... } })                  -- 采集(默认开)
+bt.ready({ root = "@bt/root.json" })         -- 采集(默认开)
 bt.exec({ interval = 10, max_step = 100 })
 print(bt.path_report())                       -- 自行打印 / 写文件 / 发日志
 ```

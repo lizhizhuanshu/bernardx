@@ -53,7 +53,7 @@ my_project/               ← --dir 指向这里
 └── sensors/              # BT 传感器脚本（由 CodeProvider 加载）
 ```
 
-行为树结构在 `bt.ready` 调用时以 Lua table 直接传入（`root` / `subtrees` / `sensor_defs`），不经文件或 JSON。Script 节点与传感器的 Lua 脚本仍由 `path` 指定，统一由运行时 `CodeProvider` 加载（与主脚本 `require()` 共用同一加载器）——请将 `scripts/`、`sensors/` 等脚本目录纳入 `CodeProvider` 搜索路径。详见 [行为树文档](bt.md)。
+行为树结构在 `bt.ready` 调用时从 **JSON 文件**加载：`root` 与 `sensor_defs` 为文件路径（`@` 前缀走项目资源 `ResourceProvider`，否则绝对路径）；Subtree 节点也按 `path` 加载子树 JSON。Script 节点与传感器的 Lua 脚本仍由 `path` 指定，统一由运行时 `CodeProvider` 加载（与主脚本 `require()` 共用同一加载器）——请将 `scripts/`、`sensors/` 等脚本目录纳入 `CodeProvider` 搜索路径。详见 [行为树文档](bt.md)。
 
 ## 退出码
 
