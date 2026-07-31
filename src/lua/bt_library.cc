@@ -155,20 +155,20 @@ int bt_ready(lua_State* L) {
         return 2;
     }
 
-    lua_getfield(L, 1, "tree");
-    int tree_idx = lua_absindex(L, -1);
-    if (!lua_istable(L, tree_idx)) {
+    lua_getfield(L, 1, "root");
+    int root_idx = lua_absindex(L, -1);
+    if (!lua_istable(L, root_idx)) {
         lua_pop(L, 1);
         lua_pushnil(L);
-        lua_pushstring(L, "tree (table) required");
+        lua_pushstring(L, "root (table) required");
         return 2;
     }
     lua_getfield(L, 1, "subtrees");
     if (!lua_istable(L, -1)) { lua_pop(L, 1); lua_newtable(L); }
     int subtrees_idx = lua_absindex(L, -1);
-    lua_getfield(L, 1, "sensors");
+    lua_getfield(L, 1, "sensor_defs");
     if (!lua_istable(L, -1)) { lua_pop(L, 1); lua_newtable(L); }
-    int sensors_idx = lua_absindex(L, -1);
+    int sensor_defs_idx = lua_absindex(L, -1);
 
     bool trace_paths = true;
     lua_getfield(L, 1, "trace_paths");
@@ -179,7 +179,7 @@ int bt_ready(lua_State* L) {
     if (!rt_ctx) { lua_pop(L, 3); lua_pushnil(L); lua_pushstring(L, "no LuaRuntime"); return 2; }
     if (!rt_ctx->executor()) { lua_pop(L, 3); lua_pushnil(L); lua_pushstring(L, "executor required"); return 2; }
 
-    auto parse_result = LuaTreeParser::Parse(L, tree_idx, subtrees_idx, sensors_idx);
+    auto parse_result = LuaTreeParser::Parse(L, root_idx, subtrees_idx, sensor_defs_idx);
     lua_pop(L, 3);
     if (!parse_result.root) {
         lua_pushnil(L);

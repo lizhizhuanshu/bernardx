@@ -18,9 +18,9 @@ struct LuaParseResult {
 // Builds a behavior-tree Node tree directly from Lua tables on the stack,
 // bypassing any JSON representation.
 //
-// tree_idx     — stack position of the `tree` table (root node definition, required)
+// tree_idx     — stack position of the `root` table (root node definition, required)
 // subtrees_idx — stack position of the `subtrees` table (name -> node definition)
-// sensors_idx  — stack position of the `sensors` table (name -> {interval, args, path})
+// sensors_idx  — stack position of the `sensor_defs` table (name -> {interval, args, path})
 //
 // All indices are normalized to absolute positions internally, so callers may
 // pass relative indices. The three tables must remain on the stack for the

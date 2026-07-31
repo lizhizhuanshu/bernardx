@@ -64,12 +64,12 @@ TEST_F(SensorActivationTest, SensorOnActivePathIsActivated) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Script',
                 path = 'scripts/no_args.lua',
                 sensors = {'sensor_a'},
             },
-            sensors = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
+            sensor_defs = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -85,7 +85,7 @@ TEST_F(SensorActivationTest, SensorOnInactiveBranchNotActivated) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Selector',
                 children = {
                     { type = 'Script', path = 'scripts/no_args.lua', name = 'branch_a' },
@@ -96,7 +96,7 @@ TEST_F(SensorActivationTest, SensorOnInactiveBranchNotActivated) {
                     },
                 },
             },
-            sensors = { sensor_b = {path = 'sensors/tracking_b.lua', interval = 50} },
+            sensor_defs = { sensor_b = {path = 'sensors/tracking_b.lua', interval = 50} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -111,7 +111,7 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenBranchLeavesActivePath) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Selector',
                 children = {
                     {
@@ -122,7 +122,7 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenBranchLeavesActivePath) {
                     { type = 'Script', path = 'scripts/no_args.lua', name = 'branch_b' },
                 },
             },
-            sensors = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
+            sensor_defs = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -138,7 +138,7 @@ TEST_F(SensorActivationTest, BothBranchesActivatedSequentially) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Selector',
                 children = {
                     {
@@ -153,7 +153,7 @@ TEST_F(SensorActivationTest, BothBranchesActivatedSequentially) {
                     },
                 },
             },
-            sensors = {
+            sensor_defs = {
                 sensor_a = {path = 'sensors/tracking_a.lua', interval = 50},
                 sensor_b = {path = 'sensors/tracking_b.lua', interval = 50},
             },
@@ -174,12 +174,12 @@ TEST_F(SensorActivationTest, AllSensorsDeactivatedWhenTreeCompletes) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Script',
                 path = 'scripts/run_3_ticks.lua',
                 sensors = {'sensor_a'},
             },
-            sensors = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
+            sensor_defs = { sensor_a = {path = 'sensors/tracking_a.lua', interval = 50} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -195,7 +195,7 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenAnotherSelectorBranchTakesOver
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Selector',
                 children = {
                     {
@@ -210,7 +210,7 @@ TEST_F(SensorActivationTest, SensorDeactivatedWhenAnotherSelectorBranchTakesOver
                     },
                 },
             },
-            sensors = {
+            sensor_defs = {
                 sensor_a = {path = 'sensors/tracking_a.lua', interval = 50},
                 sensor_b = {path = 'sensors/tracking_b.lua', interval = 50},
             },
@@ -233,7 +233,7 @@ TEST_F(AbortSensorTest, LowerPriorityKeepsSensorActive) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Sequence',
                 children = {
                     {
@@ -246,7 +246,7 @@ TEST_F(AbortSensorTest, LowerPriorityKeepsSensorActive) {
                     { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
                 },
             },
-            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+            sensor_defs = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -261,7 +261,7 @@ TEST_F(AbortSensorTest, NoAbortDeactivatesSensor) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Sequence',
                 children = {
                     {
@@ -274,7 +274,7 @@ TEST_F(AbortSensorTest, NoAbortDeactivatesSensor) {
                     { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
                 },
             },
-            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+            sensor_defs = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -289,7 +289,7 @@ TEST_F(AbortSensorTest, BothKeepsSensorActive) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Sequence',
                 children = {
                     {
@@ -302,7 +302,7 @@ TEST_F(AbortSensorTest, BothKeepsSensorActive) {
                     { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
                 },
             },
-            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+            sensor_defs = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -317,7 +317,7 @@ TEST_F(AbortSensorTest, SelfAbortDeactivatesSensor) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Sequence',
                 children = {
                     {
@@ -330,7 +330,7 @@ TEST_F(AbortSensorTest, SelfAbortDeactivatesSensor) {
                     { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
                 },
             },
-            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+            sensor_defs = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -345,7 +345,7 @@ TEST_F(AbortSensorTest, NoDecoratorDeactivatesSensor) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Sequence',
                 children = {
                     {
@@ -355,7 +355,7 @@ TEST_F(AbortSensorTest, NoDecoratorDeactivatesSensor) {
                     { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
                 },
             },
-            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+            sensor_defs = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -370,7 +370,7 @@ TEST_F(AbortSensorTest, SecondSensorWithAbortAlsoMonitored) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Sequence',
                 children = {
                     {
@@ -383,7 +383,7 @@ TEST_F(AbortSensorTest, SecondSensorWithAbortAlsoMonitored) {
                     { type = 'Script', path = 'scripts/run_3_ticks.lua', name = 'step_b' },
                 },
             },
-            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+            sensor_defs = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -402,7 +402,7 @@ TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
         local bb = require('blackboard')
         bb.set('flag', true)
         bt.ready({
-            tree = {
+            root = {
                 type = 'Sequence',
                 children = {
                     {
@@ -436,7 +436,7 @@ TEST_F(DeepSensorTest, FiveLevelTreeSensorActivation) {
                     },
                 },
             },
-            sensors = {
+            sensor_defs = {
                 sensor_a = {path = 'sensors/counting_a.lua', interval = 10},
                 sensor_b = {path = 'sensors/counting_b.lua', interval = 10},
                 sensor_c = {path = 'sensors/counting_c.lua', interval = 10},
@@ -457,7 +457,7 @@ TEST_F(DeepSensorTest, FiveLevelAbortMonitoringAcrossDepths) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Sequence',
                 children = {
                     {
@@ -485,7 +485,7 @@ TEST_F(DeepSensorTest, FiveLevelAbortMonitoringAcrossDepths) {
                     { type = 'Script', path = 'scripts/run_5_ticks.lua', name = 'L2_tail' },
                 },
             },
-            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+            sensor_defs = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -500,7 +500,7 @@ TEST_F(DeepSensorTest, FiveLevelNoAbortSensorDeactivatedAtDepth) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Sequence',
                 children = {
                     {
@@ -525,7 +525,7 @@ TEST_F(DeepSensorTest, FiveLevelNoAbortSensorDeactivatedAtDepth) {
                     { type = 'Script', path = 'scripts/run_5_ticks.lua', name = 'L2_tail' },
                 },
             },
-            sensors = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
+            sensor_defs = { sensor_a = {path = 'sensors/counting_a.lua', interval = 10} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -545,7 +545,7 @@ TEST_F(DeepSensorTest, FiveLevelMultipleAbortSensorsAtDifferentDepths) {
         bb.set('y', true)
         bb.set('z', true)
         bt.ready({
-            tree = {
+            root = {
                 type = 'Sequence',
                 children = {
                     {
@@ -589,7 +589,7 @@ TEST_F(DeepSensorTest, FiveLevelMultipleAbortSensorsAtDifferentDepths) {
                     { type = 'Script', path = 'scripts/run_5_ticks.lua', name = 'L2_tail' },
                 },
             },
-            sensors = {
+            sensor_defs = {
                 sensor_a = {path = 'sensors/counting_a.lua', interval = 10},
                 sensor_b = {path = 'sensors/counting_b.lua', interval = 10},
                 sensor_c = {path = 'sensors/counting_c.lua', interval = 10},
@@ -612,12 +612,12 @@ TEST_F(SensorInitTest, SensorWithBasicScript) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Script',
                 path = 'scripts/no_args.lua',
                 sensors = {'hp'},
             },
-            sensors = { hp = {path = 'sensors/basic.lua', interval = 50} },
+            sensor_defs = { hp = {path = 'sensors/basic.lua', interval = 50} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -632,12 +632,12 @@ TEST_F(SensorInitTest, SensorWithAsyncRequire) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Script',
                 path = 'scripts/no_args.lua',
                 sensors = {'data'},
             },
-            sensors = { data = {path = 'sensors/with_require.lua', interval = 50} },
+            sensor_defs = { data = {path = 'sensors/with_require.lua', interval = 50} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -652,12 +652,12 @@ TEST_F(SensorInitTest, SensorScriptNotFound) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.ready({
-            tree = {
+            root = {
                 type = 'Script',
                 path = 'scripts/no_args.lua',
                 sensors = {'bad'},
             },
-            sensors = { bad = {path = 'sensors/nonexistent.lua', interval = 50} },
+            sensor_defs = { bad = {path = 'sensors/nonexistent.lua', interval = 50} },
         })
         if not status then return false, err end
         return true, status
@@ -674,12 +674,12 @@ TEST_F(SensorInitTest, SensorMissingTickFunction) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.ready({
-            tree = {
+            root = {
                 type = 'Script',
                 path = 'scripts/no_args.lua',
                 sensors = {'no_tick'},
             },
-            sensors = { no_tick = {path = 'sensors/missing_tick.lua', interval = 50} },
+            sensor_defs = { no_tick = {path = 'sensors/missing_tick.lua', interval = 50} },
         })
         if not status then return false, err end
         return true, status
@@ -696,12 +696,12 @@ TEST_F(SensorInitTest, SensorOnCompositeNode) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Sequence',
                 sensors = {'hp'},
                 children = { { type = 'Script', path = 'scripts/no_args.lua' } },
             },
-            sensors = { hp = {path = 'sensors/basic.lua', interval = 50} },
+            sensor_defs = { hp = {path = 'sensors/basic.lua', interval = 50} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
@@ -716,12 +716,12 @@ TEST_F(SensorInitTest, MultipleSensorsOnTree) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Script',
                 path = 'scripts/no_args.lua',
                 sensors = {'hp', 'data'},
             },
-            sensors = {
+            sensor_defs = {
                 hp = {path = 'sensors/basic.lua', interval = 50},
                 data = {path = 'sensors/with_require.lua', interval = 100},
             },
@@ -739,12 +739,12 @@ TEST_F(SensorInitTest, SensorFullLifecycle) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.ready({
-            tree = {
+            root = {
                 type = 'Script',
                 path = 'scripts/no_args.lua',
                 sensors = {'full'},
             },
-            sensors = { full = {path = 'sensors/full_lifecycle.lua', interval = 50} },
+            sensor_defs = { full = {path = 'sensors/full_lifecycle.lua', interval = 50} },
         })
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end

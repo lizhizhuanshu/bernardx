@@ -427,7 +427,7 @@ LuaParseResult LuaTreeParser::Parse(lua_State* L, int tree_idx, int subtrees_idx
     tree_idx = lua_absindex(L, tree_idx);
 
     if (!lua_istable(L, tree_idx)) {
-        result.error = "tree must be a table";
+        result.error = "root must be a table";
         return result;
     }
 

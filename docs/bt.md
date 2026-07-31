@@ -20,7 +20,7 @@ local bt = require('bt')
 
 ## 核心机制一览
 
-先用一个微型示例把全部核心件一次串起来：**树拓扑**（`tree`，Lua table）描述结构、**Script**（叶子）用 `Tick` 返回状态驱动流转、**Sensor**（传感器）把感知结果写黑板、**BlackboardCondition**（装饰器）读黑板做条件门。
+先用一个微型示例把全部核心件一次串起来：**树拓扑**（`root`，Lua table）描述结构、**Script**（叶子）用 `Tick` 返回状态驱动流转、**Sensor**（传感器）把感知结果写黑板、**BlackboardCondition**（装饰器）读黑板做条件门。
 
 场景：敌人进入 10 米内则攻击，否则巡逻。
 
@@ -28,7 +28,7 @@ local bt = require('bt')
 local bt = require('bt')
 
 bt.ready({
-    tree = {
+    root = {
         type = 'Selector',                 -- ① 根节点（复合 OR）：依次尝试，首个成功即停
         sensors = { 'enemy_dist' },        -- ② 传感器挂在根上 → 根总在活跃路径，传感器常驻
         children = {
@@ -42,7 +42,7 @@ bt.ready({
             { type = 'Script', path = 'scripts/patrol.lua' },  -- 动作 B：否则巡逻
         },
     },
-    sensors = {
+    sensor_defs = {
         enemy_dist = { interval = 100, path = 'sensors/enemy_dist.lua' },
     },
 })
@@ -88,9 +88,9 @@ return M
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `tree` | `table` | **是** | 根节点定义（行为树拓扑，见下） |
+| `root` | `table` | **是** | 根节点定义（行为树拓扑，见下） |
 | `subtrees` | `table` | 否 | 子树定义：`{名字 = 节点定义, ...}` |
-| `sensors` | `table` | 否 | 传感器配置：`{名字 = {interval, args, path}, ...}` |
+| `sensor_defs` | `table` | 否 | 传感器定义：`{名字 = {interval, args, path}, ...}`（节点用 `sensors = {'名字'}` 按名引用） |
 | `trace_paths` | `bool` | 否 | 是否采集路径数据（默认 `true`，见[路径记录](#路径记录-path-tracer)） |
 
 `ready` 在 running/paused 时调用会报错（先 `stop`）。
@@ -123,12 +123,12 @@ return M
 
 ```lua
 bt.ready({
-    tree = { type = 'Sequence', children = {
+    root = { type = 'Sequence', children = {
         { type = 'Script', path = 'scripts/attack.lua', args = { target = 'enemy' } },
         { type = 'Subtree', subtree = 'combat' },
     }},
     subtrees = { combat = { type = 'Sequence', children = { ... } } },
-    sensors = { hp = { interval = 100, path = 'sensors/hp.lua' } },
+    sensor_defs = { hp = { interval = 100, path = 'sensors/hp.lua' } },
     trace_paths = true,
 })
 local status, err = bt.exec({ interval = 100, max_step = 1000, timeout = 5000 })
@@ -143,7 +143,7 @@ print(bt.path_report())
 
 Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `CodeProvider` 加载（与主脚本 `require()` / `loadfile()` 共用同一加载器）。`path` 相对 `CodeProvider` 的搜索路径解析——请将 `scripts/`、`sensors/` 等脚本目录纳入 `CodeProvider` 搜索路径。
 
-**`bt.ready` 不再有 `project_path`/目录加载**：树拓扑由 `tree`/`subtrees` table 直接提供，不经文件或 JSON。
+**`bt.ready` 不再有 `project_path`/目录加载**：树拓扑由 `root`/`subtrees` table 直接提供，不经文件或 JSON。
 
 ## 节点速查表
 
@@ -316,15 +316,15 @@ decorators = {
 
 ### 配置方式
 
-传感器的**脚本与调度配置集中在 `bt.ready` 的 `sensors` 参数**（一个 `{名字 = 配置}` 的 table）；节点通过 `sensors = {'名字'}` 数组按名引用。
+传感器的**脚本与调度配置集中在 `bt.ready` 的 `sensor_defs` 参数**（一个 `{名字 = 配置}` 的 table）；节点通过 `sensors = {'名字'}` 数组按名引用。
 
 ```lua
 bt.ready({
-    tree = {
+    root = {
         type = 'Script', path = 'scripts/click.lua',
         sensors = { 'login_visible' },          -- 引用名字
     },
-    sensors = {
+    sensor_defs = {
         login_visible = { interval = 100, path = 'sensors/element_visible.lua', args = { selector = '#login' } },
         hp = { interval = 50, path = 'sensors/hp.lua' },
     },
@@ -409,8 +409,8 @@ return M
 
 ```lua
 -- bt.ready 配置：
---   sensors = { threat = { interval = 100, path = 'sensors/threat.lua',
---                          args = { range = 50, faction = 'enemy' } } }
+--   sensor_defs = { threat = { interval = 100, path = 'sensors/threat.lua',
+--                              args = { range = 50, faction = 'enemy' } } }
 local M = {}
 function M:Enter(args)
   self.range   = args.range         -- 50
@@ -434,7 +434,7 @@ return M
 
 ```lua
 bt.ready({
-    tree = {
+    root = {
         type = 'Sequence', name = 'engage',
         sensors = { 'nearby_enemies' },          -- 节点活跃时该传感器周期运行
         children = {
@@ -446,7 +446,7 @@ bt.ready({
             },
         },
     },
-    sensors = {
+    sensor_defs = {
         nearby_enemies = { interval = 100, path = 'sensors/nearby_enemies.lua' },
     },
 })
@@ -480,7 +480,7 @@ return M
 local bt = require('bt')
 
 bt.ready({
-    tree = {
+    root = {
         type = 'Selector', name = 'ai_root',
         decorators = {
             { type = 'BlackboardCondition', key = 'alive', operator = 'is_set', abort = 'Self' },
@@ -554,7 +554,7 @@ local p = bt.dump_paths()
 返回三视图报告的**字符串**(A 路径热度 + B 树形热力图 + C 切换时间线)。由你决定何时获取、如何输出:
 
 ```lua
-bt.ready({ tree = { ... } })                  -- 采集(默认开)
+bt.ready({ root = { ... } })                  -- 采集(默认开)
 bt.exec({ interval = 10, max_step = 100 })
 print(bt.path_report())                       -- 自行打印 / 写文件 / 发日志
 ```
