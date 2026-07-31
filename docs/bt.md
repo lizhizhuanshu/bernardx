@@ -125,7 +125,7 @@ return M
 bt.ready({
     root = { type = 'Sequence', children = {
         { type = 'Script', path = 'scripts/attack.lua', params = { target = 'enemy' } },
-        { type = 'Subtree', subtree = 'combat' },
+        { type = 'Subtree', path = 'combat' },
     }},
     subtrees = { combat = { type = 'Sequence', children = { ... } } },
     sensor_defs = { hp = { interval = 100, path = 'sensors/hp.lua' } },
@@ -158,7 +158,7 @@ Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `
 | `RandomSelector` | 复合 | `type` | `children` | 随机顺序 OR |
 | `RandomSequence` | 复合 | `type` | `children` | 随机顺序 AND |
 | `Script` | 叶子 | `type`,`path` | 无 | 执行 Lua 脚本，`params` 传参 |
-| `Subtree` | 叶子 | `type`,`subtree` | 无 | 引用 subtrees 子树 |
+| `Subtree` | 叶子 | `type`,`path` | 无 | 引用 subtrees 子树 |
 | `Wait` | 叶子 | `type` | 无 | 等待指定毫秒数 |
 | `Repeat` | 包装 | `type` | `children[1]` | 重复执行子节点 |
 | `RetryUntilSuccessful` | 包装 | `type` | `children[1]` | 失败时重试 |
@@ -257,13 +257,13 @@ return M
 #### Subtree — 子树节点
 
 ```lua
-{ type = 'Subtree', subtree = 'combat', name = '可选' }
+{ type = 'Subtree', path = 'combat', name = '可选' }
 ```
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `subtree` | **是** | `subtrees` table 中定义的子树名 |
-| `name` | 否 | 默认等于 subtree 名 |
+| `path` | **是** | `subtrees` table 中定义的子树名（按名引用） |
+| `name` | 否 | 默认等于 path 值 |
 
 支持 `decorators`/`sensors`，子树定义内可引用其他子树（可嵌套）。
 
@@ -486,8 +486,8 @@ bt.ready({
             { type = 'BlackboardCondition', key = 'alive', operator = 'is_set', abort = 'Self' },
         },
         children = {
-            { type = 'Subtree', subtree = 'combat' },
-            { type = 'Subtree', subtree = 'patrol' },
+            { type = 'Subtree', path = 'combat' },
+            { type = 'Subtree', path = 'patrol' },
             { type = 'Script', path = 'scripts/idle.lua', decorators = { { type = 'ForceSuccess' } } },
         },
     },

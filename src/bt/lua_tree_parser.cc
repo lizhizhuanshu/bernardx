@@ -298,9 +298,9 @@ std::unique_ptr<Node> ParseScriptLeaf(lua_State* L, int idx, ParseContext& ctx) 
 }
 
 std::unique_ptr<Node> ParseSubtree(lua_State* L, int idx, ParseContext& ctx) {
-    std::string subtree_name = ReadStringField(L, idx, "subtree", "");
+    std::string subtree_name = ReadStringField(L, idx, "path", "");
     if (subtree_name.empty()) {
-        ctx.error = "Subtree node missing 'subtree' field";
+        ctx.error = "Subtree node missing 'path' field";
         return nullptr;
     }
     if (ctx.resolving.count(subtree_name)) {
