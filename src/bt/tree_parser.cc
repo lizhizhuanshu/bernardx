@@ -74,6 +74,24 @@ std::optional<LuaValue> ParseLuaValue(const json& j) {
     return std::nullopt;
 }
 
+// Read a scalar knob from the node's `params` object (e.g. Wait.ms,
+// Repeat.count, Parallel.success_policy). Returns `def` if absent/wrong type.
+std::string ParamsString(const json& j, const char* key, std::string def) {
+    if (j.contains("params") && j["params"].is_object() &&
+        j["params"].contains(key) && j["params"][key].is_string()) {
+        return j["params"][key].get<std::string>();
+    }
+    return def;
+}
+
+int ParamsInt(const json& j, const char* key, int def) {
+    if (j.contains("params") && j["params"].is_object() &&
+        j["params"].contains(key) && j["params"][key].is_number_integer()) {
+        return j["params"][key].get<int>();
+    }
+    return def;
+}
+
 // Load a JSON asset by path. "@rel" -> ResourceProvider; otherwise absolute read.
 async_simple::coro::Lazy<std::optional<std::string>>
 LoadAsset(const std::string& path, std::shared_ptr<ResourceProvider> provider) {
@@ -197,8 +215,8 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseComposite(const json& j, Pa
     } else if (type == "ResumeSequence") {
         node = std::make_unique<ResumeSequence>(id, name);
     } else if (type == "Parallel") {
-        auto sp = j.value("success_policy", "RequireAll");
-        auto fp = j.value("failure_policy", "RequireOne");
+        auto sp = ParamsString(j, "success_policy", "RequireAll");
+        auto fp = ParamsString(j, "failure_policy", "RequireOne");
         node = std::make_unique<Parallel>(id, name, ParseParallelPolicy(sp), ParseParallelPolicy(fp));
     } else if (type == "RandomSelector") {
         node = std::make_unique<RandomSelector>(id, name);
@@ -307,7 +325,7 @@ ParseSingleChild(const json& j, ParseContext& ctx, const char* missing_msg) {
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRepeat(const json& j, ParseContext& ctx) {
     auto child = co_await ParseSingleChild(j, ctx, "Repeat node requires at least one child");
     if (!child) co_return nullptr;
-    int count = j.value("count", Repeat::kInfinite);
+    int count = ParamsInt(j, "count", Repeat::kInfinite);
     std::string name = j.value("name", "Repeat");
     uint32_t id = ctx.next_id++;
     auto node = std::make_unique<Repeat>(id, std::move(name), count, std::move(child));
@@ -320,7 +338,7 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRepeat(const json& j, Parse
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRetry(const json& j, ParseContext& ctx) {
     auto child = co_await ParseSingleChild(j, ctx, "RetryUntilSuccessful node requires at least one child");
     if (!child) co_return nullptr;
-    int attempts = j.value("attempts", RetryUntilSuccessful::kInfinite);
+    int attempts = ParamsInt(j, "attempts", RetryUntilSuccessful::kInfinite);
     std::string name = j.value("name", "RetryUntilSuccessful");
     uint32_t id = ctx.next_id++;
     auto node = std::make_unique<RetryUntilSuccessful>(id, std::move(name), attempts, std::move(child));
@@ -331,11 +349,7 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRetry(const json& j, ParseC
 }
 
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseWait(const json& j, ParseContext& ctx) {
-    // `ms` is read from the `params` object (e.g. {"type":"Wait","params":{"ms":500}}).
-    int ms = 1000;
-    if (j.contains("params") && j["params"].is_object() && j["params"].contains("ms")) {
-        ms = j["params"]["ms"].get<int>();
-    }
+    int ms = ParamsInt(j, "ms", 1000);
     std::string name = j.value("name", "Wait");
     uint32_t id = ctx.next_id++;
     auto node = std::make_unique<WaitNode>(id, std::move(name), ms);

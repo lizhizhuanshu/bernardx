@@ -72,7 +72,7 @@ Script 与传感器的 **Lua 脚本**仍由 `path` 指定，经 `CodeProvider` �
 | `children` | 复合/包装 | 子节点数组（包装类仅取第一个） |
 | `decorators` | 全部 | 装饰器数组（见[装饰器](#装饰器)） |
 | `sensors` | 全部 | 传感器名数组（见[传感器](#传感器)） |
-| `params` | Script, Wait | Script: 传给 `Enter` 的参数；Wait: `{"ms":N}` 等待毫秒 |
+| `params` | 各类型 | 类型相关参数：Script→`Enter` 参数、Wait→`ms`、Repeat→`count`、Retry→`attempts`、Parallel→`success_policy`/`failure_policy` |
 | `path` | Script / Subtree | Script 的 Lua 脚本路径 / Subtree 的子树 JSON 路径 |
 | `description` | 全部 | 备注（仅文档/调试） |
 
@@ -83,15 +83,15 @@ Script 与传感器的 **Lua 脚本**仍由 `path` 指定，经 `CodeProvider` �
 | `Selector` | 复合 | — | 依次 tick，首个 Success 即 Success（OR） |
 | `Sequence` | 复合 | — | 依次 tick，首个 Failure 即 Failure（AND） |
 | `ResumeSequence` | 复合 | — | 首次/恢复时找首个 decorator 成立的子节点作为入口，之后按序推进（见下） |
-| `Parallel` | 复合 | `success_policy` / `failure_policy` | 并行所有子节点，策略控制结果 |
+| `Parallel` | 复合 | `params` | 并行所有子节点，策略控制结果 |
 | `RandomSelector` / `RandomSequence` | 复合 | — | 同 Selector/Sequence，每次 Reset 后随机排列子节点顺序 |
 | `Script` | 叶子 | `path`, `params` | 执行 Lua 脚本 |
 | `Subtree` | 叶子 | `path` | 加载 `path` 指向的子树 JSON（递归） |
 | `Wait` | 叶子 | `params` | 等待 `params.ms` 毫秒（默认 1000） |
-| `Repeat` | 包装 | `count`（默认 -1 无限） | 重复执行子节点 |
-| `RetryUntilSuccessful` | 包装 | `attempts`（默认 -1 无限） | 失败重试 |
+| `Repeat` | 包装 | `params` | 重复执行子节点（`params.count`，默认 -1 无限） |
+| `RetryUntilSuccessful` | 包装 | `params` | 失败重试（`params.attempts`，默认 -1 无限） |
 
-**Parallel 策略**（均 `RequireAll`/`RequireOne`）：`success_policy` 默认 `RequireAll`，`failure_policy` 默认 `RequireOne`。
+**Parallel 策略**（`params.success_policy` / `params.failure_policy`，均 `RequireAll`/`RequireOne`）：默认 `RequireAll` / `RequireOne`。
 
 **ResumeSequence** —— 首次进入（或被上层打断后恢复）从上到下找首个 decorator 成立的子节点作为入口，之后按 Sequence 记忆位置推进；只有 `Reset`/被中止才重新找入口。适合"按步骤执行、被打断后自动回到当前步骤"——已完成的步骤因描述不再成立被跳过：
 
