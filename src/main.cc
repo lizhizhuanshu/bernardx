@@ -38,7 +38,7 @@ int main(int argc, char* argv[]) {
     std::thread io_thread([&ioc]() { ioc.run(); });
 
     auto code_provider = std::make_shared<FileSystemCodeProvider>(dir);
-    auto resource_provider = std::make_shared<FileSystemResourceProvider>(dir);
+    auto resource_provider = std::make_shared<FileSystemResourceProvider>(dir + "/res");
     auto blackboard = std::make_shared<Blackboard>();
     auto bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
     auto bt_lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
