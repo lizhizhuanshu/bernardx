@@ -1,6 +1,6 @@
 local M = {}
-function M:Enter(args)
-  self.has_flag = args.enabled
+function M:Enter(params)
+  self.has_flag = params.enabled
 end
 function M:Tick()
   if self.has_flag == true then

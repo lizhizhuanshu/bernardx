@@ -1,5 +1,5 @@
 local M = {}
-function M:Enter(args)
+function M:Enter(params)
   self.counter = 0
 end
 function M:Tick()

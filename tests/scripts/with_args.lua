@@ -1,7 +1,7 @@
 local M = {}
-function M:Enter(args)
-  self.target = args.target
-  self.damage = args.damage
+function M:Enter(params)
+  self.target = params.target
+  self.damage = params.damage
 end
 function M:Tick()
   if self.target and self.damage then

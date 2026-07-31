@@ -198,7 +198,7 @@ SensorSpec ReadSensorSpec(lua_State* L, int sensors_idx, const std::string& name
         spec.description = ReadStringField(L, cfg, "description", "");
         spec.interval_ms = ReadIntField(L, cfg, "interval", 100);
         spec.script_path = ReadStringField(L, cfg, "path", "");
-        spec.args = ReadArgsMap(L, cfg, "args");
+        spec.args = ReadArgsMap(L, cfg, "params");
     }
     lua_pop(L, 1);
     return spec;
@@ -287,7 +287,7 @@ std::unique_ptr<Node> ParseScriptLeaf(lua_State* L, int idx, ParseContext& ctx) 
         return nullptr;
     }
     std::string name = ReadStringField(L, idx, "name", path.c_str());
-    auto args = ReadArgsMap(L, idx, "args");
+    auto args = ReadArgsMap(L, idx, "params");
     uint32_t id = ctx.next_id++;
 
     auto node = std::make_unique<ScriptNode>(id, std::move(name), std::move(path), std::move(args));

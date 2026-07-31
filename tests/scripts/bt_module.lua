@@ -1,5 +1,5 @@
 local M = {}
-function M:Enter(args)
+function M:Enter(params)
   self.checked = true
 end
 function M:Tick()

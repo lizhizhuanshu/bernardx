@@ -90,7 +90,7 @@ return M
 |------|------|------|------|
 | `root` | `table` | **是** | 根节点定义（行为树拓扑，见下） |
 | `subtrees` | `table` | 否 | 子树定义：`{名字 = 节点定义, ...}` |
-| `sensor_defs` | `table` | 否 | 传感器定义：`{名字 = {interval, args, path}, ...}`（节点用 `sensors = {'名字'}` 按名引用） |
+| `sensor_defs` | `table` | 否 | 传感器定义：`{名字 = {interval, params, path}, ...}`（节点用 `sensors = {'名字'}` 按名引用） |
 | `trace_paths` | `bool` | 否 | 是否采集路径数据（默认 `true`，见[路径记录](#路径记录-path-tracer)） |
 
 `ready` 在 running/paused 时调用会报错（先 `stop`）。
@@ -124,7 +124,7 @@ return M
 ```lua
 bt.ready({
     root = { type = 'Sequence', children = {
-        { type = 'Script', path = 'scripts/attack.lua', args = { target = 'enemy' } },
+        { type = 'Script', path = 'scripts/attack.lua', params = { target = 'enemy' } },
         { type = 'Subtree', subtree = 'combat' },
     }},
     subtrees = { combat = { type = 'Sequence', children = { ... } } },
@@ -157,7 +157,7 @@ Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `
 | `Parallel` | 复合 | `type` | `children` | 并行，策略控制结果 |
 | `RandomSelector` | 复合 | `type` | `children` | 随机顺序 OR |
 | `RandomSequence` | 复合 | `type` | `children` | 随机顺序 AND |
-| `Script` | 叶子 | `type`,`path` | 无 | 执行 Lua 脚本，`args` 传参 |
+| `Script` | 叶子 | `type`,`path` | 无 | 执行 Lua 脚本，`params` 传参 |
 | `Subtree` | 叶子 | `type`,`subtree` | 无 | 引用 subtrees 子树 |
 | `Wait` | 叶子 | `type` | 无 | 等待指定毫秒数 |
 | `Repeat` | 包装 | `type` | `children[1]` | 重复执行子节点 |
@@ -218,21 +218,21 @@ Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `
 #### Script — 脚本节点
 
 ```lua
-{ type = 'Script', path = 'scripts/attack.lua', name = '可选', args = { target = 'enemy', damage = 100 } }
+{ type = 'Script', path = 'scripts/attack.lua', name = '可选', params = { target = 'enemy', damage = 100 } }
 ```
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
 | `path` | **是** | Lua 脚本路径（相对 `CodeProvider` 搜索路径） |
 | `name` | 否 | 节点名，默认等于 path |
-| `args` | 否 | 传给 `Enter` 的参数对象（值支持 `bool`/`int`/`double`/`string`） |
+| `params` | 否 | 传给 `Enter` 的参数对象（值支持 `bool`/`int`/`double`/`string`） |
 
 **脚本格式**：必须 **return 一个 table**，用冒号语法定义回调，`self` 是该 table（存跨 tick 状态）：
 
 ```lua
 -- scripts/attack.lua
 local M = {}
-function M:Enter(args) self.target = args.target end   -- 进入活跃时一次
+function M:Enter(params) self.target = params.target end   -- 进入活跃时一次
 function M:Tick()                                       -- 必需，协程内每次 tick
   return self.target and "success" or "failure"
 end
@@ -243,14 +243,14 @@ return M
 
 | 回调 | 签名 | 必需 | 可 yield | 说明 |
 |------|------|------|---------|------|
-| `Enter` | `self:Enter(args)` | 否 | 否 | 进入活跃状态时一次 |
+| `Enter` | `self:Enter(params)` | 否 | 否 | 进入活跃状态时一次 |
 | `Tick` | `self:Tick()` | **是** | **是** | 每次 tick，返回状态字符串 |
 | `Exit` | `self:Exit(reason)` | 否 | 否 | 离开活跃状态时 |
 | `Abort` | `self:Abort()` | 否 | 否 | 强制中止时（Exit 之前） |
 
 未返回 table 或缺 `Tick` → 加载失败，tick 时返回 Failure。**Tick 返回**：`"success"` / `"failure"`（进 Exit）/ `"running"`（保持活跃，下次 tick 直接 Tick，不再 Enter）；返回 nil 或无法识别的字符串视为 Failure。`Tick` 内可用所有异步 API（`sleep`/`await`/`http.request` 等），异步期间节点挂起 Running，完成后自动恢复。
 
-**生命周期**：首次 tick → `Enter(args)` → `Tick()` →（success/failure: `Exit(reason)` 完成 / running: 下次 tick 直接 `Tick()`）；被装饰器中止 → `Abort()` → `Exit("aborted")`；被重置 → `Exit("reset")`。
+**生命周期**：首次 tick → `Enter(params)` → `Tick()` →（success/failure: `Exit(reason)` 完成 / running: 下次 tick 直接 `Tick()`）；被装饰器中止 → `Abort()` → `Exit("aborted")`；被重置 → `Exit("reset")`。
 
 **黑板访问**：`require('blackboard')` 后 `bb.get(key)` / `bb.set(key, value)`，值支持 `nil`/`boolean`/`integer`(int64)/`double`/`string`。
 
@@ -325,7 +325,7 @@ bt.ready({
         sensors = { 'login_visible' },          -- 引用名字
     },
     sensor_defs = {
-        login_visible = { interval = 100, path = 'sensors/element_visible.lua', args = { selector = '#login' } },
+        login_visible = { interval = 100, path = 'sensors/element_visible.lua', params = { selector = '#login' } },
         hp = { interval = 50, path = 'sensors/hp.lua' },
     },
 })
@@ -338,7 +338,7 @@ bt.exec({ interval = 100 })
 |------|------|------|------|
 | `path` | **是** | string | Lua 脚本路径（相对 `CodeProvider` 搜索路径） |
 | `interval` | 否 | integer | tick 间隔（毫秒），默认 `100` |
-| `args` | 否 | object | 传给 `Enter` 的参数（值支持 `bool`/`int`/`double`/`string`） |
+| `params` | 否 | object | 传给 `Enter` 的参数（值支持 `bool`/`int`/`double`/`string`） |
 
 传感器名同时作为**黑板键名**（Tick 返回值写入 `bb[名字]`）。
 
@@ -349,7 +349,7 @@ bt.exec({ interval = 100 })
 ```lua
 -- sensors/element_visible.lua
 local M = {}
-function M:Enter(args) end                  -- 激活时一次（同步，不可 yield）
+function M:Enter(params) end                  -- 激活时一次（同步，不可 yield）
 function M:Tick()                           -- 必需，按 interval 周期调用（协程，可 yield）
   return find("#login-btn") ~= nil          -- 第一个返回值 → bb[名字]
 end
@@ -359,7 +359,7 @@ return M
 
 | 回调 | 必需 | 可 yield | 说明 |
 |------|------|---------|------|
-| `Enter(args)` | 否 | 否 | 激活时一次，`args` 为配置中的 `args` table |
+| `Enter(params)` | 否 | 否 | 激活时一次，`params` 为配置中的 `params` table |
 | `Tick()` | **是** | **是** | 按 interval 周期，第一个返回值写入黑板 |
 | `Exit()` | 否 | 否 | 停用时一次 |
 
@@ -403,18 +403,18 @@ end
 return M
 ```
 
-#### 示例 3：`args` 从配置传入 Enter
+#### 示例 3：`params` 从配置传入 Enter
 
-配置里的 `args` 会原样作为参数传给 `Enter`：
+配置里的 `params` 会原样作为参数传给 `Enter`：
 
 ```lua
 -- bt.ready 配置：
 --   sensor_defs = { threat = { interval = 100, path = 'sensors/threat.lua',
---                              args = { range = 50, faction = 'enemy' } } }
+--                              params = { range = 50, faction = 'enemy' } } }
 local M = {}
-function M:Enter(args)
-  self.range   = args.range         -- 50
-  self.faction = args.faction       -- 'enemy'
+function M:Enter(params)
+  self.range   = params.range         -- 50
+  self.faction = params.faction       -- 'enemy'
 end
 function M:Tick()
   return count_units(self.faction, self.range)   -- → bb.threat

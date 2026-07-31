@@ -983,7 +983,7 @@ TEST_F(ScriptNodeIntegrationTest, ExitReasonAsParameter) {
 TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/with_args.lua', args = {target = 'enemy', damage = 100}}})
+        bt.ready({root = {type = 'Script', path = 'scripts/with_args.lua', params = {target = 'enemy', damage = 100}}})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -994,7 +994,7 @@ TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
 TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.ready({root = {type = 'Script', path = 'scripts/bool_args.lua', args = {enabled = true}}})
+        bt.ready({root = {type = 'Script', path = 'scripts/bool_args.lua', params = {enabled = true}}})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
