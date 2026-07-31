@@ -8,7 +8,7 @@ local bt = require('bt')
 
 | 函数 | 说明 |
 |------|------|
-| `bt.ready(opts)` | 构建树 + 初始化脚本/传感器 + 激活（协程 yield，完成后恢复）。返回 `"ready"` 或 `nil, err` |
+| `bt.init(opts)` | 构建树 + 初始化脚本/传感器 + 激活（协程 yield，完成后恢复）。返回 `"ready"` 或 `nil, err` |
 | `bt.exec(opts)` | 启动后台 tick 并**阻塞**到本次 run 结束（协程 yield）；返回 `"success"`/`"failure"`/`"timeout"`/`"stopped"` 或 `nil, err`。期间可被宿主暂停/恢复 |
 | `bt.goto_path(names)` | 跳到指定节点名路径（如 `{"combat","attack"}`），重置树让叶子重新 Enter |
 | `bt.stop()` | 停止并清理当前树 |
@@ -27,7 +27,7 @@ local bt = require('bt')
 ```lua
 local bt = require('bt')
 
-bt.ready({
+bt.init({
     root = "@bt/attack_or_patrol.json",        -- 根节点 JSON 文件
     sensor_defs = "@bt/sensors.json",          -- 传感器定义 JSON 文件
 })
@@ -81,13 +81,13 @@ return M
 
 > **核心区别**：Script 与 Sensor 的脚本是**同一种 table 回调**（`return M` + `Enter/Tick/Exit` 冒号语法）。差别只在 `Tick` 的产出——**Script 返回状态字符串**（`"success"`/`"failure"`/`"running"`）控制树如何流转；**Sensor 返回任意值**写入黑板供条件读取。后续各节是对这些件的展开。
 
-## 生命周期 API（ready / exec / goto_path / stop）
+## 生命周期 API（init / exec / goto_path / stop）
 
-行为树采用**分离的生命周期**：`ready` 构建+初始化（协程 yield），`exec` 启动后台 tick 并**阻塞到结束**（返回 status）。暂停/恢复由宿主控制（见下）。
+行为树采用**分离的生命周期**：`init` 构建+初始化（协程 yield），`exec` 启动后台 tick 并**阻塞到结束**（返回 status）。暂停/恢复由宿主控制（见下）。
 
 状态机：`idle → ready → running ↔ paused → success/failure →（stop）idle`。
 
-### bt.ready(opts)
+### bt.init(opts)
 
 加载 JSON 定义文件 → 构建 Node 树 → 初始化 Script → 初始化 Sensor → 激活初始 Sensor。**协程 yield**，完成后恢复，返回 `"ready"` 或 `nil, err`（load/parse/init 错）。
 
@@ -97,7 +97,7 @@ return M
 | `sensor_defs` | `string` | 否 | 传感器定义 JSON 文件路径 |
 | `trace_paths` | `bool` | 否 | 是否采集路径数据（默认 `true`，见[路径记录](#路径记录-path-tracer)） |
 
-`ready` 在 running/paused 时调用会报错（先 `stop`）。
+`init` 在 running/paused 时调用会报错（先 `stop`）。
 
 #### 路径解析
 
@@ -134,7 +134,7 @@ Script 节点与传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `
 | `max_step` | `integer` | 否 | 最大 tick 步数，未设置则无限 |
 | `timeout` | `integer` | 否 | 超时（毫秒），未设置则不超时 |
 
-从 `success`/`failure` 再 `exec` 报错（重新 `ready`）。`ready`/`paused` 之外的状态调 `exec` 均报错。
+从 `success`/`failure` 再 `exec` 报错（重新 `init`）。`ready`/`paused` 之外的状态调 `exec` 均报错。
 
 ### 暂停 / 恢复（宿主级）
 
@@ -151,7 +151,7 @@ Script 节点与传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `
 ### 典型用法
 
 ```lua
-bt.ready({
+bt.init({
     root = "@bt/root.json",            -- 根节点 JSON：Sequence → attack + Subtree("combat")
     sensor_defs = "@bt/sensors.json",  -- 传感器定义
     trace_paths = true,
@@ -168,7 +168,7 @@ print(bt.path_report())
 
 Script 节点和传感器的 **Lua 脚本仍由 `path` 指定**，由运行时 `CodeProvider` 加载（与主脚本 `require()` / `loadfile()` 共用同一加载器）。`path` 相对 `CodeProvider` 的搜索路径解析——请将 `scripts/`、`sensors/` 等脚本目录纳入 `CodeProvider` 搜索路径。
 
-**`bt.ready` 的树拓扑从 JSON 文件加载**：`root`/`sensor_defs` 是文件路径（`@` 资源或绝对路径，见[路径解析](#路径解析)），Subtree 节点也按 `path` 加载子树 JSON。Script 与传感器的 Lua 脚本则由 `CodeProvider` 经 `path` 加载——两套加载器各管一摊。
+**`bt.init` 的树拓扑从 JSON 文件加载**：`root`/`sensor_defs` 是文件路径（`@` 资源或绝对路径，见[路径解析](#路径解析)），Subtree 节点也按 `path` 加载子树 JSON。Script 与传感器的 Lua 脚本则由 `CodeProvider` 经 `path` 加载——两套加载器各管一摊。
 
 ## 节点速查表
 
@@ -343,10 +343,10 @@ decorators = {
 
 ### 配置方式
 
-传感器的**脚本与调度配置集中在 `sensor_defs` JSON 文件**（`bt.ready` 的 `sensor_defs` 参数是其路径）；节点通过 `sensors = ['名字']` 数组按名引用。
+传感器的**脚本与调度配置集中在 `sensor_defs` JSON 文件**（`bt.init` 的 `sensor_defs` 参数是其路径）；节点通过 `sensors = ['名字']` 数组按名引用。
 
 ```lua
-bt.ready({
+bt.init({
     root = "@bt/click.json",            -- root JSON 内某节点带 "sensors": ["login_visible"]
     sensor_defs = "@bt/sensors.json",
 })
@@ -463,7 +463,7 @@ return M
 完整示例——附近有敌人时进攻。传感器返回**整数**数量，条件用比较运算符判断：
 
 ```lua
-bt.ready({
+bt.init({
     root = "@bt/engage.json",
     sensor_defs = "@bt/sensors.json",
 })
@@ -515,7 +515,7 @@ return M
 ```lua
 local bt = require('bt')
 
-bt.ready({ root = "@bt/ai_root.json" })
+bt.init({ root = "@bt/ai_root.json" })
 local status, err = bt.exec({ interval = 100 })
 ```
 
@@ -574,7 +574,7 @@ local status, err = bt.exec({ interval = 100 })
 
 ### bt.dump_paths()
 
-返回一个 table,含本 run(自上次 `bt.ready` 起)的全部路径数据:
+返回一个 table,含本 run(自上次 `bt.init` 起)的全部路径数据:
 
 ```lua
 local p = bt.dump_paths()
@@ -600,7 +600,7 @@ local p = bt.dump_paths()
 返回三视图报告的**字符串**(A 路径热度 + B 树形热力图 + C 切换时间线)。由你决定何时获取、如何输出:
 
 ```lua
-bt.ready({ root = "@bt/root.json" })         -- 采集(默认开)
+bt.init({ root = "@bt/root.json" })         -- 采集(默认开)
 bt.exec({ interval = 10, max_step = 100 })
 print(bt.path_report())                       -- 自行打印 / 写文件 / 发日志
 ```

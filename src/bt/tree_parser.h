@@ -24,7 +24,7 @@ struct ParseResult {
 //   sensor_defs_path — path to a JSON file {name: {interval, path, params}} (optional)
 class TreeParser {
 public:
-    // bt.ready entry: load root + sensor_defs files, recursively load subtrees by path.
+    // bt.init entry: load root + sensor_defs files, recursively load subtrees by path.
     static async_simple::coro::Lazy<ParseResult> LoadAndParse(
         const std::string& root_path,
         const std::string& sensor_defs_path,

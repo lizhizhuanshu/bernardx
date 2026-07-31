@@ -55,8 +55,8 @@ const char* NodeStatusToString(NodeStatus s) {
     }
 }
 
-// --- ready: load+parse JSON defs, init scripts/sensors, activate (yields) ---
-static async_simple::coro::Lazy<void> ReadyAsync(
+// --- init: load+parse JSON defs, init scripts/sensors, activate (yields) ---
+static async_simple::coro::Lazy<void> InitAsync(
     std::shared_ptr<LuaRuntime> rt,
     AsyncHandle handle,
     BehaviorTreeEngine::Ptr engine,
@@ -182,7 +182,7 @@ static async_simple::coro::Lazy<void> RunLoop(
     }
 }
 
-int bt_ready(lua_State* L) {
+int bt_init(lua_State* L) {
     auto* engine = GetEngine(L);
     luaL_checktype(L, 1, LUA_TTABLE);
 
@@ -215,7 +215,7 @@ int bt_ready(lua_State* L) {
 
     auto handle = rt_ctx->PreYield(L);
     uint64_t gen = engine->generation();
-    ReadyAsync(rt_ctx, handle, engine->shared_from_this(),
+    InitAsync(rt_ctx, handle, engine->shared_from_this(),
                std::move(root_path), std::move(sensor_defs_path),
                rt_ctx->shared_resource_provider(), trace_paths, gen)
         .via(rt_ctx->executor())
@@ -232,8 +232,8 @@ int bt_exec(lua_State* L) {
         st != BehaviorTreeEngine::BtState::kPaused) {
         lua_pushnil(L);
         lua_pushstring(L, st == BehaviorTreeEngine::BtState::kIdle
-                              ? "no tree; call ready first"
-                              : "run finished; call ready to restart");
+                              ? "no tree; call init first"
+                              : "run finished; call init to restart");
         return 2;
     }
 
@@ -351,7 +351,7 @@ void BehaviorTreeLibrary::Open(lua_State* L) {
     lua_pushlightuserdata(L, engine_.get());
 
     luaL_Reg funcs[] = {
-        {"ready", bt_ready},
+        {"init", bt_init},
         {"exec", bt_exec},
         {"goto_path", bt_goto_path},
         {"stop", bt_stop},

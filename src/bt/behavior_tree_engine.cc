@@ -62,7 +62,7 @@ std::optional<std::string> BehaviorTreeEngine::GotoPath(
     if (state_ == BtState::kRunning) {
         return "goto_path illegal while running; pause first";
     }
-    if (!root_) return "no tree loaded; call ready first";
+    if (!root_) return "no tree loaded; call init first";
     if (names.empty()) return "empty path";
 
     // Walk the live tree, recording (composite, child index) positions to set.
