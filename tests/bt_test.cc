@@ -337,7 +337,7 @@ TEST(ResumeSequenceTest, ResumesAtCurrentStepAfterInterrupt) {
 }
 
 TEST(ResumeSequenceParseTest, ParsesTypeAndChildren) {
-    auto node = ParseJsonTree(R"({"type":"ResumeSequence","children":[{"type":"Wait","ms":10}]})");
+    auto node = ParseJsonTree(R"({"type":"ResumeSequence","children":[{"type":"Wait","params":{"ms":10}}]})");
     ASSERT_NE(node, nullptr);
     EXPECT_EQ(node->type(), "ResumeSequence");
     EXPECT_EQ(static_cast<Composite*>(node.get())->children().size(), 1u);
@@ -1894,7 +1894,7 @@ TEST(PathTracerTest, DecoratorFlipRecorded) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
-    PutRoot(R"({"type":"Wait","ms":999999})");
+    PutRoot(R"({"type":"Wait","params":{"ms":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1912,7 +1912,7 @@ TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
-    PutRoot(R"({"type":"Wait","ms":999999})");
+    PutRoot(R"({"type":"Wait","params":{"ms":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root", trace_paths=false})
@@ -1927,7 +1927,7 @@ TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
-    PutRoot(R"({"type":"Wait","ms":999999})");
+    PutRoot(R"({"type":"Wait","params":{"ms":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1946,8 +1946,8 @@ TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathLegal) {
     PutRoot(R"({"type":"Sequence","name":"root","children":[)"
-            R"({"type":"Wait","name":"w1","ms":99999},)"
-            R"({"type":"Wait","name":"w2","ms":99999}]})");
+            R"({"type":"Wait","name":"w1","params":{"ms":99999}},)"
+            R"({"type":"Wait","name":"w2","params":{"ms":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1961,7 +1961,7 @@ TEST_F(BehaviorTreeLibraryTest, GotoPathLegal) {
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathNameNotFound) {
     PutRoot(R"({"type":"Sequence","name":"root","children":[)"
-            R"({"type":"Wait","name":"w1","ms":99999}]})");
+            R"({"type":"Wait","name":"w1","params":{"ms":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1976,7 +1976,7 @@ TEST_F(BehaviorTreeLibraryTest, GotoPathNameNotFound) {
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathRejectsParallel) {
     PutRoot(R"({"type":"Parallel","name":"par","children":[)"
-            R"({"type":"Wait","name":"w1","ms":99999}]})");
+            R"({"type":"Wait","name":"w1","params":{"ms":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})

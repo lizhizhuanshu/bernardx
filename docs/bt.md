@@ -72,7 +72,7 @@ Script 与传感器的 **Lua 脚本**仍由 `path` 指定，经 `CodeProvider` �
 | `children` | 复合/包装 | 子节点数组（包装类仅取第一个） |
 | `decorators` | 全部 | 装饰器数组（见[装饰器](#装饰器)） |
 | `sensors` | 全部 | 传感器名数组（见[传感器](#传感器)） |
-| `params` | Script | 传给脚本 `Enter` 的参数 |
+| `params` | Script, Wait | Script: 传给 `Enter` 的参数；Wait: `{"ms":N}` 等待毫秒 |
 | `path` | Script / Subtree | Script 的 Lua 脚本路径 / Subtree 的子树 JSON 路径 |
 | `description` | 全部 | 备注（仅文档/调试） |
 
@@ -87,7 +87,7 @@ Script 与传感器的 **Lua 脚本**仍由 `path` 指定，经 `CodeProvider` �
 | `RandomSelector` / `RandomSequence` | 复合 | — | 同 Selector/Sequence，每次 Reset 后随机排列子节点顺序 |
 | `Script` | 叶子 | `path`, `params` | 执行 Lua 脚本 |
 | `Subtree` | 叶子 | `path` | 加载 `path` 指向的子树 JSON（递归） |
-| `Wait` | 叶子 | `ms`（默认 1000） | 等待指定毫秒数 |
+| `Wait` | 叶子 | `params` | 等待 `params.ms` 毫秒（默认 1000） |
 | `Repeat` | 包装 | `count`（默认 -1 无限） | 重复执行子节点 |
 | `RetryUntilSuccessful` | 包装 | `attempts`（默认 -1 无限） | 失败重试 |
 

@@ -331,7 +331,11 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRetry(const json& j, ParseC
 }
 
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseWait(const json& j, ParseContext& ctx) {
-    int ms = j.value("ms", 1000);
+    // `ms` is read from the `params` object (e.g. {"type":"Wait","params":{"ms":500}}).
+    int ms = 1000;
+    if (j.contains("params") && j["params"].is_object() && j["params"].contains("ms")) {
+        ms = j["params"]["ms"].get<int>();
+    }
     std::string name = j.value("name", "Wait");
     uint32_t id = ctx.next_id++;
     auto node = std::make_unique<WaitNode>(id, std::move(name), ms);
