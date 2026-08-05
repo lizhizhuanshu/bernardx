@@ -149,8 +149,8 @@ public:
     void Interrupt();
 
     // Reversible pause: a paused runtime's background coroutines (e.g. a bt
-    // tick loop) should skip their work until Resume(). Set by the host
-    // (BernardXEngine::Pause), not by Lua scripts.
+    // tick loop) should skip their work until Resume(). Set by the host,
+    // not by Lua scripts.
     void Pause();
     void Resume();
     bool paused() const { return paused_.load(std::memory_order_acquire); }

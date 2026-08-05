@@ -21,8 +21,8 @@ class Blackboard;
 class BtEventQueue;
 
 // A condition backed by a Lua script. Loads a module table with optional
-// `Enter`/`Tick`/`Exit` (the same shape action `ScriptNode` and the old sensor
-// scripts use), so existing page-recognition scripts port over unchanged.
+// `Enter`/`Tick`/`Exit` (the same shape as `ScriptNode`), so existing
+// page-recognition scripts port over unchanged.
 //
 // Lifecycle is simpler than `ScriptNode`: `Enter` runs once on the first
 // `Tick`; `Tick` may be called repeatedly (yielding -> Running) until it

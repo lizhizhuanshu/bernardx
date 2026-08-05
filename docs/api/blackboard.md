@@ -1,6 +1,6 @@
 # blackboard 模块
 
-黑板键值存储，线程安全。行为树节点、传感器和 Lua 脚本通过同一个黑板实例共享数据。
+黑板键值存储，线程安全。行为树节点与 Lua 脚本通过同一个黑板实例共享数据。
 
 ```lua
 local bb = require('blackboard')

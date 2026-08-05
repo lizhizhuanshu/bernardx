@@ -20,7 +20,7 @@ local bt = require('bt')
 
 状态机：`idle →(init) ready →(exec) running ↔ paused → success/failure →(stop) idle`。`init` 在 running/paused 时报错（先 `stop`）；终态再 `exec` 报错（重新 `init`）；`ready`/`paused` 之外的状态调 `exec` 也报错。
 
-> **暂停/恢复**是宿主级（网络 `kPause`/`kResume` → `BernardXEngine::Pause/Resume`），**不由 Lua 调用**。暂停时 bt 后台 tick 与 `sleep` 停推进（树状态保留），`http`/`async_io` 照常；恢复后从原位置继续。
+> **暂停/恢复**是宿主级（`LuaRuntime::Pause/Resume`，由宿主调用），**不由 Lua 调用**。暂停时 bt 后台 tick 与 `sleep` 停推进（树状态保留），`http`/`async` 照常；恢复后从原位置继续。
 
 ### bt.init / bt.exec 参数
 
@@ -35,7 +35,7 @@ local bt = require('bt')
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `interval` | integer | **是** | tick 间隔（毫秒），> 0 |
+| `interval` | integer | 否 | tick 间隔（毫秒），默认 50，需 > 0 |
 | `max_step` | integer | 否 | 最大 tick 步数，未设则无限 |
 | `timeout` | integer | 否 | 超时（毫秒），未设则不超时 |
 

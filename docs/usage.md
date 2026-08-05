@@ -20,7 +20,7 @@ bernardx [--dir=目录] [--entry=入口文件]
 
 1. 解析 `--dir` 参数，将其作为工作目录
 2. 创建 `FileSystemCodeProvider`，在 `src/` 和 `libs/` 子目录中查找 Lua 模块
-3. 初始化 Lua 运行时（注册 http、json、bt、blackboard 四个内置库）
+3. 初始化 Lua 运行时（注册 blackboard、bt、http、json、lfs 五个内置库）
 4. 执行 `{dir}/{entry}` 指定的入口文件
 5. 脚本执行完毕后，如果行为树仍在运行，等待其结束后退出
 
@@ -49,11 +49,10 @@ my_project/               ← --dir 指向这里
 │   ├── main.lua          # 默认入口脚本
 │   └── *.lua             # 其他模块
 ├── libs/                 # 第三方 Lua 库
-├── scripts/              # BT Script 节点脚本（由 CodeProvider 加载）
-└── sensors/              # BT 传感器脚本（由 CodeProvider 加载）
+└── scripts/              # BT Script 节点脚本（由 CodeProvider 加载）
 ```
 
-行为树结构在 `bt.init` 调用时从 **JSON 文件**加载：`root` 与 `sensor_defs` 为文件路径（`@` 前缀走项目资源 `ResourceProvider`，否则绝对路径）；Subtree 节点也按 `path` 加载子树 JSON。Script 节点与传感器的 Lua 脚本仍由 `path` 指定，统一由运行时 `CodeProvider` 加载（与主脚本 `require()` 共用同一加载器）——请将 `scripts/`、`sensors/` 等脚本目录纳入 `CodeProvider` 搜索路径。详见 [行为树文档](bt.md)。
+行为树在 `bt.init` 时从 JSON 加载（`root` 指定，`@` 走项目资源）；Script 脚本经 `CodeProvider` 加载——请将 `scripts/` 等目录纳入搜索路径。详见 [行为树文档](bt.md)。
 
 ## 退出码
 

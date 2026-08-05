@@ -13,7 +13,7 @@ flowchart TB
     RT["LuaRuntime<br/>（所有 Lua 代码跑在单 executor 线程）"]
     RT --> ML["main_L_ · lua_State"]
     RT --> CP["CodeProvider<br/>LoadModule / LoadFile"]
-    RT --> LIB["LuaLibrary[]<br/>bt · http · json · fs · bb · async_io"]
+    RT --> LIB["LuaLibrary[]<br/>bt · http · json · lfs · blackboard · async"]
     RT --> CO["CoroutinePool<br/>协程复用"]
     RT --> TM["TimerManager<br/>sleep / timeout"]
     CP -. "实现" .-> FS["FileSystemCodeProvider"]

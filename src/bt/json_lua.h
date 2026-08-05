@@ -14,7 +14,7 @@ extern "C" {
 #include "lua_types.h"
 
 // Bridge nlohmann::json values to Lua. Used at Node::Init time (when a live
-// lua_State is available) to turn Script/sensor `params` — which may be
+// lua_State is available) to turn Script `params` — which may be
 // objects or arrays — into real Lua tables (LuaRef). Scalars map the same way
 // the old ParseLuaValue did.
 
