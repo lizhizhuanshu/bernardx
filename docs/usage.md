@@ -20,7 +20,7 @@ bernardx [--dir=目录] [--entry=入口文件]
 
 1. 解析 `--dir` 参数，将其作为工作目录
 2. 创建 `FileSystemCodeProvider`，在 `src/` 和 `libs/` 子目录中查找 Lua 模块
-3. 初始化 Lua 运行时（注册 blackboard、bt、http、json、lfs 五个内置库）
+3. 初始化 Lua 运行时（注册 async、blackboard、bt、http、json、lfs 六个内置库）
 4. 执行 `{dir}/{entry}` 指定的入口文件
 5. 脚本执行完毕后，如果行为树仍在运行，等待其结束后退出
 

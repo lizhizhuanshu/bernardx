@@ -10,7 +10,7 @@
 | `bt` | `require('bt')` | 行为树（[bt.md](bt.md)） |
 | `json` | `require('json')` | `json.encode` / `json.decode` |
 | `lfs` | `require('lfs')` | 文件系统（attributes / dir / mkdir 等） |
-| `async` | `require('async')` | 异步文件 I/O 和进程管理（非默认注册，需 `AsyncIOLibrary`） |
+| `async` | `require('async')` | 异步文件 I/O 和进程管理 |
 
 ## 详细文档
 

@@ -2,7 +2,7 @@
 
 基于 asio 的异步文件 I/O 和进程管理。通过 `require('async')` 加载。
 
-> **注意：** 需要在构建 `LuaRuntime` 时注册 `AsyncIOLibrary` 并传入 `asio::io_context`。
+> **注意：** `bernardx` CLI 默认已注册；自行构建 `LuaRuntime` 时需注册 `AsyncIOLibrary` 并传入 `asio::io_context`。
 > 所有 read/write 操作均为**协程异步**——调用时 yield 挂起，I/O 完成后自动恢复。
 
 ```lua

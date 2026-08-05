@@ -10,6 +10,7 @@
 #include <iostream>
 #include <thread>
 
+#include "async_io_library.h"
 #include "bt_library.h"
 #include "http_library.h"
 #include "json_library.h"
@@ -45,6 +46,7 @@ int main(int argc, char* argv[]) {
     auto http_lib = std::make_shared<HttpLibrary>(*http_exec);
     auto json_lib = std::make_shared<JsonLibrary>();
     auto fs_lib = std::make_shared<FileSystemLibrary>();
+    auto async_lib = std::make_shared<AsyncIOLibrary>(ioc);
 
     async_simple::executors::SimpleExecutor executor(1);
     auto rt = LuaRuntime::Builder()
@@ -56,6 +58,7 @@ int main(int argc, char* argv[]) {
                   .RegisterLibrary(http_lib)
                   .RegisterLibrary(json_lib)
                   .RegisterLibrary(fs_lib)
+                  .RegisterLibrary(async_lib)
                   .Create();
 
     std::string entry = FLAGS_entry.empty() ? "src/main.lua" : FLAGS_entry;
