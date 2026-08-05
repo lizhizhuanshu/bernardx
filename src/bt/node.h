@@ -11,8 +11,7 @@ extern "C" {
 
 #include <async_simple/coro/Lazy.h>
 
-#include "decorator.h"
-#include "sensor.h"
+#include "node_condition.h"
 #include "types.h"
 
 class Blackboard;
@@ -31,8 +30,34 @@ public:
     // last status populated. The recorded value reflects the node's TRUE
     // return: wrappers that rewrite status (Repeat/Retry) do so AFTER this
     // returns, leaving the child's recorded value untouched.
+    //
+    // Also enforces the node's guard `condition` (if any): each tick the guard
+    // is evaluated with stale-while-running (an async condition mid-re-eval
+    // uses its last terminal result). If the guard is (effectively) Failure,
+    // the node is interrupted — OnAborted is called if it was mid-flight, and
+    // Failure is returned without ticking. This is the general interruption
+    // mechanism: it applies to every node that carries a condition.
     NodeStatus TickAndRecord(Blackboard& bb, BtEventQueue& events) {
+        // Self abort: while this node is active, monitor its guard condition and
+        // interrupt on Failure. Applies only when the condition's abort mode is
+        // Self or Both (LowerPriority preemption is handled by the engine).
+        if (condition_) {
+            AbortMode am = condition_->abort();
+            if (am == AbortMode::kSelf || am == AbortMode::kBoth) {
+                NodeStatus raw = condition_->Eval(bb, events);
+                NodeStatus guard = (raw == NodeStatus::kRunning)
+                                       ? condition_->last_terminal()
+                                       : raw;
+                if (guard == NodeStatus::kFailure) {
+                    if (is_running_) OnAborted();  // interrupt mid-flight work
+                    is_running_ = false;
+                    last_tick_status_ = NodeStatus::kFailure;
+                    return NodeStatus::kFailure;
+                }
+            }
+        }
         last_tick_status_ = Tick(bb, events);
+        is_running_ = (last_tick_status_ == NodeStatus::kRunning);
         return last_tick_status_;
     }
 
@@ -56,13 +81,21 @@ public:
 
     NodeStatus last_tick_status() const { return last_tick_status_; }
 
-    void AddDecorator(std::unique_ptr<Decorator> dec);
+    // Optional guard condition. Today only `Pipeline` consumes it (first-tick
+    // scan picks the first child whose condition is met). Other composites
+    // ignore it — guarding is explicit, never implicit in `Tick`.
+    void SetCondition(std::shared_ptr<NodeCondition> c) { condition_ = std::move(c); }
+    NodeCondition* condition() const { return condition_.get(); }
 
-    const std::vector<std::unique_ptr<Decorator>>& decorators() const { return decorators_; }
-    bool CheckDecorators(Blackboard& bb) const;
-
-    const std::vector<SensorSpec>& sensor_specs() const { return sensor_specs_; }
-    void AddSensorSpec(SensorSpec spec) { sensor_specs_.push_back(std::move(spec)); }
+    // Effective guard status (Success if there is no condition). Evaluates the
+    // condition with stale-while-running; composites call this to GATE a child
+    // before ticking it (Failure → Selector skips / Sequence fails / Parallel
+    // counts a failure). Does NOT tick this node.
+    NodeStatus GuardStatus(Blackboard& bb, BtEventQueue& events) {
+        if (!condition_) return NodeStatus::kSuccess;
+        NodeStatus raw = condition_->Eval(bb, events);
+        return (raw == NodeStatus::kRunning) ? condition_->last_terminal() : raw;
+    }
 
 protected:
     Node(uint32_t id, std::string type, std::string name);
@@ -74,6 +107,6 @@ protected:
     std::string description_;
     std::string last_error_;
     NodeStatus last_tick_status_ = NodeStatus::kRunning;
-    std::vector<std::unique_ptr<Decorator>> decorators_;
-    std::vector<SensorSpec> sensor_specs_;
+    bool is_running_ = false;  // last Tick returned Running (interruptable)
+    std::shared_ptr<NodeCondition> condition_;
 };

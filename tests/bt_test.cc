@@ -8,23 +8,23 @@
 
 #include "behavior_tree_engine.h"
 #include "blackboard.h"
-#include "blackboard_condition.h"
 #include "bt_event_queue.h"
 #include "bt_library.h"
 #include "blackboard_library.h"
 #include "composite.h"
-#include "decorator.h"
+#include "condition_composite.h"
 #include "force_success.h"
 #include "force_failure.h"
 #include "inverter.h"
 #include "lua_runtime.h"
 #include "node.h"
+#include "node_condition.h"
 #include "parallel.h"
+#include "pipeline.h"
+#include "script_condition.h"
 #include "script_node.h"
 #include "selector.h"
 #include "sequence.h"
-#include "resume_sequence.h"
-#include "sensor.h"
 #include "subtree_node.h"
 #include "repeat.h"
 #include "retry_until_successful.h"
@@ -70,6 +70,25 @@ public:
         tick_count = 0;
         aborted = false;
         Node::Reset();
+    }
+
+private:
+    NodeStatus status_;
+};
+
+// --- Mock condition for testing logic composites + Pipeline scan without Lua ---
+
+class MockCondition : public NodeCondition {
+public:
+    explicit MockCondition(NodeStatus status = NodeStatus::kSuccess)
+        : NodeCondition("Mock"), status_(status) {}
+
+    void set_status(NodeStatus s) { status_ = s; }
+    int tick_count = 0;
+
+    NodeStatus Tick(Blackboard& /*bb*/, BtEventQueue& /*events*/) override {
+        ++tick_count;
+        return status_;
     }
 
 private:
@@ -207,144 +226,6 @@ TEST(SequenceTest, RunningResumesFromSameChild) {
     EXPECT_FALSE(seq->has_started());
 }
 
-// --- ResumeSequence Tests ---
-
-TEST(ResumeSequenceTest, AllSkippedReturnsFailure) {
-    Blackboard bb;
-    BtEventQueue events;
-    auto rs = std::make_unique<ResumeSequence>(1, "rs");
-    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
-    a->AddDecorator(std::make_unique<BlackboardCondition>("x", "is_set"));
-    auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
-    b->AddDecorator(std::make_unique<BlackboardCondition>("y", "is_set"));
-    rs->AddChild(std::unique_ptr<MockNode>(a));
-    rs->AddChild(std::unique_ptr<MockNode>(b));
-
-    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kFailure);
-    EXPECT_EQ(a->tick_count, 0);
-    EXPECT_EQ(b->tick_count, 0);
-}
-
-TEST(ResumeSequenceTest, AdvancesThroughSuccesses) {
-    Blackboard bb;
-    BtEventQueue events;
-    auto rs = std::make_unique<ResumeSequence>(1, "rs");
-    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
-    auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
-    rs->AddChild(std::unique_ptr<MockNode>(a));
-    rs->AddChild(std::unique_ptr<MockNode>(b));
-
-    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kSuccess);
-    EXPECT_EQ(a->tick_count, 1);
-    EXPECT_EQ(b->tick_count, 1);
-}
-
-TEST(ResumeSequenceTest, RunningRemembersPosition) {
-    Blackboard bb;
-    BtEventQueue events;
-    auto rs = std::make_unique<ResumeSequence>(1, "rs");
-    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
-    auto* b = new MockNode(3, "b", NodeStatus::kRunning);
-    rs->AddChild(std::unique_ptr<MockNode>(a));
-    rs->AddChild(std::unique_ptr<MockNode>(b));
-
-    // tick 1: entry=0, a Success (advance to 1), b Running (remember 1)
-    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kRunning);
-    EXPECT_EQ(a->tick_count, 1);
-    EXPECT_EQ(b->tick_count, 1);
-
-    // tick 2: resumes from b -- a is NOT re-scanned (memory, not reactive)
-    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kRunning);
-    EXPECT_EQ(a->tick_count, 1);
-    EXPECT_EQ(b->tick_count, 2);
-
-    // b now succeeds -> whole node succeeds
-    static_cast<MockNode*>(rs->children()[1].get())->set_status(NodeStatus::kSuccess);
-    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kSuccess);
-    EXPECT_EQ(b->tick_count, 3);
-}
-
-TEST(ResumeSequenceTest, FailurePropagatesAndStops) {
-    Blackboard bb;
-    BtEventQueue events;
-    auto rs = std::make_unique<ResumeSequence>(1, "rs");
-    rs->AddChild(std::make_unique<MockNode>(2, "a", NodeStatus::kSuccess));
-    rs->AddChild(std::make_unique<MockNode>(3, "b", NodeStatus::kFailure));
-    rs->AddChild(std::make_unique<MockNode>(4, "c", NodeStatus::kSuccess));
-
-    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kFailure);
-    // c sits after the failing b and is never reached
-    EXPECT_EQ(static_cast<MockNode*>(rs->children()[2].get())->tick_count, 0);
-}
-
-TEST(ResumeSequenceTest, SkipsChildrenWhoseDecoratorFails) {
-    Blackboard bb;
-    BtEventQueue events;
-    auto rs = std::make_unique<ResumeSequence>(1, "rs");
-    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
-    a->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
-    auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
-    rs->AddChild(std::unique_ptr<MockNode>(a));
-    rs->AddChild(std::unique_ptr<MockNode>(b));
-
-    // a's decorator fails -> skip; b runs and succeeds
-    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kSuccess);
-    EXPECT_EQ(a->tick_count, 0);
-    EXPECT_EQ(b->tick_count, 1);
-}
-
-TEST(ResumeSequenceTest, ResumesAtCurrentStepAfterInterrupt) {
-    // Steps 1,2 are done (bb.step=2), step3 pending. Entry scan skips 1,2.
-    // An upstream popup aborts this node; on re-entry it re-scans and still
-    // resumes at step3 -- the interrupt-recovery case.
-    Blackboard bb;
-    BtEventQueue events;
-    bb.Set("step", LuaValue(static_cast<int64_t>(2)));
-
-    auto rs = std::make_unique<ResumeSequence>(1, "rs");
-    auto* s1 = new MockNode(2, "step1", NodeStatus::kSuccess);
-    s1->AddDecorator(std::make_unique<BlackboardCondition>(
-        "step", "less_than", LuaValue(static_cast<int64_t>(1))));
-    auto* s2 = new MockNode(3, "step2", NodeStatus::kSuccess);
-    s2->AddDecorator(std::make_unique<BlackboardCondition>(
-        "step", "less_than", LuaValue(static_cast<int64_t>(2))));
-    auto* s3 = new MockNode(4, "step3", NodeStatus::kRunning);
-    s3->AddDecorator(std::make_unique<BlackboardCondition>(
-        "step", "less_than", LuaValue(static_cast<int64_t>(3))));
-    rs->AddChild(std::unique_ptr<MockNode>(s1));
-    rs->AddChild(std::unique_ptr<MockNode>(s2));
-    rs->AddChild(std::unique_ptr<MockNode>(s3));
-
-    // First tick: entry scan skips s1,s2 (done), resumes at s3 -> Running
-    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kRunning);
-    EXPECT_EQ(s1->tick_count, 0);
-    EXPECT_EQ(s2->tick_count, 0);
-    EXPECT_EQ(s3->tick_count, 1);
-
-    // Upstream popup aborts this node -> OnAborted clears the entry so the
-    // next tick re-scans top-to-bottom (skipping s1,s2 again).
-    rs->OnAborted();
-
-    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kRunning);
-    EXPECT_EQ(s1->tick_count, 0);
-    EXPECT_EQ(s2->tick_count, 0);
-    EXPECT_EQ(s3->tick_count, 2);
-
-    // s3 finishes -> node succeeds.
-    static_cast<MockNode*>(rs->children()[2].get())->set_status(NodeStatus::kSuccess);
-    EXPECT_EQ(rs->Tick(bb, events), NodeStatus::kSuccess);
-    EXPECT_EQ(s3->tick_count, 3);
-}
-
-TEST(ResumeSequenceParseTest, ParsesTypeAndChildren) {
-    auto node = ParseJsonTree(R"({"type":"ResumeSequence","children":[{"type":"Wait","params":{"ms":10}}]})");
-    ASSERT_NE(node, nullptr);
-    EXPECT_EQ(node->type(), "ResumeSequence");
-    EXPECT_EQ(static_cast<Composite*>(node.get())->children().size(), 1u);
-}
-
-// --- Parallel Tests ---
-
 TEST(ParallelTest, RequireAllSuccess) {
     Blackboard bb;
     BtEventQueue events;
@@ -435,105 +316,6 @@ TEST(NestedTreeTest, SequenceFailsInnerSelector) {
 
 // --- Decorator Tests ---
 
-TEST(BlackboardConditionTest, IsSet) {
-    Blackboard bb;
-    BlackboardCondition cond("hp", "is_set");
-    EXPECT_FALSE(cond.Evaluate(bb));
-
-    bb.Set("hp", LuaValue(static_cast<int64_t>(100)));
-    EXPECT_TRUE(cond.Evaluate(bb));
-}
-
-TEST(BlackboardConditionTest, IsNotSet) {
-    Blackboard bb;
-    BlackboardCondition cond("hp", "is_not_set");
-    EXPECT_TRUE(cond.Evaluate(bb));
-
-    bb.Set("hp", LuaValue(static_cast<int64_t>(100)));
-    EXPECT_FALSE(cond.Evaluate(bb));
-}
-
-TEST(BlackboardConditionTest, EqualsInt) {
-    Blackboard bb;
-    bb.Set("hp", LuaValue(static_cast<int64_t>(100)));
-
-    BlackboardCondition cond("hp", "equals", LuaValue(static_cast<int64_t>(100)));
-    EXPECT_TRUE(cond.Evaluate(bb));
-
-    BlackboardCondition cond2("hp", "equals", LuaValue(static_cast<int64_t>(50)));
-    EXPECT_FALSE(cond2.Evaluate(bb));
-}
-
-TEST(BlackboardConditionTest, NotEquals) {
-    Blackboard bb;
-    bb.Set("hp", LuaValue(static_cast<int64_t>(100)));
-
-    BlackboardCondition cond("hp", "not_equals", LuaValue(static_cast<int64_t>(50)));
-    EXPECT_TRUE(cond.Evaluate(bb));
-
-    BlackboardCondition cond2("hp", "not_equals", LuaValue(static_cast<int64_t>(100)));
-    EXPECT_FALSE(cond2.Evaluate(bb));
-}
-
-TEST(BlackboardConditionTest, GreaterThan) {
-    Blackboard bb;
-    bb.Set("hp", LuaValue(static_cast<int64_t>(100)));
-
-    BlackboardCondition cond("hp", "greater_than", LuaValue(static_cast<int64_t>(50)));
-    EXPECT_TRUE(cond.Evaluate(bb));
-
-    BlackboardCondition cond2("hp", "greater_than", LuaValue(static_cast<int64_t>(100)));
-    EXPECT_FALSE(cond2.Evaluate(bb));
-}
-
-TEST(BlackboardConditionTest, LessThan) {
-    Blackboard bb;
-    bb.Set("hp", LuaValue(static_cast<int64_t>(50)));
-
-    BlackboardCondition cond("hp", "less_than", LuaValue(static_cast<int64_t>(100)));
-    EXPECT_TRUE(cond.Evaluate(bb));
-
-    BlackboardCondition cond2("hp", "less_than", LuaValue(static_cast<int64_t>(50)));
-    EXPECT_FALSE(cond2.Evaluate(bb));
-}
-
-TEST(BlackboardConditionTest, EqualsString) {
-    Blackboard bb;
-    bb.Set("state", LuaValue(std::string("idle")));
-
-    BlackboardCondition cond("state", "equals", LuaValue(std::string("idle")));
-    EXPECT_TRUE(cond.Evaluate(bb));
-
-    BlackboardCondition cond2("state", "equals", LuaValue(std::string("combat")));
-    EXPECT_FALSE(cond2.Evaluate(bb));
-}
-
-TEST(BlackboardConditionTest, EqualsBool) {
-    Blackboard bb;
-    bb.Set("alive", LuaValue(true));
-
-    BlackboardCondition cond("alive", "equals", LuaValue(true));
-    EXPECT_TRUE(cond.Evaluate(bb));
-
-    BlackboardCondition cond2("alive", "equals", LuaValue(false));
-    EXPECT_FALSE(cond2.Evaluate(bb));
-}
-
-TEST(BlackboardConditionTest, TypeMismatchReturnsFalse) {
-    Blackboard bb;
-    bb.Set("hp", LuaValue(static_cast<int64_t>(100)));
-
-    // String expected but int stored
-    BlackboardCondition cond("hp", "equals", LuaValue(std::string("100")));
-    EXPECT_FALSE(cond.Evaluate(bb));
-}
-
-TEST(BlackboardConditionTest, MissingKeyWithOperatorReturnsFalse) {
-    Blackboard bb;
-    BlackboardCondition cond("missing", "equals", LuaValue(static_cast<int64_t>(0)));
-    EXPECT_FALSE(cond.Evaluate(bb));
-}
-
 TEST(InverterTest, FlipsSuccessToFailure) {
     Blackboard bb;
     BtEventQueue events;
@@ -613,7 +395,7 @@ protected:
 
 TEST_F(BehaviorTreeEngineTest, LoadValidTree) {
     engine->SetRoot(ParseJsonTree(
-        R"({"type":"Selector","children":[{"type":"Script","path":"a.lua"},{"type":"Script","path":"b.lua"}]})"));
+        R"({"type":"Selector","children":[{"type":"Script","source":"a.lua"},{"type":"Script","source":"b.lua"}]})"));
     EXPECT_TRUE(engine->IsLoaded());
 }
 
@@ -623,7 +405,7 @@ TEST_F(BehaviorTreeEngineTest, StatusBeforeLoad) {
 
 TEST_F(BehaviorTreeEngineTest, TickOnceOnLoadedTree) {
     engine->SetRoot(ParseJsonTree(
-        R"({"type":"Selector","children":[{"type":"Script","path":"nonexistent.lua"}]})"));
+        R"({"type":"Selector","children":[{"type":"Script","source":"nonexistent.lua"}]})"));
     EXPECT_TRUE(engine->IsLoaded());
 
     auto status = engine->TickOnce();
@@ -632,7 +414,7 @@ TEST_F(BehaviorTreeEngineTest, TickOnceOnLoadedTree) {
 
 TEST_F(BehaviorTreeEngineTest, StopResetsTree) {
     engine->SetRoot(ParseJsonTree(
-        R"({"type":"Selector","children":[{"type":"Script","path":"nonexistent.lua"}]})"));
+        R"({"type":"Selector","children":[{"type":"Script","source":"nonexistent.lua"}]})"));
     engine->Stop();
     EXPECT_EQ(engine->GetStatus(), "idle");
 }
@@ -647,7 +429,7 @@ TEST_F(BehaviorTreeEngineTest, BlackboardPersistsAcrossLoad) {
     EXPECT_TRUE(engine->blackboard().Has("x"));
 
     engine->SetRoot(ParseJsonTree(
-        R"({"type":"Selector","children":[{"type":"Script","path":"a.lua"}]})"));
+        R"({"type":"Selector","children":[{"type":"Script","source":"a.lua"}]})"));
     // SetRoot preserves blackboard state
     EXPECT_TRUE(engine->blackboard().Has("x"));
 }
@@ -747,7 +529,7 @@ TEST_F(BehaviorTreeLibraryTest, RunInvalidJson) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, RunInvalidJsonReturnsSpecificError) {
-    // A Script node with no path is rejected during parsing.
+    // A Script node with no source is rejected during parsing.
     PutRoot(R"({"type":"Script"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
@@ -758,7 +540,7 @@ TEST_F(BehaviorTreeLibraryTest, RunInvalidJsonReturnsSpecificError) {
     EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[0]));
     auto* err = std::get_if<std::string>(&r.values[1]);
     ASSERT_NE(err, nullptr);
-    EXPECT_NE(err->find("path"), std::string::npos);
+    EXPECT_NE(err->find("source"), std::string::npos);
 }
 
 TEST_F(BehaviorTreeLibraryTest, RunUnknownNodeType) {
@@ -805,7 +587,7 @@ TEST_F(BehaviorTreeLibraryTest, GetBlackboardAsTable) {
 
 TEST_F(BehaviorTreeLibraryTest, RunLoadAndTick) {
     // x.lua does not exist → script init fails → bt.init returns nil + error.
-    PutRoot(R"({"type":"Selector","children":[{"type":"Script","path":"x.lua"}]})");
+    PutRoot(R"({"type":"Selector","children":[{"type":"Script","source":"x.lua"}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.init({root = "@root"})
@@ -903,26 +685,6 @@ TEST(NodeTreeTest, NestedParentPointers) {
     EXPECT_EQ(leaf->parent()->parent(), root.get());
 }
 
-// --- Decorator on node Tests ---
-
-TEST(DecoratorOnNodeTest, AddDecorator) {
-    MockNode node(1, "test");
-    EXPECT_TRUE(node.decorators().empty());
-
-    auto cond = std::make_unique<BlackboardCondition>("hp", "is_set");
-    node.AddDecorator(std::move(cond));
-    EXPECT_EQ(node.decorators().size(), 1u);
-}
-
-TEST(DecoratorOnNodeTest, EngineManagesDecoratorState) {
-    auto engine = std::make_shared<BehaviorTreeEngine>();
-    engine->SetRoot(ParseJsonTree(
-        R"({"type":"Selector",)"
-        R"("decorators":[{"type":"BlackboardCondition","key":"hp","operator":"is_set"}],)"
-        R"("children":[{"type":"Script","path":"a.lua"}]})"));
-    EXPECT_TRUE(engine->IsLoaded());
-}
-
 // --- BtEventQueue thread safety stress test ---
 
 TEST(BtEventQueueTest, ConcurrentPushDrain) {
@@ -997,7 +759,7 @@ protected:
 };
 
 TEST_F(ScriptNodeIntegrationTest, SelfStateInEnterAndTick) {
-    PutRoot(R"({"type":"Script","path":"scripts/bt_module.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/bt_module.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1009,7 +771,7 @@ TEST_F(ScriptNodeIntegrationTest, SelfStateInEnterAndTick) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, ExitReasonAsParameter) {
-    PutRoot(R"({"type":"Script","path":"scripts/check_reason.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/check_reason.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1021,7 +783,7 @@ TEST_F(ScriptNodeIntegrationTest, ExitReasonAsParameter) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
-    PutRoot(R"({"type":"Script","path":"scripts/with_args.lua","params":{"target":"enemy","damage":100}})");
+    PutRoot(R"({"type":"Script","source":"scripts/with_args.lua","params":{"target":"enemy","damage":100}})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1033,7 +795,7 @@ TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
-    PutRoot(R"({"type":"Script","path":"scripts/bool_args.lua","params":{"enabled":true}})");
+    PutRoot(R"({"type":"Script","source":"scripts/bool_args.lua","params":{"enabled":true}})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1044,8 +806,130 @@ TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
     EXPECT_EQ(status, "success");
 }
 
+TEST_F(ScriptNodeIntegrationTest, SubtreeParamsTemplatingPreservesTypes) {
+    // A Subtree node forwards its `params` into the wrapped subtree JSON via
+    // {{key}} placeholders. Whole-value placeholders preserve the param type
+    // (string/number/bool flow through unchanged).
+    PutRoot(R"({"type":"Subtree","source":"@sub","params":{"name":"lizhi","age":18,"active":true}})");
+    resource_provider->Put("sub",
+        R"({"type":"Script","source":"scripts/subtree_args.lua",)"
+        R"("params":{"name":"{{name}}","age":"{{age}}","active":"{{active}}"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bt.init({root = "@root"})
+        bt.exec({interval = 10})
+        return bb.get("sub_name"), bb.get("sub_age"), bb.get("sub_active")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 3u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "lizhi");
+    EXPECT_EQ(std::get<int64_t>(r.values[1]), 18);
+    EXPECT_EQ(std::get<bool>(r.values[2]), true);
+}
+
+TEST_F(ScriptNodeIntegrationTest, SubtreeParamsPartialSubstitution) {
+    // A placeholder embedded in a larger string is interpolated as text;
+    // whole-value placeholders in the same params still preserve type.
+    PutRoot(R"({"type":"Subtree","source":"@sub","params":{"name":"lizhi","age":18,"active":true}})");
+    resource_provider->Put("sub",
+        R"({"type":"Script","source":"scripts/subtree_args.lua",)"
+        R"("params":{"name":"hello {{name}}","age":"{{age}}","active":"{{active}}"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bt.init({root = "@root"})
+        bt.exec({interval = 10})
+        return bb.get("sub_name"), bb.get("sub_age"), bb.get("sub_active")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 3u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "hello lizhi");
+    EXPECT_EQ(std::get<int64_t>(r.values[1]), 18);
+    EXPECT_EQ(std::get<bool>(r.values[2]), true);
+}
+
+TEST_F(ScriptNodeIntegrationTest, SubtreeParamsTemplatingCondition) {
+    // Placeholders work in any string field, including a node's `condition`.
+    // Here the Subtree's param selects which condition script the inner node
+    // uses — "{{cond}}" resolves to the provided path.
+    PutRoot(R"({"type":"Subtree","source":"@sub","params":{"cond":"scripts/cond_truthy.lua"}})");
+    resource_provider->Put("sub",
+        R"({"type":"Pipeline","children":[)"
+        R"({"type":"Script","source":"scripts/no_args.lua","condition":{"type":"Script","source":"{{cond}}"}}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "@root"})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    // Condition templated to cond_truthy -> met -> step runs -> success.
+    EXPECT_EQ(*s, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, SubtreeParamsNestedPassThrough) {
+    // Outer params template the inner Subtree node's path AND params; those
+    // params then template the inner subtree JSON. Values pass through every
+    // level transparently.
+    PutRoot(R"({"type":"Subtree","source":"@outer","params":{"role":"combat"}})");
+    resource_provider->Put("outer",
+        R"({"type":"Subtree","source":"@inner-{{role}}.json","params":{"who":"{{role}}"}})");
+    resource_provider->Put("inner-combat.json",
+        R"({"type":"Script","source":"scripts/subtree_args.lua","params":{"name":"{{who}}"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bt.init({root = "@root"})
+        bt.exec({interval = 10})
+        return bb.get("sub_name")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "combat");
+}
+
+TEST_F(ScriptNodeIntegrationTest, TableParamPassedToEnter) {
+    // An object-valued param arrives in Enter as a real Lua table: nested
+    // field access works and scalar element types are preserved.
+    PutRoot(R"({"type":"Script","source":"scripts/table_args.lua",)"
+            R"("params":{"config":{"name":"lizhi","hp":100}}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bt.init({root = "@root"})
+        bt.exec({interval = 10})
+        return bb.get("t_name"), bb.get("t_hp")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "lizhi");
+    EXPECT_EQ(std::get<int64_t>(r.values[1]), 100);
+}
+
+TEST_F(ScriptNodeIntegrationTest, SubtreeTableParamForwarded) {
+    // A table param on the outer Subtree is forwarded (whole-value placeholder
+    // preserves the object) and reaches the Script's Enter as a Lua table.
+    PutRoot(R"({"type":"Subtree","source":"@sub",)"
+            R"("params":{"profile":{"name":"lizhi","hp":100}}})");
+    resource_provider->Put("sub",
+        R"({"type":"Script","source":"scripts/table_args.lua","params":{"config":"{{profile}}"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bt.init({root = "@root"})
+        bt.exec({interval = 10})
+        return bb.get("t_name"), bb.get("t_hp")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "lizhi");
+    EXPECT_EQ(std::get<int64_t>(r.values[1]), 100);
+}
+
 TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
-    PutRoot(R"({"type":"Script","path":"scripts/counter.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/counter.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1057,7 +941,7 @@ TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, NoArgsStillWorks) {
-    PutRoot(R"({"type":"Script","path":"scripts/no_args.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/no_args.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1069,7 +953,7 @@ TEST_F(ScriptNodeIntegrationTest, NoArgsStillWorks) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, ScriptNotFoundReturnsError) {
-    PutRoot(R"({"type":"Script","path":"scripts/nonexistent.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/nonexistent.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local status, err = bt.init({root = "@root"})
@@ -1084,7 +968,7 @@ TEST_F(ScriptNodeIntegrationTest, ScriptNotFoundReturnsError) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, ScriptRuntimeErrorReturnsError) {
-    PutRoot(R"({"type":"Script","path":"scripts/runtime_error.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/runtime_error.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1101,7 +985,7 @@ TEST_F(ScriptNodeIntegrationTest, ScriptRuntimeErrorReturnsError) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, NodeReturnsFailureIsNotError) {
-    PutRoot(R"({"type":"Script","path":"scripts/returns_failure.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/returns_failure.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1116,8 +1000,8 @@ TEST_F(ScriptNodeIntegrationTest, NodeReturnsFailureIsNotError) {
 
 TEST_F(ScriptNodeIntegrationTest, InitErrorInSequenceStopsEarly) {
     PutRoot(R"({"type":"Sequence","children":[)"
-            R"({"type":"Script","path":"scripts/nonexistent.lua"},)"
-            R"({"type":"Script","path":"scripts/no_args.lua"}]})");
+            R"({"type":"Script","source":"scripts/nonexistent.lua"},)"
+            R"({"type":"Script","source":"scripts/no_args.lua"}]})");
     auto r = AWAIT_BT(rt->RunScript(
         "local bt = require('bt')\n"
         "local status, err = bt.init({root = '@root'})\n"
@@ -1130,6 +1014,11 @@ TEST_F(ScriptNodeIntegrationTest, InitErrorInSequenceStopsEarly) {
     ASSERT_NE(err, nullptr);
     EXPECT_NE(err->find("nonexistent.lua"), std::string::npos);
 }
+
+// --- Pipeline composite tests ---
+//
+// (Pipeline tests are rewritten for the scan-to-start + sequential model in
+// the condition refactor; see the Pipeline + NodeCondition test sections.)
 
 // --- bt lifecycle exec() max_step / timeout / interval Tests ---
 
@@ -1167,7 +1056,7 @@ protected:
 };
 
 TEST_F(BtRunOptionsTest, MaxStepStopsTree) {
-    PutRoot(R"({"type":"Script","path":"scripts/run_forever.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/run_forever.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1182,7 +1071,7 @@ TEST_F(BtRunOptionsTest, MaxStepStopsTree) {
 }
 
 TEST_F(BtRunOptionsTest, MaxStepNotReachedTreeCompletes) {
-    PutRoot(R"({"type":"Script","path":"scripts/run_3_ticks.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/run_3_ticks.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1197,7 +1086,7 @@ TEST_F(BtRunOptionsTest, MaxStepNotReachedTreeCompletes) {
 }
 
 TEST_F(BtRunOptionsTest, TimeoutStopsTree) {
-    PutRoot(R"({"type":"Script","path":"scripts/run_forever.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/run_forever.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1212,7 +1101,7 @@ TEST_F(BtRunOptionsTest, TimeoutStopsTree) {
 }
 
 TEST_F(BtRunOptionsTest, TimeoutNotReachedTreeCompletes) {
-    PutRoot(R"({"type":"Script","path":"scripts/run_3_ticks.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/run_3_ticks.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1227,7 +1116,7 @@ TEST_F(BtRunOptionsTest, TimeoutNotReachedTreeCompletes) {
 }
 
 TEST_F(BtRunOptionsTest, IntervalAccepted) {
-    PutRoot(R"({"type":"Script","path":"scripts/run_3_ticks.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/run_3_ticks.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1241,7 +1130,7 @@ TEST_F(BtRunOptionsTest, IntervalAccepted) {
 }
 
 TEST_F(BtRunOptionsTest, CombinedMaxStepAndInterval) {
-    PutRoot(R"({"type":"Script","path":"scripts/run_forever.lua"})");
+    PutRoot(R"({"type":"Script","source":"scripts/run_forever.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})
@@ -1551,314 +1440,6 @@ TEST(WaitNodeTest, ResetRestartsTimer) {
     EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
 }
 
-// --- TreeParser new node type tests (removed: JSON-based TreeParser deleted) ---
-
-// --- Decorator gating on child nodes ---
-
-TEST(SelectorDecoratorTest, SkipsChildWhenDecoratorFails) {
-    Blackboard bb;
-    BtEventQueue events;
-
-    auto sel = std::make_unique<Selector>(1, "sel");
-    auto* gated = new MockNode(2, "gated", NodeStatus::kSuccess);
-    gated->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
-    auto* fallback = new MockNode(3, "fallback", NodeStatus::kSuccess);
-
-    sel->AddChild(std::unique_ptr<MockNode>(gated));
-    sel->AddChild(std::unique_ptr<MockNode>(fallback));
-
-    // flag not set → first child's decorator fails → skip to fallback
-    EXPECT_EQ(sel->Tick(bb, events), NodeStatus::kSuccess);
-    EXPECT_EQ(gated->tick_count, 0);
-    EXPECT_EQ(fallback->tick_count, 1);
-}
-
-TEST(SelectorDecoratorTest, TicksChildWhenDecoratorPasses) {
-    Blackboard bb;
-    BtEventQueue events;
-    bb.Set("flag", LuaValue(true));
-
-    auto sel = std::make_unique<Selector>(1, "sel");
-    auto* gated = new MockNode(2, "gated", NodeStatus::kSuccess);
-    gated->AddDecorator(std::make_unique<BlackboardCondition>("flag", "equals", LuaValue(true)));
-    auto* fallback = new MockNode(3, "fallback", NodeStatus::kSuccess);
-
-    sel->AddChild(std::unique_ptr<MockNode>(gated));
-    sel->AddChild(std::unique_ptr<MockNode>(fallback));
-
-    EXPECT_EQ(sel->Tick(bb, events), NodeStatus::kSuccess);
-    EXPECT_EQ(gated->tick_count, 1);
-    EXPECT_EQ(fallback->tick_count, 0);
-}
-
-TEST(SelectorDecoratorTest, AllDecoratorsFailReturnsFailure) {
-    Blackboard bb;
-    BtEventQueue events;
-
-    auto sel = std::make_unique<Selector>(1, "sel");
-    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
-    a->AddDecorator(std::make_unique<BlackboardCondition>("x", "is_set"));
-    auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
-    b->AddDecorator(std::make_unique<BlackboardCondition>("y", "is_set"));
-
-    sel->AddChild(std::unique_ptr<MockNode>(a));
-    sel->AddChild(std::unique_ptr<MockNode>(b));
-
-    EXPECT_EQ(sel->Tick(bb, events), NodeStatus::kFailure);
-    EXPECT_EQ(a->tick_count, 0);
-    EXPECT_EQ(b->tick_count, 0);
-}
-
-TEST(SequenceDecoratorTest, FailsImmediatelyWhenChildDecoratorFails) {
-    Blackboard bb;
-    BtEventQueue events;
-
-    auto seq = std::make_unique<Sequence>(1, "seq");
-    auto* gated = new MockNode(2, "gated", NodeStatus::kSuccess);
-    gated->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
-    auto* second = new MockNode(3, "second", NodeStatus::kSuccess);
-
-    seq->AddChild(std::unique_ptr<MockNode>(gated));
-    seq->AddChild(std::unique_ptr<MockNode>(second));
-
-    EXPECT_EQ(seq->Tick(bb, events), NodeStatus::kFailure);
-    EXPECT_EQ(gated->tick_count, 0);
-    EXPECT_EQ(second->tick_count, 0);
-}
-
-TEST(SequenceDecoratorTest, PassesThroughWhenDecoratorPasses) {
-    Blackboard bb;
-    BtEventQueue events;
-    bb.Set("flag", LuaValue(true));
-
-    auto seq = std::make_unique<Sequence>(1, "seq");
-    auto* gated = new MockNode(2, "gated", NodeStatus::kSuccess);
-    gated->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
-    auto* second = new MockNode(3, "second", NodeStatus::kSuccess);
-
-    seq->AddChild(std::unique_ptr<MockNode>(gated));
-    seq->AddChild(std::unique_ptr<MockNode>(second));
-
-    EXPECT_EQ(seq->Tick(bb, events), NodeStatus::kSuccess);
-    EXPECT_EQ(gated->tick_count, 1);
-    EXPECT_EQ(second->tick_count, 1);
-}
-
-TEST(ParallelDecoratorTest, DecoratorFailCountsAsFailure) {
-    Blackboard bb;
-    BtEventQueue events;
-
-    auto par = std::make_unique<Parallel>(1, "par",
-        Parallel::Policy::kRequireAll, Parallel::Policy::kRequireOne);
-
-    auto* gated = new MockNode(2, "gated", NodeStatus::kSuccess);
-    gated->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
-    auto* ok = new MockNode(3, "ok", NodeStatus::kSuccess);
-
-    par->AddChild(std::unique_ptr<MockNode>(gated));
-    par->AddChild(std::unique_ptr<MockNode>(ok));
-
-    // gated skipped (decorator fail → failure_count=1), ok succeeds.
-    // With failure_policy=RequireOne, one failure → Parallel fails.
-    EXPECT_EQ(par->Tick(bb, events), NodeStatus::kFailure);
-    EXPECT_EQ(gated->tick_count, 0);
-    EXPECT_EQ(ok->tick_count, 1);
-}
-
-TEST(RetryDecoratorTest, RetriesWhenChildDecoratorFails) {
-    Blackboard bb;
-    BtEventQueue events;
-
-    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
-    child->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
-    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 3,
-        std::unique_ptr<MockNode>(child));
-
-    // Tick 1: decorator fails, attempt=1, returns Running
-    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
-    EXPECT_EQ(child->tick_count, 0);
-
-    // Tick 2: decorator still fails, attempt=2
-    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
-
-    // Tick 3: decorator still fails, attempt=3 == max → Failure
-    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kFailure);
-    EXPECT_EQ(child->tick_count, 0);
-}
-
-TEST(RetryDecoratorTest, SucceedsWhenDecoratorStartsPassing) {
-    Blackboard bb;
-    BtEventQueue events;
-
-    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
-    child->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
-    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 5,
-        std::unique_ptr<MockNode>(child));
-
-    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
-
-    bb.Set("flag", LuaValue(true));
-    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kSuccess);
-    EXPECT_EQ(child->tick_count, 1);
-}
-
-TEST(RepeatDecoratorTest, FailsWhenChildDecoratorFails) {
-    Blackboard bb;
-    BtEventQueue events;
-
-    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
-    child->AddDecorator(std::make_unique<BlackboardCondition>("flag", "is_set"));
-    auto repeat = std::make_unique<Repeat>(1, "rep", 3,
-        std::unique_ptr<MockNode>(child));
-
-    EXPECT_EQ(repeat->Tick(bb, events), NodeStatus::kFailure);
-    EXPECT_EQ(child->tick_count, 0);
-}
-
-TEST(SubtreeDecoratorTest, BlocksSubtreeWhenDecoratorFails) {
-    Blackboard bb;
-    BtEventQueue events;
-
-    auto inner = std::make_unique<MockNode>(2, "inner", NodeStatus::kSuccess);
-    auto sub = std::make_unique<SubtreeNode>(1, "sub", "test",
-        std::move(inner));
-    sub->subtree_root()->AddDecorator(
-        std::make_unique<BlackboardCondition>("flag", "is_set"));
-
-    EXPECT_EQ(sub->Tick(bb, events), NodeStatus::kFailure);
-    auto* inner_node = dynamic_cast<MockNode*>(sub->subtree_root());
-    ASSERT_NE(inner_node, nullptr);
-    EXPECT_EQ(inner_node->tick_count, 0);
-}
-
-TEST(SubtreeDecoratorTest, ExecutesSubtreeWhenDecoratorPasses) {
-    Blackboard bb;
-    BtEventQueue events;
-    bb.Set("flag", LuaValue(true));
-
-    auto inner = std::make_unique<MockNode>(2, "inner", NodeStatus::kSuccess);
-    auto sub = std::make_unique<SubtreeNode>(1, "sub", "test",
-        std::move(inner));
-    sub->subtree_root()->AddDecorator(
-        std::make_unique<BlackboardCondition>("flag", "is_set"));
-
-    EXPECT_EQ(sub->Tick(bb, events), NodeStatus::kSuccess);
-    auto* inner_node = dynamic_cast<MockNode*>(sub->subtree_root());
-    ASSERT_NE(inner_node, nullptr);
-    EXPECT_EQ(inner_node->tick_count, 1);
-}
-
-TEST(DecoratorGateIntegrationTest, RetryWithSelectorGatedScript) {
-    Blackboard bb;
-    BtEventQueue events;
-
-    auto sel = std::make_unique<Selector>(2, "sel");
-
-    auto* print_script = new MockNode(3, "print", NodeStatus::kSuccess);
-    print_script->AddDecorator(std::make_unique<BlackboardCondition>(
-        "stop_visible", "equals", LuaValue(true)));
-
-    auto* fail_script = new MockNode(4, "fail", NodeStatus::kFailure);
-
-    sel->AddChild(std::unique_ptr<MockNode>(print_script));
-    sel->AddChild(std::unique_ptr<MockNode>(fail_script));
-
-    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 20000,
-        std::move(sel));
-
-    // stop_visible not set → first child's decorator fails → skip to fail_script → kFailure → retry
-    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
-    // print_script was never ticked (decorator blocked it)
-    EXPECT_EQ(print_script->tick_count, 0);
-
-    // Set stop_visible → first child's decorator passes → print_script executes → kSuccess
-    bb.Set("stop_visible", LuaValue(true));
-    EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kSuccess);
-    EXPECT_EQ(print_script->tick_count, 1);
-}
-
-// --- Non-root Decorator Abort Propagation Tests ---
-
-class AbortPropagationTest : public ::testing::Test {
-protected:
-    void SetUp() override {
-        blackboard = std::make_shared<Blackboard>();
-        bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
-        lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
-        tests_dir_ = std::filesystem::absolute(
-            std::filesystem::path(__FILE__).parent_path()).string();
-        resource_provider = std::make_shared<MemoryResourceProvider>();
-        rt = LuaRuntime::Builder()
-            .WithCodeProvider(std::make_shared<FileSystemCodeProvider>(
-                std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts", tests_dir_ + "/sensors"}))
-            .WithResourceProvider(resource_provider)
-            .RegisterLibrary(bb_lib)
-            .RegisterLibrary(lib)
-            .Create();
-    }
-
-    void TearDown() override {
-        lib->engine()->Stop();
-    }
-
-    void PutRoot(std::string json) { resource_provider->Put("root", std::move(json)); }
-    void PutSensors(std::string json) { resource_provider->Put("sensors", std::move(json)); }
-
-    std::shared_ptr<Blackboard> blackboard;
-    std::shared_ptr<BlackboardLibrary> bb_lib;
-    std::shared_ptr<BehaviorTreeLibrary> lib;
-    std::shared_ptr<MemoryResourceProvider> resource_provider;
-    LuaRuntime::Ptr rt;
-    std::string tests_dir_;
-};
-
-#define AWAIT_ABORT(lazy) async_simple::coro::syncAwait(lazy)
-
-TEST_F(AbortPropagationTest, SelfAbortTerminatesTree) {
-    // Script runs then clears "go" after 2 ticks. abort=Self on the Script.
-    // When "go" is cleared, the decorator transitions true→false, triggering Self abort.
-    // Sequence then fails (no more children).
-    PutRoot(R"({"type":"Sequence","children":[)"
-            R"({"type":"Script","path":"scripts/run_then_clear_flag.lua",)"
-            R"("decorators":[{"type":"BlackboardCondition","key":"go","operator":"equals","value":true,"abort":"Self"}]}]})");
-    auto r = AWAIT_ABORT(rt->RunScript(R"(
-        local bt = require('bt')
-        local bb = require('blackboard')
-        bb.set("go", true)
-        bt.init({root = "@root"})
-        local status = bt.exec({max_step = 20, interval = 10})
-        return status
-    )"));
-    ASSERT_EQ(r.status, LUA_OK);
-    auto* s = std::get_if<std::string>(&r.values[0]);
-    ASSERT_NE(s, nullptr);
-    // Should be "failure" (aborted) not "timeout" (would happen without abort propagation)
-    EXPECT_EQ(*s, "failure");
-}
-
-TEST_F(AbortPropagationTest, LowerPriorityAbortPreemptsSibling) {
-    // Selector: [no_args (decorator: flag is_set, abort=LowerPriority), run_then_set_flag]
-    // run_then_set_flag sets "flag" after 2 ticks.
-    // When flag appears, LowerPriority abort fires → second child aborted → first child retries → succeeds.
-    PutRoot(R"({"type":"Selector","children":[)"
-            R"({"type":"Script","path":"scripts/no_args.lua",)"
-            R"("decorators":[{"type":"BlackboardCondition","key":"flag","operator":"is_set","abort":"LowerPriority"}]},)"
-            R"({"type":"Script","path":"scripts/run_then_set_flag.lua"}]})");
-    auto r = AWAIT_ABORT(rt->RunScript(R"(
-        local bt = require('bt')
-        local bb = require('blackboard')
-        bt.init({root = "@root"})
-        local status = bt.exec({max_step = 20, interval = 10})
-        return status
-    )"));
-    ASSERT_EQ(r.status, LUA_OK);
-    auto* s = std::get_if<std::string>(&r.values[0]);
-    ASSERT_NE(s, nullptr);
-    // LowerPriority abort should cause Selector to re-evaluate: first child's decorator
-    // now passes (flag set) → no_args succeeds → Selector succeeds
-    EXPECT_EQ(*s, "success");
-}
-
 // --- PathTracer Tests ---
 
 TEST(PathTracerTest, SinglePathCount) {
@@ -1925,34 +1506,6 @@ TEST(PathTracerTest, ResetBetweenRuns) {
     auto& tr = engine.path_tracer();
     EXPECT_EQ(tr.path_count(), 1u);
     EXPECT_EQ(tr.count_for({1}), 1u);
-}
-
-TEST(PathTracerTest, RootDecoratorBlockedStillSampled) {
-    BehaviorTreeEngine engine;
-    auto leaf = std::make_unique<MockNode>(2, "leaf", NodeStatus::kSuccess);
-    auto root = std::make_unique<Sequence>(1, "root");
-    root->AddChild(std::move(leaf));
-    root->AddDecorator(std::make_unique<BlackboardCondition>("gate", "is_set"));
-    engine.SetRoot(std::move(root));
-    engine.TickOnce();  // gate absent → root blocked
-
-    auto& tr = engine.path_tracer();
-    EXPECT_EQ(tr.tick_count(), 1u);
-    EXPECT_EQ(tr.count_for({1, 2}), 1u);  // path still sampled
-}
-
-TEST(PathTracerTest, DecoratorFlipRecorded) {
-    BehaviorTreeEngine engine;
-    auto leaf = std::make_unique<MockNode>(2, "leaf", NodeStatus::kSuccess);
-    auto root = std::make_unique<Sequence>(1, "root");
-    root->AddChild(std::move(leaf));
-    root->AddDecorator(std::make_unique<BlackboardCondition>("gate", "is_set"));
-    engine.SetRoot(std::move(root));
-    engine.TickOnce();  // gate absent, dec first seen false (no flip)
-    EXPECT_EQ(engine.path_tracer().dec_flip_count(), 0u);
-    engine.blackboard().Set("gate", LuaValue(static_cast<int64_t>(1)));
-    engine.TickOnce();  // gate set → dec flips false→true
-    EXPECT_EQ(engine.path_tracer().dec_flip_count(), 1u);
 }
 
 TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
@@ -2057,4 +1610,462 @@ TEST_F(BehaviorTreeLibraryTest, RuntimePauseResumeFlag) {
     EXPECT_TRUE(rt->paused());
     rt->Resume();
     EXPECT_FALSE(rt->paused());
+}
+
+// --- Condition logic composite tests (MockCondition, no Lua) ---
+
+TEST(ConditionLogicTest, AndAllSuccessIsSuccess) {
+    AndCondition c;
+    c.AddChild(std::make_unique<MockCondition>(NodeStatus::kSuccess));
+    c.AddChild(std::make_unique<MockCondition>(NodeStatus::kSuccess));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(c.Tick(bb, ev), NodeStatus::kSuccess);
+}
+
+TEST(ConditionLogicTest, AndShortCircuitsOnFailure) {
+    AndCondition c;
+    auto* second = new MockCondition(NodeStatus::kSuccess);
+    c.AddChild(std::make_unique<MockCondition>(NodeStatus::kFailure));
+    c.AddChild(std::unique_ptr<MockCondition>(second));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(c.Tick(bb, ev), NodeStatus::kFailure);
+    EXPECT_EQ(second->tick_count, 0);  // never evaluated
+}
+
+TEST(ConditionLogicTest, AndRunningPropagatesAndStops) {
+    AndCondition c;
+    auto* second = new MockCondition(NodeStatus::kSuccess);
+    c.AddChild(std::make_unique<MockCondition>(NodeStatus::kRunning));
+    c.AddChild(std::unique_ptr<MockCondition>(second));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(c.Tick(bb, ev), NodeStatus::kRunning);
+    EXPECT_EQ(second->tick_count, 0);
+}
+
+TEST(ConditionLogicTest, OrAnySuccessIsSuccess) {
+    OrCondition c;
+    c.AddChild(std::make_unique<MockCondition>(NodeStatus::kFailure));
+    c.AddChild(std::make_unique<MockCondition>(NodeStatus::kSuccess));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(c.Tick(bb, ev), NodeStatus::kSuccess);
+}
+
+TEST(ConditionLogicTest, OrShortCircuitsOnSuccess) {
+    OrCondition c;
+    auto* second = new MockCondition(NodeStatus::kFailure);
+    c.AddChild(std::make_unique<MockCondition>(NodeStatus::kSuccess));
+    c.AddChild(std::unique_ptr<MockCondition>(second));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(c.Tick(bb, ev), NodeStatus::kSuccess);
+    EXPECT_EQ(second->tick_count, 0);
+}
+
+TEST(ConditionLogicTest, OrAllFailureIsFailure) {
+    OrCondition c;
+    c.AddChild(std::make_unique<MockCondition>(NodeStatus::kFailure));
+    c.AddChild(std::make_unique<MockCondition>(NodeStatus::kFailure));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(c.Tick(bb, ev), NodeStatus::kFailure);
+}
+
+TEST(ConditionLogicTest, NotInvertsSuccessAndFailure) {
+    Blackboard bb; BtEventQueue ev;
+    NotCondition from_success(std::make_unique<MockCondition>(NodeStatus::kSuccess));
+    EXPECT_EQ(from_success.Tick(bb, ev), NodeStatus::kFailure);
+    NotCondition from_failure(std::make_unique<MockCondition>(NodeStatus::kFailure));
+    EXPECT_EQ(from_failure.Tick(bb, ev), NodeStatus::kSuccess);
+}
+
+TEST(ConditionLogicTest, NotPassesRunningThrough) {
+    NotCondition c(std::make_unique<MockCondition>(NodeStatus::kRunning));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(c.Tick(bb, ev), NodeStatus::kRunning);
+}
+
+// --- Pipeline scan + sequential unit tests (MockNode + MockCondition) ---
+
+TEST(PipelineTest, NullConditionFirstChildSelectedThenSequential) {
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
+    pipe.AddChild(std::unique_ptr<MockNode>(a));
+    pipe.AddChild(std::unique_ptr<MockNode>(b));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);
+    EXPECT_EQ(a->tick_count, 1);
+    EXPECT_EQ(b->tick_count, 1);  // advanced same tick
+}
+
+TEST(PipelineTest, FirstMatchingConditionSelected) {
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
+    pipe.AddChild(std::unique_ptr<MockNode>(a));
+    pipe.AddChild(std::unique_ptr<MockNode>(b));
+    pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kSuccess));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);
+    EXPECT_EQ(a->tick_count, 0);
+    EXPECT_EQ(b->tick_count, 1);
+}
+
+TEST(PipelineTest, NoConditionMetTimesOutAtStep0) {
+    // Scan finds no condition held → wait at step 0; $timeout (ticks) elapses
+    // with condition still failing → fail (no previous step to back up to).
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), /*timeout=*/2, /*retry=*/0);
+    pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // scan no match → wait
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // 2 wait ticks → timeout at step 0
+    EXPECT_EQ(a->tick_count, 0);
+}
+
+TEST(PipelineTest, WaitTimeoutWithoutRetryFails) {
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout=*/2, /*retry=*/0);
+    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // step1 timeout, no retry
+    EXPECT_EQ(a1->tick_count, 0);
+}
+
+TEST(PipelineTest, RetryBacksUpAndSucceeds) {
+    // Step1 condition appears only after action0 is re-run via a retry back-up.
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout=*/2, /*retry=*/1);
+    auto* cond1 = new MockCondition(NodeStatus::kFailure);
+    pipe.children()[1]->SetCondition(std::shared_ptr<MockCondition>(cond1));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // step1 timeout → back up, reset a0
+    cond1->set_status(NodeStatus::kSuccess);             // now step1's condition holds
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);  // re-run a0 → step1 → a1 → done
+    EXPECT_EQ(a1->tick_count, 1);
+}
+
+TEST(PipelineTest, RetryExhaustedFails) {
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout=*/2, /*retry=*/1);
+    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // a0; step1 wait
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // timeout → back up, reset a0
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // re-run a0; step1 wait again
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // 2nd timeout, retry budget exhausted
+    EXPECT_EQ(a1->tick_count, 0);
+}
+
+TEST(PipelineTest, RetryFailsIfPrevConditionLost) {
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
+    auto* cond0 = new MockCondition(NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout=*/2, /*retry=*/1);
+    pipe.children()[0]->SetCondition(std::shared_ptr<MockCondition>(cond0));
+    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // scan step0; a0 runs; step1 waits
+    cond0->set_status(NodeStatus::kFailure);             // previous condition now lost
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // back-up gate fails
+    EXPECT_EQ(a1->tick_count, 0);
+}
+
+TEST(PipelineTest, RunningConditionKeepsScanPhase) {
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    pipe.AddChild(std::unique_ptr<MockNode>(a));
+    auto cond = std::make_shared<MockCondition>(NodeStatus::kRunning);
+    pipe.children()[0]->SetCondition(cond);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // still scanning
+    EXPECT_EQ(a->tick_count, 0);
+    cond->set_status(NodeStatus::kSuccess);
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);  // now selected + runs
+    EXPECT_EQ(a->tick_count, 1);
+}
+
+TEST(PipelineTest, ChildFailureFailsPipeline) {
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kFailure);
+    pipe.AddChild(std::unique_ptr<MockNode>(a));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);
+}
+
+TEST(PipelineTest, ResetReScans) {
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    pipe.AddChild(std::unique_ptr<MockNode>(a));
+    Blackboard bb; BtEventQueue ev;
+    ASSERT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);
+    pipe.Reset();  // clears started_ + child state (tick_count -> 0)
+    ASSERT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);
+    EXPECT_EQ(a->tick_count, 1);  // re-ran after reset (scan phase re-entered)
+}
+
+// --- Node guard (condition) + interruption tests ---
+
+TEST(NodeGuardTest, ConditionGatesEntryAndInterruptsOnFailure) {
+    // With abort=Self, a node's condition is a continuous guard: while it holds
+    // the node runs; the moment it goes Failure the running work is interrupted.
+    auto* mock = new MockNode(1, "n", NodeStatus::kRunning);
+    std::unique_ptr<Node> node(mock);
+    auto cond = std::make_shared<MockCondition>(NodeStatus::kSuccess);
+    cond->set_abort(AbortMode::kSelf);
+    node->SetCondition(cond);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(node->TickAndRecord(bb, ev), NodeStatus::kRunning);  // guard met -> run
+    EXPECT_FALSE(mock->aborted);
+    cond->set_status(NodeStatus::kFailure);                        // guard lost
+    EXPECT_EQ(node->TickAndRecord(bb, ev), NodeStatus::kFailure);  // interrupted
+    EXPECT_TRUE(mock->aborted);
+}
+
+TEST(NodeGuardTest, NoneAbortDoesNotInterrupt) {
+    // Default abort=None: the condition is NOT monitored — a running node keeps
+    // running even after its condition goes Failure.
+    auto* mock = new MockNode(1, "n", NodeStatus::kRunning);
+    std::unique_ptr<Node> node(mock);
+    auto cond = std::make_shared<MockCondition>(NodeStatus::kSuccess);  // abort=None
+    node->SetCondition(cond);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(node->TickAndRecord(bb, ev), NodeStatus::kRunning);
+    cond->set_status(NodeStatus::kFailure);
+    EXPECT_EQ(node->TickAndRecord(bb, ev), NodeStatus::kRunning);  // not interrupted
+    EXPECT_FALSE(mock->aborted);
+}
+
+TEST(NodeGuardTest, AsyncRunningUsesLastResult) {
+    // An async guard returning Running is treated as its last terminal result,
+    // so a previously-met guard doesn't spuriously interrupt the subordinate.
+    auto* mock = new MockNode(1, "n", NodeStatus::kRunning);
+    std::unique_ptr<Node> node(mock);
+    auto cond = std::make_shared<MockCondition>(NodeStatus::kSuccess);
+    cond->set_abort(AbortMode::kSelf);
+    node->SetCondition(cond);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(node->TickAndRecord(bb, ev), NodeStatus::kRunning);  // guard Success -> run
+    cond->set_status(NodeStatus::kRunning);                        // async mid-re-eval
+    EXPECT_EQ(node->TickAndRecord(bb, ev), NodeStatus::kRunning);  // stale Success -> continue
+    EXPECT_FALSE(mock->aborted);
+    cond->set_status(NodeStatus::kFailure);                        // guard actually failed
+    EXPECT_EQ(node->TickAndRecord(bb, ev), NodeStatus::kFailure);  // now interrupted
+    EXPECT_TRUE(mock->aborted);
+}
+
+TEST(PipelineTest, GuardInterruptsActionWhenConditionLost) {
+    // With abort=Self on the step's condition, while the action runs the
+    // condition is monitored; if the page is lost (Failure) the action is
+    // aborted and the step fails.
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new MockNode(2, "a0", NodeStatus::kRunning);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
+    auto* cond0 = new MockCondition(NodeStatus::kSuccess);
+    cond0->set_abort(AbortMode::kSelf);
+    pipe.children()[0]->SetCondition(std::shared_ptr<MockCondition>(cond0));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // a0 running under its guard
+    EXPECT_FALSE(a0->aborted);
+    cond0->set_status(NodeStatus::kFailure);             // page lost
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // guard interrupts a0 -> step fails
+    EXPECT_TRUE(a0->aborted);
+}
+
+TEST(AbortTest, LowerPriorityPreemptsRunningSibling) {
+    // Selector: high-priority child gated out (cond false) -> low runs. When the
+    // high cond flips true, abort=LowerPriority preempts the low branch.
+    BehaviorTreeEngine engine;
+    auto* a_hi = new MockNode(2, "high", NodeStatus::kRunning);
+    auto* a_lo = new MockNode(3, "low", NodeStatus::kRunning);
+    auto sel = std::make_unique<Selector>(1, "sel");
+    auto cond_hi = std::make_shared<MockCondition>(NodeStatus::kFailure);
+    cond_hi->set_abort(AbortMode::kLowerPriority);
+    sel->AddChild(std::unique_ptr<MockNode>(a_hi));
+    sel->children()[0]->SetCondition(cond_hi);
+    sel->AddChild(std::unique_ptr<MockNode>(a_lo));
+    engine.SetRoot(std::move(sel));
+
+    EXPECT_EQ(engine.TickOnce(), NodeStatus::kRunning);  // high gated out -> low runs
+    EXPECT_EQ(a_hi->tick_count, 0);
+    EXPECT_EQ(a_lo->tick_count, 1);
+
+    cond_hi->set_status(NodeStatus::kSuccess);           // high now wants priority
+    EXPECT_EQ(engine.TickOnce(), NodeStatus::kRunning);  // preempts low -> high runs
+    EXPECT_TRUE(a_lo->aborted);
+    EXPECT_EQ(a_hi->tick_count, 1);
+}
+
+TEST(AbortTest, ConditionGatesSelectorEntry) {
+    // abort=None still gates entry: a Selector skips a child whose condition
+    // is Failure, even though None does no reactive monitoring. (Running action
+    // so the tree stays active — TickOnce resets state on terminal.)
+    BehaviorTreeEngine engine;
+    auto* a_skip = new MockNode(2, "skip", NodeStatus::kRunning);
+    auto* a_run = new MockNode(3, "run", NodeStatus::kRunning);
+    auto sel = std::make_unique<Selector>(1, "sel");
+    sel->AddChild(std::unique_ptr<MockNode>(a_skip));
+    sel->children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    sel->AddChild(std::unique_ptr<MockNode>(a_run));
+    engine.SetRoot(std::move(sel));
+
+    EXPECT_EQ(engine.TickOnce(), NodeStatus::kRunning);  // gated child skipped, second runs
+    EXPECT_EQ(a_skip->tick_count, 0);
+    EXPECT_EQ(a_run->tick_count, 1);
+}
+
+// --- ScriptCondition + Pipeline integration (Lua, via JSON parser) ---
+
+TEST_F(ScriptNodeIntegrationTest, ScriptConditionTruthySelectsAndRuns) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua","condition":{"type":"Script","source":"scripts/cond_truthy.lua"}}]})");
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "@root"})
+        local status, err = bt.exec({interval = 10, max_step = 20})
+        if not status then return false, err end
+        return true, status
+    )");
+    EXPECT_EQ(status, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, PipelineScansPastFailingCondition) {
+    // Step 1's condition is never met; step 2's is. Pipeline starts at step 2.
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua","condition":{"type":"Script","source":"scripts/cond_falsy.lua"}},)"
+            R"({"type":"Script","source":"scripts/no_args.lua","condition":{"type":"Script","source":"scripts/cond_truthy.lua"}}]})");
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "@root"})
+        local status, err = bt.exec({interval = 10, max_step = 20})
+        if not status then return false, err end
+        return true, status
+    )");
+    EXPECT_EQ(status, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, PipelineNoConditionMetFails) {
+    // cond_falsy never holds → scan finds no match → wait at step 0; $timeout
+    // (ticks) elapses → fail (no previous step to back up to).
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"$timeout":3}]})");
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "@root"})
+        local status = bt.exec({interval = 10, max_step = 20})
+        return status
+    )");
+    EXPECT_EQ(status, "failure");
+}
+
+TEST_F(ScriptNodeIntegrationTest, ConditionAndOrNotComposition) {
+    // (cond_falsy OR cond_truthy) AND NOT cond_falsy -> met -> step runs.
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua","condition":)"
+            R"({"type":"And","children":[)"
+            R"({"type":"Or","children":[)"
+            R"({"type":"Script","source":"scripts/cond_falsy.lua"},)"
+            R"({"type":"Script","source":"scripts/cond_truthy.lua"}]},)"
+            R"({"type":"Not","child":{"type":"Script","source":"scripts/cond_falsy.lua"}}]}}]})");
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "@root"})
+        local status, err = bt.exec({interval = 10, max_step = 20})
+        if not status then return false, err end
+        return true, status
+    )");
+    EXPECT_EQ(status, "success");
+}
+
+// --- E2E simulated automation scenarios (Lua + bt.exec, blackboard = page state) ---
+//
+// Reusable fixtures (tests/scripts/e2e_*.lua): e2e_when (cond: bb[key]==value),
+// e2e_goto (action: navigate, flaky), e2e_set (action: bb[key]=value),
+// e2e_run (action: long-running, optional mid-run bb write + Exit tracking),
+// e2e_decay (cond: holds N ticks then fails).
+
+// Scenario 1 — checkout flow: Pipeline (scan + wait + retry back-up) with a
+// parameterized Subtree for one step. A flaky navigation forces a retry back-up.
+TEST_F(ScriptNodeIntegrationTest, E2E_CheckoutPipelineWithSubtreeAndRetry) {
+    // Subtree wraps the navigate action; {{to}}/{{flaky}} templated by the step.
+    resource_provider->Put("nav",
+        R"({"type":"Script","source":"scripts/e2e_goto.lua",)"
+        R"("params":{"to":"{{to}}","flaky":"{{flaky}}"}})");
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            // step 1: on home -> open cart (flaky 1st attempt) via Subtree
+            R"({"type":"Subtree","source":"@nav","params":{"to":"cart","flaky":1},)"
+            R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"home"}}},)"
+            // step 2: on cart -> go to checkout; wait for cart with retry back-up
+            R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"checkout"},)"
+            R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"cart"}},)"
+            R"("$timeout":3,"$retry":1},)"
+            // step 3: on checkout -> mark done
+            R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"done","value":true},)"
+            R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"checkout"}}})"
+            R"(]})");
+    blackboard->Set("page", LuaValue(std::string("home")));  // start on home
+
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "@root"})
+        return bt.exec({interval = 10, max_step = 30})
+    )");
+    EXPECT_EQ(status, "success");
+    EXPECT_EQ(*blackboard->Get("done"), LuaValue(true));                       // flow completed
+    EXPECT_EQ(*blackboard->Get("goto_cart"), LuaValue(static_cast<int64_t>(2)));  // retried once
+}
+
+// Scenario 2 — condition interrupt (Self): a long form-filling action runs under
+// a "still on form page" guard that decays. When the page disappears mid-fill,
+// the guard aborts the action and the Pipeline fails.
+TEST_F(ScriptNodeIntegrationTest, E2E_SelfAbortInterruptsLongAction) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/e2e_run.lua","params":{"ticks":10,"exit_key":"form_exit"},)"
+            R"("condition":{"type":"Script","source":"scripts/e2e_decay.lua","params":{"hold":3},"abort":"Self"}}]})");
+
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "@root"})
+        return bt.exec({interval = 10, max_step = 30})
+    )");
+    EXPECT_EQ(status, "failure");                                  // guard aborted the action
+    ASSERT_TRUE(blackboard->Has("form_exit"));
+    EXPECT_EQ(*blackboard->Get("form_exit"), LuaValue(std::string("aborted")));
+}
+
+// Scenario 3 — LowerPriority preemption: a worker runs until it triggers an
+// alert popup; the high-priority alert handler (LowerPriority) preempts the
+// worker, dismisses the alert, and the Selector succeeds.
+TEST_F(ScriptNodeIntegrationTest, E2E_LowerPriorityPreemptsWorker) {
+    PutRoot(R"({"type":"Selector","children":[)"
+            // high priority: dismiss alert when one is visible
+            R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"alert_visible","value":false},)"
+            R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"alert_visible","value":true},"abort":"LowerPriority"}},)"
+            // low priority: worker that triggers an alert on tick 2
+            R"({"type":"Script","source":"scripts/e2e_run.lua",)"
+            R"("params":{"ticks":0,"set_at":2,"set_key":"alert_visible","set_val":true,"exit_key":"worker_exit"}}]})");
+
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "@root"})
+        return bt.exec({interval = 10, max_step = 30})
+    )");
+    EXPECT_EQ(status, "success");                                  // alert dismissed
+    ASSERT_TRUE(blackboard->Has("worker_exit"));
+    EXPECT_EQ(*blackboard->Get("worker_exit"), LuaValue(std::string("aborted")));  // preempted
+    EXPECT_EQ(*blackboard->Get("alert_visible"), LuaValue(false));               // cleared
 }

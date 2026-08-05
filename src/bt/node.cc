@@ -1,6 +1,5 @@
 #include "node.h"
 
-#include "blackboard.h"
 #include "lua_runtime.h"
 
 Node::Node(uint32_t id, std::string type, std::string name)
@@ -8,24 +7,14 @@ Node::Node(uint32_t id, std::string type, std::string name)
 
 void Node::Reset() {
     last_error_.clear();
+    is_running_ = false;
+    if (condition_) condition_->Reset();
 }
 
 void Node::OnAborted() {
+    if (condition_) condition_->Reset();
 }
 
 async_simple::coro::Lazy<bool> Node::Init(lua_State* /*L*/, LuaRuntime* /*ctx*/) {
     co_return true;
-}
-
-void Node::AddDecorator(std::unique_ptr<Decorator> dec) {
-    decorators_.push_back(std::move(dec));
-}
-
-bool Node::CheckDecorators(Blackboard& bb) const {
-    for (auto& dec : decorators_) {
-        if (!dec->Evaluate(bb)) {
-            return false;
-        }
-    }
-    return true;
 }

@@ -11,11 +11,6 @@ NodeStatus Repeat::Tick(Blackboard& bb, BtEventQueue& events) {
         return NodeStatus::kFailure;
     }
 
-    if (!child_->CheckDecorators(bb)) {
-        set_last_error("child decorator condition not met");
-        return NodeStatus::kFailure;
-    }
-
     if (max_count_ == kInfinite) {
         auto status = child_->TickAndRecord(bb, events);
         if (status == NodeStatus::kFailure) {

@@ -1,11 +1,10 @@
 #pragma once
 
-#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
-#include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 extern "C" {
@@ -18,7 +17,6 @@ extern "C" {
 #include "bt_event_queue.h"
 #include "node.h"
 #include "path_tracer.h"
-#include "sensor.h"
 #include "types.h"
 
 class BehaviorTreeEngine : public std::enable_shared_from_this<BehaviorTreeEngine> {
@@ -33,7 +31,7 @@ public:
     BehaviorTreeEngine(BehaviorTreeEngine&&) = delete;
     BehaviorTreeEngine& operator=(BehaviorTreeEngine&&) = delete;
 
-    // Install an already-parsed tree root. Resets tree state and deactivates sensors.
+    // Install an already-parsed tree root. Resets tree state.
     void SetRoot(std::unique_ptr<Node> root);
 
     // Reset tree state and release all resources
@@ -49,11 +47,9 @@ public:
 
     void Notify(const std::string& event_name, LuaValue data);
 
+    // Async-load all Script nodes (and subtrees thereof). Also inits every
+    // node's guard `condition` via InitConditionsRecursive.
     async_simple::coro::Lazy<std::string> InitScriptNodesAsync(lua_State* L, LuaRuntime* ctx);
-
-    async_simple::coro::Lazy<std::string> InitSensorsAsync(lua_State* L, LuaRuntime* ctx);
-    void ActivateInitialSensors();
-    void DeactivateAllSensors();
 
     // Generation counter — incremented on Stop(). Async init checks this to detect stale operations.
     uint64_t generation() const { return generation_; }
@@ -89,37 +85,30 @@ public:
     std::optional<std::string> GotoPath(const std::vector<std::string>& names);
 
 private:
-    using DecoratorState = std::unordered_map<Node*, std::unordered_map<Decorator*, bool>>;
-
-    bool EvaluateDecorators(Node* node);
-    void EvaluateAllAbortMonitors();
-    void PropagateAbort(Node* source, AbortMode mode);
     void HandleEvents();
     void ResetTree();
-    void ClearDecoratorState();
-    void CollectRunningNodes(Node* node, std::vector<Node*>& out);
-    bool IsDescendantOf(Node* node, Node* ancestor) const;
-
-    void TickSensors();
-    void UpdateActiveSensors();
-    void CollectActiveNodes(Node* node, std::set<Node*>& out);
+    // Reactive abort (LowerPriority / Both): walk the tree, evaluate guard
+    // conditions, and on a false→true flip preempt the currently-running
+    // lower-priority branch. Self abort is handled per-node in Node::TickAndRecord.
+    void EvaluateAborts();
+    void EvaluateAbortsRecursive(Node* node);
+    // On a LowerPriority flip at `source`, walk up to the nearest ancestor
+    // Composite where source's branch outranks the running branch; abort that
+    // running branch and route the composite to source's branch.
+    void PreemptLowerPriority(Node* source);
+    // Recursive async init of every node's guard condition (if any). Walks
+    // Composite / SingleChildNode / SubtreeNode children so every node is
+    // visited regardless of how each Node::Init override chains.
+    async_simple::coro::Lazy<bool> InitConditionsRecursive(Node* node, lua_State* L, LuaRuntime* ctx);
     // Ordered, possibly multi-chain active path(s). Parallel fans out to one
     // chain per child; other composites/single-child nodes follow their active
     // child; leaves yield a single [self] chain.
     void CollectActivePaths(Node* node, std::vector<std::vector<Node*>>& out);
-    void CollectAbortMonitoringNodes(Node* node, std::set<Node*>& out);
-    void ActivateNodeSensors(Node* node);
-    void DeactivateNodeSensors(Node* node, const std::set<Node*>& still_active);
-    async_simple::coro::Lazy<std::string> InitSensorsRecursive(Node* node, lua_State* L, LuaRuntime* ctx);
-    static bool HasAbortLowerPriority(const Node* node);
 
     std::unique_ptr<Node> root_;
     std::shared_ptr<Blackboard> blackboard_;
     BtEventQueue event_queue_;
-    DecoratorState decorator_state_;
-
-    std::map<std::string, std::unique_ptr<ActiveSensor>> active_sensors_;
-    std::set<Node*> prev_sensor_nodes_;
+    std::unordered_map<Node*, NodeStatus> cond_state_;  // prev effective status (flip detection)
 
     std::string last_error_;
     NodeStatus last_status_ = NodeStatus::kRunning;

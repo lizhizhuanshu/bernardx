@@ -3,6 +3,8 @@
 #include <string>
 #include <unordered_map>
 
+#include <nlohmann/json.hpp>
+
 extern "C" {
 #include "lauxlib.h"
 #include "lua.h"
@@ -19,7 +21,10 @@ class ScriptNode : public Leaf {
 public:
     using ArgsMap = std::unordered_map<std::string, LuaValue>;
 
-    ScriptNode(uint32_t id, std::string name, std::string script_path, ArgsMap args = {});
+    // `params` is the raw JSON params object; scalars and tables alike are
+    // resolved to LuaValues at Init() (when a lua_State is available).
+    ScriptNode(uint32_t id, std::string name, std::string script_path,
+               nlohmann::json params = nlohmann::json::object());
     ~ScriptNode() override;
 
     const std::string& script_path() const { return script_path_; }
@@ -39,6 +44,7 @@ private:
     NodeStatus HandleScriptResult(const ScriptResult& result);
 
     std::string script_path_;
+    nlohmann::json params_json_;
     ArgsMap args_;
     LuaScriptHost host_;
 

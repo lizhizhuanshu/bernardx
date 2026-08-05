@@ -12,7 +12,6 @@ extern "C" {
 }
 
 #include "composite.h"
-#include "decorator.h"
 #include "lua_value_utils.h"
 #include "node.h"
 #include "single_child_node.h"
@@ -85,9 +84,6 @@ void PathTracer::SnapshotTopology(Node* root) {
         meta.name = node->name();
         meta.type = node->type();
         meta.parent_id = parent_id;
-        for (const auto& dec : node->decorators()) {
-            meta.decorators.push_back(dec->Describe());
-        }
 
         if (auto* comp = dynamic_cast<Composite*>(node)) {
             for (const auto& child : comp->children()) {
@@ -111,7 +107,6 @@ void PathTracer::Reset() {
     visit_count_.clear();
     composite_progress_.clear();
     switches_.clear();
-    dec_flips_.clear();
     tick_count_ = 0;
     path_occurrences_ = 0;
     has_terminal_ = false;
@@ -183,11 +178,6 @@ void PathTracer::OnTickDone(const std::vector<std::vector<Node*>>& active_paths,
         switches_.push_back({tick_count_, now_ms, last_sigset_, sigset});
     }
     last_sigset_ = std::move(sigset);
-}
-
-void PathTracer::OnDecoratorFlip(Node* node, Decorator* dec, bool was, bool now) {
-    if (!tracing_ || !node || !dec) return;
-    dec_flips_.push_back({tick_count_, node->id(), dec->Describe(), was, now});
 }
 
 void PathTracer::MarkTerminal(const std::vector<std::vector<uint32_t>>& last_sigs,
@@ -329,9 +319,6 @@ std::string PathTracer::RenderReport() const {
                             std::to_string(m.child_ids.size()) + "]";
                 }
             }
-            for (const auto& d : m.decorators) {
-                line += "  ⟂" + d;
-            }
             add(line);
             // push children in reverse so first child renders first
             for (auto rit = m.child_ids.rbegin(); rit != m.child_ids.rend(); ++rit) {
@@ -342,7 +329,7 @@ std::string PathTracer::RenderReport() const {
 
     // --- C: switch timeline ---
     add("");
-    add("▸ C 路径切换时间线 (仅切换事件 + 触发装饰器)");
+    add("▸ C 路径切换时间线 (仅切换事件)");
     if (switches_.empty()) {
         add(" (无切换)");
     } else {
@@ -361,15 +348,6 @@ std::string PathTracer::RenderReport() const {
                 if (sw.to.size() > 1) line += "(+" + std::to_string(sw.to.size() - 1) + ")";
             }
             add(line);
-            // attach same-tick decorator flips as reason
-            for (const auto& f : dec_flips_) {
-                if (f.tick == sw.tick) {
-                    auto nit = nodes_.find(f.node_id);
-                    std::string nm = nit != nodes_.end() ? nit->second.name : "#?";
-                    add("        因: " + nm + " " + f.desc + "  " +
-                        (f.was ? "true" : "false") + "→" + (f.now ? "true" : "false"));
-                }
-            }
         }
         if (start > 0) {
             add(" (仅显示最近 " + std::to_string(switches_.size() - start) +
@@ -471,12 +449,6 @@ void PathTracer::BuildLuaTable(lua_State* L) const {
             lua_seti(L, -2, static_cast<lua_Integer>(k + 1));
         }
         lua_setfield(L, -2, "child_ids");
-        lua_newtable(L);
-        for (size_t k = 0; k < m.decorators.size(); ++k) {
-            lua_pushstring(L, m.decorators[k].c_str());
-            lua_seti(L, -2, static_cast<lua_Integer>(k + 1));
-        }
-        lua_setfield(L, -2, "decorators");
         lua_pushinteger(L, static_cast<lua_Integer>(visits(id)));
         lua_setfield(L, -2, "visits");
         auto pit = composite_progress_.find(id);
@@ -506,26 +478,4 @@ void PathTracer::BuildLuaTable(lua_State* L) const {
         lua_seti(L, -2, si++);
     }
     lua_setfield(L, -2, "switches");
-
-    // dec_flips
-    lua_newtable(L);
-    int di = 1;
-    for (const auto& f : dec_flips_) {
-        lua_newtable(L);
-        lua_pushinteger(L, static_cast<lua_Integer>(f.tick));
-        lua_setfield(L, -2, "tick");
-        lua_pushinteger(L, static_cast<lua_Integer>(f.node_id));
-        lua_setfield(L, -2, "node_id");
-        auto nit = nodes_.find(f.node_id);
-        lua_pushstring(L, nit != nodes_.end() ? nit->second.name.c_str() : "#?");
-        lua_setfield(L, -2, "node_name");
-        lua_pushstring(L, f.desc.c_str());
-        lua_setfield(L, -2, "desc");
-        lua_pushboolean(L, f.was);
-        lua_setfield(L, -2, "was");
-        lua_pushboolean(L, f.now);
-        lua_setfield(L, -2, "now");
-        lua_seti(L, -2, di++);
-    }
-    lua_setfield(L, -2, "dec_flips");
 }

@@ -19,12 +19,14 @@ NodeStatus Composite::TickSequential(Blackboard& bb, BtEventQueue& events,
         size_t idx = tracker ? tracker->order()[i] : i;
         auto& child = children_[idx];
 
-        if (!child->CheckDecorators(bb)) {
+        // Gate the child on its guard condition (UE4/5 decorator-style entry
+        // check). A gated-Failure child is skipped by Selector and fails Sequence.
+        if (child->GuardStatus(bb, events) == NodeStatus::kFailure) {
             if (policy == SeqPolicy::Sequence) {
                 current_child_index_ = 0;
                 return NodeStatus::kFailure;
             }
-            continue;  // Selector: skip children whose decorators fail
+            continue;  // Selector: try the next child
         }
 
         switch (child->TickAndRecord(bb, events)) {

@@ -55,17 +55,16 @@ const char* NodeStatusToString(NodeStatus s) {
     }
 }
 
-// --- init: load+parse JSON defs, init scripts/sensors, activate (yields) ---
+// --- init: load+parse JSON root, init scripts (+conditions), activate (yields) ---
 static async_simple::coro::Lazy<void> InitAsync(
     std::shared_ptr<LuaRuntime> rt,
     AsyncHandle handle,
     BehaviorTreeEngine::Ptr engine,
     std::string root_path,
-    std::string sensor_defs_path,
     std::shared_ptr<ResourceProvider> provider,
     bool trace_paths,
     uint64_t expected_generation) {
-    auto parse_result = co_await TreeParser::LoadAndParse(root_path, sensor_defs_path, provider);
+    auto parse_result = co_await TreeParser::LoadAndParse(root_path, provider);
     if (engine->generation() != expected_generation) {
         // Stopped mid-load; unblock the awaiter so it doesn't hang.
         rt->PushResume(handle, {std::string("stopped")});
@@ -83,19 +82,7 @@ static async_simple::coro::Lazy<void> InitAsync(
     engine->SetRoot(std::move(parse_result.root));
     engine->SetTracing(trace_paths);
     if (engine->generation() == expected_generation) {
-        auto e1 = co_await engine->InitScriptNodesAsync(rt->main_state(), rt.get());
-        if (engine->generation() == expected_generation) {
-            if (e1.empty()) {
-                auto e2 = co_await engine->InitSensorsAsync(rt->main_state(), rt.get());
-                if (engine->generation() == expected_generation && e2.empty()) {
-                    engine->ActivateInitialSensors();
-                } else {
-                    err = e2;
-                }
-            } else {
-                err = e1;
-            }
-        }
+        err = co_await engine->InitScriptNodesAsync(rt->main_state(), rt.get());
     }
     if (engine->generation() != expected_generation) {
         // Stopped mid-init; unblock the awaiter so it doesn't hang.
@@ -201,8 +188,6 @@ int bt_init(lua_State* L) {
         lua_pushstring(L, "root (string path) required");
         return 2;
     }
-    // sensor_defs: path to the sensor definitions JSON file. Optional.
-    std::string sensor_defs_path = ReadStringOpt(L, 1, "sensor_defs");
     bool trace_paths = ReadBoolOpt(L, 1, "trace_paths", true);
 
     auto rt_ctx = LuaRuntime::FromLuaState(L);
@@ -216,7 +201,7 @@ int bt_init(lua_State* L) {
     auto handle = rt_ctx->PreYield(L);
     uint64_t gen = engine->generation();
     InitAsync(rt_ctx, handle, engine->shared_from_this(),
-               std::move(root_path), std::move(sensor_defs_path),
+               std::move(root_path),
                rt_ctx->shared_resource_provider(), trace_paths, gen)
         .via(rt_ctx->executor())
         .detach();

@@ -9,7 +9,6 @@
 #include "types.h"
 
 class Node;
-class Decorator;
 struct lua_State;
 
 // Records per-tick "active paths" (root -> active leaf) of a behavior tree so
@@ -34,7 +33,6 @@ public:
     void BeginTick();  // ++tick_count_; call at the very start of TickOnce
     void OnTickDone(const std::vector<std::vector<Node*>>& active_paths,
                     NodeStatus root_status, int64_t now_ms, const char* note);
-    void OnDecoratorFlip(Node* node, Decorator* dec, bool was, bool now);
     void MarkTerminal(const std::vector<std::vector<uint32_t>>& last_sigs,
                       NodeStatus root_status, const char* note);
     // Convenience: mark the most recent tick's sigset as terminal.
@@ -51,7 +49,6 @@ public:
     uint64_t path_occurrences() const { return path_occurrences_; }
     size_t path_count() const { return paths_.size(); }
     size_t switch_count() const { return switches_.size(); }
-    size_t dec_flip_count() const { return dec_flips_.size(); }
     int visits(uint32_t id) const {
         auto it = visit_count_.find(id);
         return it != visit_count_.end() ? it->second : 0;
@@ -77,7 +74,6 @@ private:
         std::string type;
         uint32_t parent_id = 0;  // 0 = none (root)
         std::vector<uint32_t> child_ids;
-        std::vector<std::string> decorators;  // Decorator::Describe() each
     };
     struct PathStats {
         uint32_t count = 0;
@@ -96,13 +92,6 @@ private:
         std::vector<std::vector<uint32_t>> from;  // prior sigset
         std::vector<std::vector<uint32_t>> to;    // new sigset
     };
-    struct DecFlip {
-        uint64_t tick;
-        uint32_t node_id;
-        std::string desc;
-        bool was;
-        bool now;
-    };
 
     static int StatusIndex(NodeStatus s) { return static_cast<int>(s); }
     std::string FormatPath(const std::vector<uint32_t>& sig) const;
@@ -114,7 +103,6 @@ private:
     std::unordered_map<uint32_t, int> visit_count_;
     std::unordered_map<uint32_t, size_t> composite_progress_;  // last current_child_index
     std::vector<SwitchEvent> switches_;
-    std::vector<DecFlip> dec_flips_;
 
     uint64_t tick_count_ = 0;
     int64_t start_ms_ = 0;

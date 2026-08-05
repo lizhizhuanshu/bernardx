@@ -5,6 +5,7 @@
 
 #include "blackboard.h"
 #include "bt_event_queue.h"
+#include "json_lua.h"
 #include "types.h"
 
 namespace {
@@ -36,10 +37,11 @@ std::string BuildErrorJson(const std::string& node, const std::string& phase, co
 
 }  // namespace
 
-ScriptNode::ScriptNode(uint32_t id, std::string name, std::string script_path, ArgsMap args)
+ScriptNode::ScriptNode(uint32_t id, std::string name, std::string script_path,
+                       nlohmann::json params)
     : Leaf(id, "Script", std::move(name)),
       script_path_(std::move(script_path)),
-      args_(std::move(args)) {}
+      params_json_(std::move(params)) {}
 
 ScriptNode::~ScriptNode() {
     if (yielded_co_ != nullptr && host_.lua_context_) {
@@ -52,6 +54,15 @@ async_simple::coro::Lazy<bool> ScriptNode::Init(lua_State* L, LuaRuntime* ctx) {
     if (!co_await host_.LoadScript(L, ctx, script_path_, true)) {
         set_last_error(host_.last_error_);
         co_return false;
+    }
+    // Resolve params now that a lua_State is available: scalars map directly,
+    // objects/arrays become Lua tables (LuaRef on host_.main_L_, shared across
+    // coroutines via the registry).
+    if (params_json_.is_object()) {
+        for (auto it = params_json_.begin(); it != params_json_.end(); ++it) {
+            args_[it.key()] = JsonToLuaValue(host_.main_L_, ctx, it.value());
+        }
+        params_json_ = nlohmann::json::object();  // release raw JSON
     }
     co_return true;
 }

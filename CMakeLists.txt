@@ -111,17 +111,17 @@ add_library(bernardx_lib STATIC
     src/bt/single_child_node.cc
     src/bt/lua_script_host.cc
     src/bt/script_node.cc
-    src/bt/sensor.cc
+    src/bt/script_condition.cc
+    src/bt/condition_composite.cc
     src/bt/node.cc
     src/bt/composite.cc
     src/bt/selector.cc
     src/bt/sequence.cc
-    src/bt/resume_sequence.cc
+    src/bt/pipeline.cc
     src/bt/parallel.cc
     src/bt/inverter.cc
     src/bt/force_success.cc
     src/bt/force_failure.cc
-    src/bt/blackboard_condition.cc
     src/bt/repeat.cc
     src/bt/retry_until_successful.cc
     src/bt/random_selector.cc

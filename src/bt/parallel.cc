@@ -18,7 +18,9 @@ NodeStatus Parallel::Tick(Blackboard& bb, BtEventQueue& events) {
     int total = static_cast<int>(children_.size());
 
     for (auto& child : children_) {
-        if (!child->CheckDecorators(bb)) {
+        // Gate on the child's guard condition; a gated-Failure child counts as
+        // a failure toward the failure policy (not ticked).
+        if (child->GuardStatus(bb, events) == NodeStatus::kFailure) {
             ++failure_count;
             continue;
         }

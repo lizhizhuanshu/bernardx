@@ -8,10 +8,6 @@ NodeStatus ForceSuccess::Tick(Blackboard& bb, BtEventQueue& events) {
         set_last_error("no child node");
         return NodeStatus::kFailure;
     }
-    if (!child_->CheckDecorators(bb)) {
-        set_last_error("child decorator condition not met");
-        return NodeStatus::kFailure;
-    }
     auto status = child_->TickAndRecord(bb, events);
     if (status == NodeStatus::kRunning) {
         return NodeStatus::kRunning;
