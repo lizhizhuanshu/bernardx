@@ -58,7 +58,7 @@ sequenceDiagram
     RT->>RT: PreYield(L) 取 AsyncHandle<br/>lua_yieldk 挂起协程
     RT->>CP: LoadModule("foo.bar")<br/>协程 .via(executor).detach()
     Note over CP: 异步读取文件/资源
-    CP-->>RT: optional&lt;source&gt;
+    CP-->>RT: source（可空，即 optional）
     alt 找到
         RT->>RT: PushRequireRun(handle, source, name)<br/>luaL_loadbuffer + lua_resume
         RT-->>S: 恢复协程，返回模块
