@@ -3,13 +3,16 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
+#include <algorithm>
 #include <filesystem>
+#include <random>
 #include <thread>
 
 #include "behavior_tree_engine.h"
 #include "blackboard.h"
 #include "bt_event_queue.h"
 #include "bt_library.h"
+#include "bt_utils.h"
 #include "blackboard_library.h"
 #include "composite.h"
 #include "condition_composite.h"
@@ -74,6 +77,22 @@ public:
 
 private:
     NodeStatus status_;
+};
+
+// MockNode whose accumulated tick count survives Reset() — used to count
+// action re-runs across Pipeline retry back-ups (each back-up Reset()s the
+// child, clearing MockNode::tick_count).
+class CountingMockNode : public MockNode {
+public:
+    using MockNode::MockNode;
+    NodeStatus Tick(Blackboard& bb, BtEventQueue& ev) override {
+        ++total_ticks_;
+        return MockNode::Tick(bb, ev);
+    }
+    int total_ticks() const { return total_ticks_; }
+
+private:
+    int total_ticks_ = 0;
 };
 
 // --- Mock condition for testing logic composites + Pipeline scan without Lua ---
@@ -1817,6 +1836,128 @@ TEST(PipelineTest, ResetReScans) {
     EXPECT_EQ(a->tick_count, 1);  // re-ran after reset (scan phase re-entered)
 }
 
+// --- RollIntInRange + Pipeline $timeout/$retry range-randomization tests ---
+//
+// $timeout/$retry may be a fixed int (lo==hi) or a [lo,hi] range; the Pipeline
+// rolls one value per step per run. The fixed cases must match the legacy
+// single-value behaviour; the range cases must keep the resolved value inside
+// the bounds across many runs.
+
+TEST(RollIntInRangeTest, DegenerateRangeReturnsLo) {
+    std::mt19937 g(123);
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_EQ(RollIntInRange(5, 5, g), 5);   // lo==hi
+        EXPECT_EQ(RollIntInRange(7, 3, g), 7);   // hi<lo → lo
+        EXPECT_EQ(RollIntInRange(0, 0, g), 0);
+    }
+}
+
+TEST(RollIntInRangeTest, StaysWithinRangeAndVisitsEndpoints) {
+    std::mt19937 g(42);
+    const int lo = 3, hi = 9;
+    int seen_min = hi, seen_max = lo;
+    for (int i = 0; i < 3000; ++i) {
+        int v = RollIntInRange(lo, hi, g);
+        ASSERT_GE(v, lo);
+        ASSERT_LE(v, hi);
+        seen_min = std::min(seen_min, v);
+        seen_max = std::max(seen_max, v);
+    }
+    EXPECT_EQ(seen_min, lo);  // uniform draw hits both endpoints over 3000 tries
+    EXPECT_EQ(seen_max, hi);
+}
+
+TEST(PipelineTest, RangeTimeoutCollapsesToFixedValue) {
+    // [2,2] must behave exactly like the legacy $timeout=2 (timeout, no retry).
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), /*lo=*/2, /*hi=*/2, /*retry=*/0, /*retry=*/0);
+    pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // scan no match → wait, tick 1
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // tick 2 → timeout at step 0
+    EXPECT_EQ(a->tick_count, 0);
+}
+
+TEST(PipelineTest, RangeTimeoutResolvesWithinBounds) {
+    // $timeout=[1,5]: across many runs the actual wait (ticks to timeout) must
+    // stay within [1,5] and reach both endpoints (proves a real roll, not a clamp).
+    const int lo = 1, hi = 5;
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), lo, hi, 0, 0);
+    pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+
+    int seen_min = hi, seen_max = lo;
+    for (int run = 0; run < 80; ++run) {
+        pipe.Reset();
+        Blackboard bb; BtEventQueue ev;
+        int ticks = 0;
+        NodeStatus s = NodeStatus::kRunning;
+        while (s == NodeStatus::kRunning) {
+            s = pipe.Tick(bb, ev);  // each tick spends one wait unit; failure on the T-th
+            ++ticks;
+        }
+        ASSERT_EQ(s, NodeStatus::kFailure);  // step 0, no retry → timeout fails
+        ASSERT_GE(ticks, lo);
+        ASSERT_LE(ticks, hi);
+        seen_min = std::min(seen_min, ticks);
+        seen_max = std::max(seen_max, ticks);
+    }
+    EXPECT_EQ(seen_min, lo);
+    EXPECT_EQ(seen_max, hi);
+    EXPECT_EQ(a->tick_count, 0);
+}
+
+TEST(PipelineTest, RangeRetryCollapsesToFixedValue) {
+    // retry=[1,1] must behave like the legacy $retry=1 (one back-up, then fail).
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout=*/2, /*timeout=*/2,
+                 /*retry_lo=*/1, /*retry_hi=*/1);
+    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // step1 timeout → back up, reset a0
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // re-run a0; step1 wait again
+    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // 2nd timeout, retry budget exhausted
+    EXPECT_EQ(a1->tick_count, 0);
+}
+
+TEST(PipelineTest, RangeRetryResolvesWithinBounds) {
+    // retry=[1,4]: the number of back-up re-runs of a0 must land in [1,4]. a0 is
+    // ticked once initially + once per back-up, so (total_ticks delta) - 1 gives
+    // the back-up count for each run.
+    const int lo = 1, hi = 4;
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new CountingMockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(static_cast<MockNode*>(a0)), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_lo=*/1, /*timeout_hi=*/1, lo, hi);
+    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+
+    int seen_min = hi, seen_max = lo;
+    for (int run = 0; run < 80; ++run) {
+        pipe.Reset();
+        Blackboard bb; BtEventQueue ev;
+        int before = a0->total_ticks();
+        NodeStatus s = NodeStatus::kRunning;
+        while (s == NodeStatus::kRunning) {
+            s = pipe.Tick(bb, ev);
+        }
+        ASSERT_EQ(s, NodeStatus::kFailure);
+        int back_ups = (a0->total_ticks() - before) - 1;  // initial run + one per back-up
+        ASSERT_GE(back_ups, lo);
+        ASSERT_LE(back_ups, hi);
+        seen_min = std::min(seen_min, back_ups);
+        seen_max = std::max(seen_max, back_ups);
+    }
+    EXPECT_EQ(seen_min, lo);
+    EXPECT_EQ(seen_max, hi);
+}
+
 // --- Node guard (condition) + interruption tests ---
 
 TEST(NodeGuardTest, ConditionGatesEntryAndInterruptsOnFailure) {
@@ -1963,6 +2104,20 @@ TEST_F(ScriptNodeIntegrationTest, PipelineNoConditionMetFails) {
     PutRoot(R"({"type":"Pipeline","children":[)"
             R"({"type":"Script","source":"scripts/no_args.lua",)"
             R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"$timeout":3}]})");
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "@root"})
+        local status = bt.exec({interval = 10, max_step = 20})
+        return status
+    )");
+    EXPECT_EQ(status, "failure");
+}
+
+TEST_F(ScriptNodeIntegrationTest, PipelineArrayTimeoutEquivalentToScalar) {
+    // $timeout as a [lo,hi] array must parse and behave like the scalar 3 above.
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"$timeout":[3,3]}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "@root"})

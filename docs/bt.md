@@ -100,8 +100,8 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `condition` | object | 该步的守卫条件（见[条件](#条件)）；可选，无则视为已成立 |
-| `$timeout` | int (tick) | 等待**本步** condition 成立的 tick 预算；0/缺省 = 无限等 |
-| `$retry` | int | 等待本步 condition 超时后，回退重跑上一步动作的最大次数；0/缺省 = 不重试 |
+| `$timeout` | int 或 `[lo,hi]` (tick) | 等待**本步** condition 成立的 tick 预算；数组形式表示闭区间内**均匀随机**（每次运行、每个步摇一个值，该步本次运行内固定）；0/缺省 = 无限等 |
+| `$retry` | int 或 `[lo,hi]` | 等待本步 condition 超时后，回退重跑上一步动作的最大次数；同样支持 `[lo,hi]` 范围随机；0/缺省 = 不重试 |
 
 执行：
 
@@ -126,6 +126,20 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 ]}
 ```
 
+**范围随机**：`$timeout` / `$retry` 既可写整数（固定值），也可写两元素数组 `[lo, hi]`——表示在该闭区间内**均匀随机**取一个值。Pipeline 在**每次运行**（Reset 后）为每个步各摇一个值，该步本次运行内固定（等价于"随机出的固定值"，不会每次 tick 重新摇）。常用于避免多次运行/多实例的等待与重试完全雷同：
+
+```json
+{ "type":"Pipeline", "children":[
+  { "type":"Script", "source":"scripts/login.lua",
+    "condition":{ "type":"Script", "source":"conds/on_login_page.lua" } },
+  { "type":"Script", "source":"scripts/open_settings.lua",
+    "condition":{ "type":"Script", "source":"conds/on_settings_page.lua" },
+    "$timeout": [40, 80], "$retry": [1, 3] }
+]}
+```
+
+> 范围内若含 0，0 仍保留"无限等/不重试"语义；要表达"有界随机"建议下界 ≥1。`$timeout`/`$retry` 单元素数组 `[v]` 等价于标量 `v`，乱序数组 `[b,a]`(b>a) 会被归一化为 `[a,b]`。
+>
 > `$timeout` 单位是 **tick 数**，实际墙钟时长 = tick 数 × `bt.exec` 的 `interval_ms`。`$timeout`/`$retry` 是边参数（描述进入该步的转移），节点自身（Script 等）不读取它们，Pipeline 在解析时单独取。纯顺序无起点判断/无需等待重试用 `Sequence`。
 
 ## 条件

@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -314,16 +315,40 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseComposite(const json& j, Pa
     co_return node;
 }
 
+// Parses a $timeout/$retry edge param: an integer (→ fixed value) or a
+// [lo, hi] array (→ inclusive random range the Pipeline resolves per run).
+// Negative values clamp to 0. A scalar or single-element array yields {v, v};
+// out-of-order pairs are normalized to {min, max}. Returns {0, 0} for absent
+// or wrong-typed input (0 = wait forever / no retry).
+std::pair<int, int> ParseIntRange(const json& v) {
+    auto clamp = [](int x) { return x < 0 ? 0 : x; };
+    if (v.is_number_integer()) {
+        int x = clamp(v.get<int>());
+        return {x, x};
+    }
+    if (v.is_array() && !v.empty() && v[0].is_number_integer()) {
+        int a = clamp(v[0].get<int>());
+        if (v.size() >= 2 && v[1].is_number_integer()) {
+            int b = clamp(v[1].get<int>());
+            return a < b ? std::make_pair(a, b) : std::make_pair(b, a);
+        }
+        return {a, a};
+    }
+    return {0, 0};
+}
+
 // Pipeline: scan-to-start + wait/retry composite. Each child is a normal node
 // (built by ParseNode) and may carry its own `condition` guard (set via
 // ApplyCondition inside ParseNode's helpers) plus two Pipeline edge params:
-//   `$timeout` (integer TICKS) — how many ticks to wait for this step's
+//   `$timeout` (int or [lo,hi] TICKS) — ticks to wait for this step's
 //                                condition (0 / absent = wait forever);
-//   `$retry`   (integer)       — max times to back up and re-run the previous
+//   `$retry`   (int or [lo,hi])      — max back-up re-runs of the previous
 //                                step's action when this wait times out.
-// These `$`-prefixed keys are intentionally distinct from node-own fields
-// (source/condition/params); the node itself ignores them, the Pipeline reads
-// them here. The Pipeline node may also be guarded, so nested pipelines work.
+// Each may be a scalar (fixed) or a two-element array (uniformly random in the
+// inclusive range; resolved per step per run). These `$`-prefixed keys are
+// intentionally distinct from node-own fields (source/condition/params); the
+// node itself ignores them, the Pipeline reads them here. The Pipeline node
+// may also be guarded, so nested pipelines work.
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParsePipeline(const json& j, ParseContext& ctx) {
     std::string name = j.value("name", "Pipeline");
     uint32_t id = ctx.next_id++;
@@ -340,17 +365,15 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParsePipeline(const json& j, Par
         }
         auto child = co_await ParseNode(child_j, ctx);
         if (!child) co_return nullptr;
-        int timeout = 0;
-        if (child_j.contains("$timeout") && child_j["$timeout"].is_number_integer()) {
-            timeout = child_j["$timeout"].get<int>();
-            if (timeout < 0) timeout = 0;
+        int timeout_lo = 0, timeout_hi = 0;
+        if (child_j.contains("$timeout")) {
+            std::tie(timeout_lo, timeout_hi) = ParseIntRange(child_j["$timeout"]);
         }
-        int retry = 0;
-        if (child_j.contains("$retry") && child_j["$retry"].is_number_integer()) {
-            retry = child_j["$retry"].get<int>();
-            if (retry < 0) retry = 0;
+        int retry_lo = 0, retry_hi = 0;
+        if (child_j.contains("$retry")) {
+            std::tie(retry_lo, retry_hi) = ParseIntRange(child_j["$retry"]);
         }
-        node->AddStep(std::move(child), timeout, retry);
+        node->AddStep(std::move(child), timeout_lo, timeout_hi, retry_lo, retry_hi);
     }
 
     if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
