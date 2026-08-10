@@ -181,7 +181,7 @@ int bt_init(lua_State* L) {
         return 2;
     }
 
-    // root: path to the root node JSON file ("@rel" resource or absolute). Required.
+    // root: path to the root node JSON file ("res://rel" resource or absolute). Required.
     std::string root_path = ReadStringOpt(L, 1, "root");
     if (root_path.empty()) {
         lua_pushnil(L);

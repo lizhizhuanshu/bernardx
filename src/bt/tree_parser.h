@@ -17,8 +17,9 @@ struct ParseResult {
 // Builds a behavior-tree Node tree from JSON definition files.
 //
 // Path resolution (uniform for root / Subtree `path`):
-//   "@<rel>"  -> project resource: ResourceProvider::Load(<rel>)
-//   "<abs>"   -> absolute filesystem path (direct read)
+//   "res://<rel>" -> project resource: ResourceProvider::Load(<rel>)  (rel is the
+//                    path under the res/ root, .json included)
+//   "<abs>"       -> absolute filesystem path (direct read)
 //
 //   root_path — path to a JSON file holding the root node object (required)
 class TreeParser {

@@ -418,6 +418,20 @@ TEST_F(BehaviorTreeEngineTest, LoadValidTree) {
     EXPECT_TRUE(engine->IsLoaded());
 }
 
+TEST_F(BehaviorTreeEngineTest, WrapperNodeTakesSingularChild) {
+    // Wrapper (single-child) nodes take their child from `child` as a direct object.
+    auto ok = TreeParser::Parse(
+        R"({"type":"Repeat","params":{"count":2},"child":{"type":"Script","source":"a.lua"}})");
+    EXPECT_NE(nullptr, ok.root);
+    EXPECT_TRUE(ok.error.empty());
+
+    // The legacy `children` array form is no longer accepted for wrapper nodes.
+    auto legacy = TreeParser::Parse(
+        R"({"type":"Repeat","params":{"count":2},"children":[{"type":"Script","source":"a.lua"}]})");
+    EXPECT_EQ(nullptr, legacy.root);
+    EXPECT_NE(legacy.error.find("requires a child"), std::string::npos);
+}
+
 TEST_F(BehaviorTreeEngineTest, StatusBeforeLoad) {
     EXPECT_EQ(engine->GetStatus(), "idle");
 }
@@ -481,10 +495,8 @@ protected:
         lib->engine()->Stop();
     }
 
-    // Register a root node JSON (referenced from Lua as root = "@root").
-    void PutRoot(std::string json) { resource_provider->Put("root", std::move(json)); }
-    // Register sensor definitions JSON (referenced as sensor_defs = "@sensors").
-    void PutSensors(std::string json) { resource_provider->Put("sensors", std::move(json)); }
+    // Register a root node JSON (referenced from Lua as root = "res://root.json").
+    void PutRoot(std::string json) { resource_provider->Put("root.json", std::move(json)); }
 
     std::shared_ptr<Blackboard> blackboard;
     std::shared_ptr<BlackboardLibrary> bb_lib;
@@ -494,6 +506,48 @@ protected:
 };
 
 #define AWAIT_BT(lazy) async_simple::coro::syncAwait(lazy)
+
+// Subtree `condition: "@child_condition"` transparently adopts the embedded
+// subtree root's own condition (shared object, same pointer at boundary & inside).
+TEST(TreeParserSubtreeCondition, ForwardsChildConditionMarker) {
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    provider->Put("sub.json",
+        R"({"type":"Sequence","condition":{"type":"Script","source":"c.lua"},"children":[{"type":"Script","source":"a.lua"}]})");
+    provider->Put("root.json", R"({"type":"Subtree","source":"res://sub.json","condition":"@child_condition"})");
+
+    auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
+    ASSERT_NE(nullptr, res.root);
+    EXPECT_TRUE(res.error.empty());
+
+    auto* sub = static_cast<SubtreeNode*>(res.root.get());
+    ASSERT_NE(nullptr, sub->child());
+    ASSERT_NE(nullptr, sub->condition());
+    // Shared, not copied: same condition object as the subtree root.
+    EXPECT_EQ(sub->condition(), sub->child()->condition());
+}
+
+// Marker is a no-op (warned) when the subtree root has no condition of its own.
+TEST(TreeParserSubtreeCondition, ChildConditionMarkerNoOpWithoutRootCondition) {
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    provider->Put("sub.json", R"({"type":"Sequence","children":[{"type":"Script","source":"a.lua"}]})");
+    provider->Put("root.json", R"({"type":"Subtree","source":"res://sub.json","condition":"@child_condition"})");
+
+    auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
+    ASSERT_NE(nullptr, res.root);
+    auto* sub = static_cast<SubtreeNode*>(res.root.get());
+    EXPECT_EQ(nullptr, sub->condition());
+}
+
+// A bogus condition string is a hard parse error (no silent ignore).
+TEST(TreeParserSubtreeCondition, RejectsUnknownConditionString) {
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    provider->Put("sub.json", R"({"type":"Script","source":"a.lua"})");
+    provider->Put("root.json", R"({"type":"Subtree","source":"res://sub.json","condition":"@child_condtion"})");  // typo
+
+    auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
+    EXPECT_EQ(nullptr, res.root);
+    EXPECT_NE(res.error.find("'@child_condition'"), std::string::npos);
+}
 
 TEST_F(BehaviorTreeLibraryTest, RequireReturnsTable) {
     auto r = AWAIT_BT(rt->RunScript("local bt = require('bt'); return type(bt)"));
@@ -552,7 +606,7 @@ TEST_F(BehaviorTreeLibraryTest, RunInvalidJsonReturnsSpecificError) {
     PutRoot(R"({"type":"Script"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.init({root = "@root"})
+        local status, err = bt.init({root = "res://root.json"})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -566,7 +620,7 @@ TEST_F(BehaviorTreeLibraryTest, RunUnknownNodeType) {
     PutRoot(R"({"type":"UnknownType"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.init({root = "@root"})
+        local status, err = bt.init({root = "res://root.json"})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -609,7 +663,7 @@ TEST_F(BehaviorTreeLibraryTest, RunLoadAndTick) {
     PutRoot(R"({"type":"Selector","children":[{"type":"Script","source":"x.lua"}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.init({root = "@root"})
+        local status, err = bt.init({root = "res://root.json"})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -742,7 +796,7 @@ protected:
         resource_provider = std::make_shared<MemoryResourceProvider>();
         rt = LuaRuntime::Builder()
             .WithCodeProvider(std::make_shared<FileSystemCodeProvider>(
-                std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts", tests_dir_ + "/sensors"}))
+                std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts"}))
             .WithResourceProvider(resource_provider)
             .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
@@ -753,8 +807,7 @@ protected:
         lib->engine()->Stop();
     }
 
-    void PutRoot(std::string json) { resource_provider->Put("root", std::move(json)); }
-    void PutSensors(std::string json) { resource_provider->Put("sensors", std::move(json)); }
+    void PutRoot(std::string json) { resource_provider->Put("root.json", std::move(json)); }
 
     std::string RunBtScript(const std::string& lua_code) {
         auto r = AWAIT_BT(rt->RunScript(lua_code));
@@ -781,7 +834,7 @@ TEST_F(ScriptNodeIntegrationTest, SelfStateInEnterAndTick) {
     PutRoot(R"({"type":"Script","source":"scripts/bt_module.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -793,7 +846,7 @@ TEST_F(ScriptNodeIntegrationTest, ExitReasonAsParameter) {
     PutRoot(R"({"type":"Script","source":"scripts/check_reason.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -805,7 +858,7 @@ TEST_F(ScriptNodeIntegrationTest, ArgsPassedToEnter) {
     PutRoot(R"({"type":"Script","source":"scripts/with_args.lua","params":{"target":"enemy","damage":100}})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -817,7 +870,7 @@ TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
     PutRoot(R"({"type":"Script","source":"scripts/bool_args.lua","params":{"enabled":true}})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -829,14 +882,14 @@ TEST_F(ScriptNodeIntegrationTest, SubtreeParamsTemplatingPreservesTypes) {
     // A Subtree node forwards its `params` into the wrapped subtree JSON via
     // {{key}} placeholders. Whole-value placeholders preserve the param type
     // (string/number/bool flow through unchanged).
-    PutRoot(R"({"type":"Subtree","source":"@sub","params":{"name":"lizhi","age":18,"active":true}})");
-    resource_provider->Put("sub",
+    PutRoot(R"({"type":"Subtree","source":"res://sub.json","params":{"name":"lizhi","age":18,"active":true}})");
+    resource_provider->Put("sub.json",
         R"({"type":"Script","source":"scripts/subtree_args.lua",)"
         R"("params":{"name":"{{name}}","age":"{{age}}","active":"{{active}}"}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local bb = require('blackboard')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         bt.exec({interval = 10})
         return bb.get("sub_name"), bb.get("sub_age"), bb.get("sub_active")
     )"));
@@ -850,14 +903,14 @@ TEST_F(ScriptNodeIntegrationTest, SubtreeParamsTemplatingPreservesTypes) {
 TEST_F(ScriptNodeIntegrationTest, SubtreeParamsPartialSubstitution) {
     // A placeholder embedded in a larger string is interpolated as text;
     // whole-value placeholders in the same params still preserve type.
-    PutRoot(R"({"type":"Subtree","source":"@sub","params":{"name":"lizhi","age":18,"active":true}})");
-    resource_provider->Put("sub",
+    PutRoot(R"({"type":"Subtree","source":"res://sub.json","params":{"name":"lizhi","age":18,"active":true}})");
+    resource_provider->Put("sub.json",
         R"({"type":"Script","source":"scripts/subtree_args.lua",)"
         R"("params":{"name":"hello {{name}}","age":"{{age}}","active":"{{active}}"}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local bb = require('blackboard')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         bt.exec({interval = 10})
         return bb.get("sub_name"), bb.get("sub_age"), bb.get("sub_active")
     )"));
@@ -872,13 +925,13 @@ TEST_F(ScriptNodeIntegrationTest, SubtreeParamsTemplatingCondition) {
     // Placeholders work in any string field, including a node's `condition`.
     // Here the Subtree's param selects which condition script the inner node
     // uses — "{{cond}}" resolves to the provided path.
-    PutRoot(R"({"type":"Subtree","source":"@sub","params":{"cond":"scripts/cond_truthy.lua"}})");
-    resource_provider->Put("sub",
+    PutRoot(R"({"type":"Subtree","source":"res://sub.json","params":{"cond":"scripts/cond_truthy.lua"}})");
+    resource_provider->Put("sub.json",
         R"({"type":"Pipeline","children":[)"
         R"({"type":"Script","source":"scripts/no_args.lua","condition":{"type":"Script","source":"{{cond}}"}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         return bt.exec({interval = 10})
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -892,15 +945,15 @@ TEST_F(ScriptNodeIntegrationTest, SubtreeParamsNestedPassThrough) {
     // Outer params template the inner Subtree node's path AND params; those
     // params then template the inner subtree JSON. Values pass through every
     // level transparently.
-    PutRoot(R"({"type":"Subtree","source":"@outer","params":{"role":"combat"}})");
-    resource_provider->Put("outer",
-        R"({"type":"Subtree","source":"@inner-{{role}}.json","params":{"who":"{{role}}"}})");
+    PutRoot(R"({"type":"Subtree","source":"res://outer.json","params":{"role":"combat"}})");
+    resource_provider->Put("outer.json",
+        R"({"type":"Subtree","source":"res://inner-{{role}}.json","params":{"who":"{{role}}"}})");
     resource_provider->Put("inner-combat.json",
         R"({"type":"Script","source":"scripts/subtree_args.lua","params":{"name":"{{who}}"}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local bb = require('blackboard')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         bt.exec({interval = 10})
         return bb.get("sub_name")
     )"));
@@ -917,7 +970,7 @@ TEST_F(ScriptNodeIntegrationTest, TableParamPassedToEnter) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local bb = require('blackboard')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         bt.exec({interval = 10})
         return bb.get("t_name"), bb.get("t_hp")
     )"));
@@ -930,14 +983,14 @@ TEST_F(ScriptNodeIntegrationTest, TableParamPassedToEnter) {
 TEST_F(ScriptNodeIntegrationTest, SubtreeTableParamForwarded) {
     // A table param on the outer Subtree is forwarded (whole-value placeholder
     // preserves the object) and reaches the Script's Enter as a Lua table.
-    PutRoot(R"({"type":"Subtree","source":"@sub",)"
+    PutRoot(R"({"type":"Subtree","source":"res://sub.json",)"
             R"("params":{"profile":{"name":"lizhi","hp":100}}})");
-    resource_provider->Put("sub",
+    resource_provider->Put("sub.json",
         R"({"type":"Script","source":"scripts/table_args.lua","params":{"config":"{{profile}}"}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local bb = require('blackboard')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         bt.exec({interval = 10})
         return bb.get("t_name"), bb.get("t_hp")
     )"));
@@ -951,7 +1004,7 @@ TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
     PutRoot(R"({"type":"Script","source":"scripts/counter.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -963,7 +1016,7 @@ TEST_F(ScriptNodeIntegrationTest, NoArgsStillWorks) {
     PutRoot(R"({"type":"Script","source":"scripts/no_args.lua"})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -975,7 +1028,7 @@ TEST_F(ScriptNodeIntegrationTest, ScriptNotFoundReturnsError) {
     PutRoot(R"({"type":"Script","source":"scripts/nonexistent.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        local status, err = bt.init({root = "@root"})
+        local status, err = bt.init({root = "res://root.json"})
         return status, err
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -990,7 +1043,7 @@ TEST_F(ScriptNodeIntegrationTest, ScriptRuntimeErrorReturnsError) {
     PutRoot(R"({"type":"Script","source":"scripts/runtime_error.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -1007,7 +1060,7 @@ TEST_F(ScriptNodeIntegrationTest, NodeReturnsFailureIsNotError) {
     PutRoot(R"({"type":"Script","source":"scripts/returns_failure.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10})
         if not status then return false, err end
         return true, status
@@ -1023,7 +1076,7 @@ TEST_F(ScriptNodeIntegrationTest, InitErrorInSequenceStopsEarly) {
             R"({"type":"Script","source":"scripts/no_args.lua"}]})");
     auto r = AWAIT_BT(rt->RunScript(
         "local bt = require('bt')\n"
-        "local status, err = bt.init({root = '@root'})\n"
+        "local status, err = bt.init({root = 'res://root.json'})\n"
         "return status, err\n"
     ));
     ASSERT_EQ(r.status, LUA_OK);
@@ -1052,7 +1105,7 @@ protected:
         resource_provider = std::make_shared<MemoryResourceProvider>();
         rt = LuaRuntime::Builder()
             .WithCodeProvider(std::make_shared<FileSystemCodeProvider>(
-                std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts", tests_dir_ + "/sensors"}))
+                std::vector<std::string>{tests_dir_, tests_dir_ + "/scripts"}))
             .WithResourceProvider(resource_provider)
             .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
@@ -1063,8 +1116,7 @@ protected:
         lib->engine()->Stop();
     }
 
-    void PutRoot(std::string json) { resource_provider->Put("root", std::move(json)); }
-    void PutSensors(std::string json) { resource_provider->Put("sensors", std::move(json)); }
+    void PutRoot(std::string json) { resource_provider->Put("root.json", std::move(json)); }
 
     std::shared_ptr<Blackboard> blackboard;
     std::shared_ptr<BlackboardLibrary> bb_lib;
@@ -1078,7 +1130,7 @@ TEST_F(BtRunOptionsTest, MaxStepStopsTree) {
     PutRoot(R"({"type":"Script","source":"scripts/run_forever.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({max_step = 2, interval = 10})
         return status, err
     )"));
@@ -1093,7 +1145,7 @@ TEST_F(BtRunOptionsTest, MaxStepNotReachedTreeCompletes) {
     PutRoot(R"({"type":"Script","source":"scripts/run_3_ticks.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({max_step = 100, interval = 10})
         return status, err
     )"));
@@ -1108,7 +1160,7 @@ TEST_F(BtRunOptionsTest, TimeoutStopsTree) {
     PutRoot(R"({"type":"Script","source":"scripts/run_forever.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({timeout = 1, interval = 10})
         return status, err
     )"));
@@ -1123,7 +1175,7 @@ TEST_F(BtRunOptionsTest, TimeoutNotReachedTreeCompletes) {
     PutRoot(R"({"type":"Script","source":"scripts/run_3_ticks.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({timeout = 60000, interval = 10})
         return status, err
     )"));
@@ -1138,7 +1190,7 @@ TEST_F(BtRunOptionsTest, IntervalAccepted) {
     PutRoot(R"({"type":"Script","source":"scripts/run_3_ticks.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10})
         return status, err
     )"));
@@ -1152,7 +1204,7 @@ TEST_F(BtRunOptionsTest, CombinedMaxStepAndInterval) {
     PutRoot(R"({"type":"Script","source":"scripts/run_forever.lua"})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({max_step = 3, interval = 10})
         return status, err
     )"));
@@ -1531,7 +1583,7 @@ TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
     PutRoot(R"({"type":"Wait","params":{"ms":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         bt.exec({max_step=3, interval=1})
         local p = bt.dump_paths()
         return p.total_ticks, p.path_occurrences, #p.paths, p.terminal, p.has_terminal
@@ -1549,7 +1601,7 @@ TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
     PutRoot(R"({"type":"Wait","params":{"ms":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root", trace_paths=false})
+        bt.init({root = "res://root.json", trace_paths=false})
         bt.exec({max_step=3, interval=1})
         local p = bt.dump_paths()
         return p.total_ticks, p.tracing
@@ -1564,7 +1616,7 @@ TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
     PutRoot(R"({"type":"Wait","params":{"ms":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         bt.exec({max_step=2, interval=1})
         local report = bt.path_report()
         return type(report), #report > 0, string.find(report, '路径报告') ~= nil
@@ -1584,7 +1636,7 @@ TEST_F(BehaviorTreeLibraryTest, GotoPathLegal) {
             R"({"type":"Wait","name":"w2","params":{"ms":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local ok, err = bt.goto_path({'root', 'w2'})
         return ok, err
     )"));
@@ -1598,7 +1650,7 @@ TEST_F(BehaviorTreeLibraryTest, GotoPathNameNotFound) {
             R"({"type":"Wait","name":"w1","params":{"ms":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local ok, err = bt.goto_path({'root', 'nope'})
         return ok, err
     )"));
@@ -1613,7 +1665,7 @@ TEST_F(BehaviorTreeLibraryTest, GotoPathRejectsParallel) {
             R"({"type":"Wait","name":"w1","params":{"ms":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local ok, err = bt.goto_path({'par', 'w1'})
         return ok, err
     )"));
@@ -2075,7 +2127,7 @@ TEST_F(ScriptNodeIntegrationTest, ScriptConditionTruthySelectsAndRuns) {
             R"({"type":"Script","source":"scripts/no_args.lua","condition":{"type":"Script","source":"scripts/cond_truthy.lua"}}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10, max_step = 20})
         if not status then return false, err end
         return true, status
@@ -2090,7 +2142,7 @@ TEST_F(ScriptNodeIntegrationTest, PipelineScansPastFailingCondition) {
             R"({"type":"Script","source":"scripts/no_args.lua","condition":{"type":"Script","source":"scripts/cond_truthy.lua"}}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10, max_step = 20})
         if not status then return false, err end
         return true, status
@@ -2106,7 +2158,7 @@ TEST_F(ScriptNodeIntegrationTest, PipelineNoConditionMetFails) {
             R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"$timeout":3}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status = bt.exec({interval = 10, max_step = 20})
         return status
     )");
@@ -2120,7 +2172,7 @@ TEST_F(ScriptNodeIntegrationTest, PipelineArrayTimeoutEquivalentToScalar) {
             R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"$timeout":[3,3]}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status = bt.exec({interval = 10, max_step = 20})
         return status
     )");
@@ -2138,7 +2190,7 @@ TEST_F(ScriptNodeIntegrationTest, ConditionAndOrNotComposition) {
             R"({"type":"Not","child":{"type":"Script","source":"scripts/cond_falsy.lua"}}]}}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         local status, err = bt.exec({interval = 10, max_step = 20})
         if not status then return false, err end
         return true, status
@@ -2157,12 +2209,12 @@ TEST_F(ScriptNodeIntegrationTest, ConditionAndOrNotComposition) {
 // parameterized Subtree for one step. A flaky navigation forces a retry back-up.
 TEST_F(ScriptNodeIntegrationTest, E2E_CheckoutPipelineWithSubtreeAndRetry) {
     // Subtree wraps the navigate action; {{to}}/{{flaky}} templated by the step.
-    resource_provider->Put("nav",
+    resource_provider->Put("nav.json",
         R"({"type":"Script","source":"scripts/e2e_goto.lua",)"
         R"("params":{"to":"{{to}}","flaky":"{{flaky}}"}})");
     PutRoot(R"({"type":"Pipeline","children":[)"
             // step 1: on home -> open cart (flaky 1st attempt) via Subtree
-            R"({"type":"Subtree","source":"@nav","params":{"to":"cart","flaky":1},)"
+            R"({"type":"Subtree","source":"res://nav.json","params":{"to":"cart","flaky":1},)"
             R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"home"}}},)"
             // step 2: on cart -> go to checkout; wait for cart with retry back-up
             R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"checkout"},)"
@@ -2176,7 +2228,7 @@ TEST_F(ScriptNodeIntegrationTest, E2E_CheckoutPipelineWithSubtreeAndRetry) {
 
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         return bt.exec({interval = 10, max_step = 30})
     )");
     EXPECT_EQ(status, "success");
@@ -2194,7 +2246,7 @@ TEST_F(ScriptNodeIntegrationTest, E2E_SelfAbortInterruptsLongAction) {
 
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         return bt.exec({interval = 10, max_step = 30})
     )");
     EXPECT_EQ(status, "failure");                                  // guard aborted the action
@@ -2216,7 +2268,7 @@ TEST_F(ScriptNodeIntegrationTest, E2E_LowerPriorityPreemptsWorker) {
 
     auto status = RunBtScript(R"(
         local bt = require('bt')
-        bt.init({root = "@root"})
+        bt.init({root = "res://root.json"})
         return bt.exec({interval = 10, max_step = 30})
     )");
     EXPECT_EQ(status, "success");                                  // alert dismissed

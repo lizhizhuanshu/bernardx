@@ -174,15 +174,19 @@ int ParamsInt(const json& j, const char* key, int def) {
     return def;
 }
 
-// Load a JSON asset by path. "@rel" -> ResourceProvider; otherwise absolute read.
+// Load a JSON asset by path. "res://rel" -> ResourceProvider (the resource lives
+// under the project res/ root; <rel> is passed verbatim, .json included); any
+// other path is an absolute filesystem read.
 async_simple::coro::Lazy<std::optional<std::string>>
 LoadAsset(const std::string& path, std::shared_ptr<ResourceProvider> provider) {
-    if (!path.empty() && path[0] == '@') {
+    constexpr const char* kResScheme = "res://";
+    constexpr size_t kResSchemeLen = 6;
+    if (path.rfind(kResScheme, 0) == 0) {  // starts with "res://"
         if (!provider) {
-            spdlog::error("TreeParser: no resource provider for '@' path '{}'", path);
+            spdlog::error("TreeParser: no resource provider for 'res://' path '{}'", path);
             co_return std::nullopt;
         }
-        co_return co_await provider->Load(path.substr(1));
+        co_return co_await provider->Load(path.substr(kResSchemeLen));
     }
     std::ifstream ifs(path, std::ios::in | std::ios::binary);
     if (!ifs.is_open()) co_return std::nullopt;
@@ -449,23 +453,50 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseSubtree(const json& j, Pars
     std::string name = j.value("name", source);
     uint32_t id = ctx.next_id++;
     auto node = std::make_unique<SubtreeNode>(id, std::move(name), std::move(source), std::move(sub_root));
-    if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
+    // A Subtree `condition` is normally a guard object. The special string
+    // "@child_condition" instead transparently adopts the embedded subtree
+    // root's own condition (shared, not copied) — so a parent can gate entry
+    // to the subtree on a condition defined inside the subtree file. If the
+    // root has no condition, the marker is a no-op (warned).
+    if (j.contains("condition")) {
+        if (j["condition"].is_string()) {
+            if (j["condition"].get<std::string>() == "@child_condition") {
+                auto child_cond = node->child()->shared_condition();
+                if (child_cond) {
+                    node->SetCondition(child_cond);
+                } else {
+                    spdlog::warn("TreeParser: Subtree '{}' marks condition '@child_condition' but its root has no condition",
+                                 node->subtree_name());
+                }
+            } else {
+                SetError(ctx, "Subtree condition string must be '@child_condition'");
+                co_return nullptr;
+            }
+        } else if (j["condition"].is_object()) {
+            if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
+        } else {
+            SetError(ctx, "Subtree condition must be an object or '@child_condition'");
+            co_return nullptr;
+        }
+    }
     ReadDescription(j, node.get());
     co_return node;
 }
 
+// Wrapper (single-child decorator) nodes take their sole child from the `child`
+// field as a direct object — not a `children` array. Composites still use the
+// `children` array; the singular/plural split keeps each honest.
 async_simple::coro::Lazy<std::unique_ptr<Node>>
 ParseSingleChild(const json& j, ParseContext& ctx, const char* missing_msg) {
-    if (j.contains("children") && j["children"].is_array() && !j["children"].empty() &&
-        j["children"][0].is_object()) {
-        co_return co_await ParseNode(j["children"][0], ctx);
+    if (j.contains("child") && j["child"].is_object()) {
+        co_return co_await ParseNode(j["child"], ctx);
     }
     if (ctx.error.empty()) SetError(ctx, missing_msg);
     co_return nullptr;
 }
 
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRepeat(const json& j, ParseContext& ctx) {
-    auto child = co_await ParseSingleChild(j, ctx, "Repeat node requires at least one child");
+    auto child = co_await ParseSingleChild(j, ctx, "Repeat node requires a child");
     if (!child) co_return nullptr;
     int count = ParamsInt(j, "count", Repeat::kInfinite);
     std::string name = j.value("name", "Repeat");
@@ -477,7 +508,7 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRepeat(const json& j, Parse
 }
 
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRetry(const json& j, ParseContext& ctx) {
-    auto child = co_await ParseSingleChild(j, ctx, "RetryUntilSuccessful node requires at least one child");
+    auto child = co_await ParseSingleChild(j, ctx, "RetryUntilSuccessful node requires a child");
     if (!child) co_return nullptr;
     int attempts = ParamsInt(j, "attempts", RetryUntilSuccessful::kInfinite);
     std::string name = j.value("name", "RetryUntilSuccessful");
@@ -499,7 +530,7 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseWait(const json& j, ParseCo
 }
 
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseForceSuccess(const json& j, ParseContext& ctx) {
-    auto child = co_await ParseSingleChild(j, ctx, "ForceSuccess node requires at least one child");
+    auto child = co_await ParseSingleChild(j, ctx, "ForceSuccess node requires a child");
     if (!child) co_return nullptr;
     std::string name = j.value("name", "ForceSuccess");
     uint32_t id = ctx.next_id++;
@@ -510,7 +541,7 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseForceSuccess(const json& j,
 }
 
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseForceFailure(const json& j, ParseContext& ctx) {
-    auto child = co_await ParseSingleChild(j, ctx, "ForceFailure node requires at least one child");
+    auto child = co_await ParseSingleChild(j, ctx, "ForceFailure node requires a child");
     if (!child) co_return nullptr;
     std::string name = j.value("name", "ForceFailure");
     uint32_t id = ctx.next_id++;
@@ -521,7 +552,7 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseForceFailure(const json& j,
 }
 
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseInverter(const json& j, ParseContext& ctx) {
-    auto child = co_await ParseSingleChild(j, ctx, "Inverter node requires at least one child");
+    auto child = co_await ParseSingleChild(j, ctx, "Inverter node requires a child");
     if (!child) co_return nullptr;
     std::string name = j.value("name", "Inverter");
     uint32_t id = ctx.next_id++;

@@ -43,7 +43,7 @@ local bt = require('bt')
 
 `root` 与 Subtree 节点的 `source` 都是字符串路径，统一解析：
 
-- `@<相对路径>` → **项目资源**：`ResourceProvider` 在资源根目录（`<项目>/res`）下加载。
+- `res://<相对路径>` → **项目资源**：`ResourceProvider` 在资源根目录（`<项目>/res`）下加载。`<相对路径>` 原样传入（含 `.json` 扩展名，如 `res://bt/ai_root.json` → 加载 `bt/ai_root.json`）。
 - `<绝对路径>` → 直接读文件系统。
 
 Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` 加载（与主脚本 `require()` 共用加载器）——请把 `scripts/` 等目录纳入 `CodeProvider` 搜索路径。两套加载器各管一摊：JSON 拓扑走 `ResourceProvider`，脚本走 `CodeProvider`。
@@ -67,8 +67,9 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 |------|------|------|
 | `type` | 全部 | 节点类型（必填） |
 | `name` | 全部 | 节点名；Script/Subtree 默认等于 `source` |
-| `children` | 复合/包装 | 子节点数组（包装类仅取第一个） |
-| `condition` | 全部 | 可选的守卫条件（见[条件](#条件)）。**所有节点通用**：复合节点 tick 子节点前先门控（Failure 则跳过/失败）；条件对象上的 `abort` 字段（默认 `None`）再开启 UE4/5 风格的响应式中断（`Self`/`LowerPriority`/`Both`）。`Pipeline` 还额外在首次扫描时用它定起点。 |
+| `children` | 复合 | 子节点数组 |
+| `child` | 包装 | 单个子节点（直接对象，非数组） |
+| `condition` | 全部 | 可选的守卫条件（见[条件](#条件)）。**所有节点通用**：复合节点 tick 子节点前先门控（Failure 则跳过/失败）；条件对象上的 `abort` 字段（默认 `None`）再开启 UE4/5 风格的响应式中断（`Self`/`LowerPriority`/`Both`）。`Pipeline` 还额外在首次扫描时用它定起点。`Subtree` 的 `condition` 还可取特殊字符串 `"@child_condition"`——透传引用所嵌子树**根节点**自身的 condition（共享同一对象，让父复合在子树边界处门控一个定义在子树文件内的条件；`abort` 随子树根条件一起带过来；子树根无 condition 时为 no-op 并告警）。 |
 | `params` | 各类型 | 类型相关参数：Script→`Enter` 参数、Wait→`ms`、Repeat→`count`、Retry→`attempts`、Parallel→`success_policy`/`failure_policy`、Subtree 透传给子树（见[子树参数透传](#子树参数透传)） |
 | `source` | Script / Subtree | Script 的 Lua 脚本路径 / Subtree 的子树 JSON 路径 |
 | `description` | 全部 | 备注（仅文档/调试） |
@@ -83,13 +84,13 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | `Parallel` | 复合 | `params` | 并行所有子节点，策略控制结果 |
 | `RandomSelector` / `RandomSequence` | 复合 | — | 同 Selector/Sequence，每次 Reset 后随机排列子节点顺序 |
 | `Script` | 叶子 | `source`, `params` | 执行 Lua 脚本 |
-| `Subtree` | 叶子 | `source`, `params` | 加载 `source` 指向的子树 JSON（递归）；`params` 透传给子树内节点（见[子树参数透传](#子树参数透传)） |
+| `Subtree` | 叶子 | `source`, `params` | 加载 `source` 指向的子树 JSON（递归）；`params` 透传给子树内节点（见[子树参数透传](#子树参数透传)）；`condition` 支持 `"@child_condition"` 透传子树根的条件（见上[节点结构](#节点结构)） |
 | `Wait` | 叶子 | `params` | 等待 `params.ms` 毫秒（默认 1000） |
-| `Repeat` | 包装 | `params` | 重复执行子节点（`params.count`，默认 -1 无限） |
-| `RetryUntilSuccessful` | 包装 | `params` | 失败重试（`params.attempts`，默认 -1 无限） |
-| `ForceSuccess` | 包装 | - | 执行子节点，结束态强制为 Success（Running 透传） |
-| `ForceFailure` | 包装 | - | 执行子节点，结束态强制为 Failure（Running 透传） |
-| `Inverter` | 包装 | - | 反转子节点结束态 Success↔Failure（Running 透传） |
+| `Repeat` | 包装 | `params`, `child` | 重复执行子节点（`params.count`，默认 -1 无限） |
+| `RetryUntilSuccessful` | 包装 | `params`, `child` | 失败重试（`params.attempts`，默认 -1 无限） |
+| `ForceSuccess` | 包装 | `child` | 执行子节点，结束态强制为 Success（Running 透传） |
+| `ForceFailure` | 包装 | `child` | 执行子节点，结束态强制为 Failure（Running 透传） |
+| `Inverter` | 包装 | `child` | 反转子节点结束态 Success↔Failure（Running 透传） |
 
 **Parallel 策略**（`params.success_policy` / `params.failure_policy`，均 `RequireAll`/`RequireOne`）：默认 `RequireAll` / `RequireOne`。
 
@@ -224,12 +225,12 @@ return M
 
 ```json
 // 父树引用子树并传入参数
-{ "type":"Subtree", "source":"@bt/greet.json",
+{ "type":"Subtree", "source":"res://bt/greet.json",
   "params":{ "name":"lizhi", "age":18, "active":true, "role":"combat", "threshold":50 } }
 ```
 
 ```json
-// @bt/greet.json —— 任意字段都能用 {{key}}
+// res://bt/greet.json —— 任意字段都能用 {{key}}
 { "type":"Sequence", "children":[
   { "type":"Script", "source":"scripts/{{role}}.lua", "name":"{{role}}_node",
     "params":{ "name":"{{name}}", "age":"{{age}}", "active":"{{active}}", "msg":"hello {{name}}" } }
@@ -242,7 +243,7 @@ return M
 
 ## 完整示例
 
-`bt.init({ root = "@bt/ai_root.json" })`，`@bt/ai_root.json`：
+`bt.init({ root = "res://bt/ai_root.json" })`，`res://bt/ai_root.json`：
 
 ```json
 {

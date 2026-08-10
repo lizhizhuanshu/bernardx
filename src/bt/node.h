@@ -86,6 +86,11 @@ public:
     // ignore it — guarding is explicit, never implicit in `Tick`.
     void SetCondition(std::shared_ptr<NodeCondition> c) { condition_ = std::move(c); }
     NodeCondition* condition() const { return condition_.get(); }
+    // Shared-ownership view of the guard condition. Used by Subtree's
+    // `@child_condition` marker to adopt the embedded subtree root's condition
+    // (shared, not copied) so the boundary gate and the inside evaluate the
+    // same condition object.
+    std::shared_ptr<NodeCondition> shared_condition() const { return condition_; }
 
     // Effective guard status (Success if there is no condition). Evaluates the
     // condition with stale-while-running; composites call this to GATE a child
