@@ -72,3 +72,14 @@ private:
     std::vector<size_t> order_;
     bool shuffled_ = false;
 };
+
+// Uniform random integer in the inclusive [lo, hi] range, drawn from the
+// supplied URNG. Collapses to `lo` when the range is degenerate (hi <= lo),
+// so lo==hi acts as a fixed value. Used by Pipeline to resolve a [lo,hi]
+// $timeout/$retry range into a single value per step, per run.
+template <typename URBG>
+inline int RollIntInRange(int lo, int hi, URBG&& g) {
+    if (hi <= lo) return lo;
+    std::uniform_int_distribution<int> dist(lo, hi);
+    return dist(std::forward<URBG>(g));
+}

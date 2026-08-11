@@ -43,7 +43,7 @@ local bt = require('bt')
 
 `root` 与 Subtree 节点的 `source` 都是字符串路径，统一解析：
 
-- `@<相对路径>` → **项目资源**：`ResourceProvider` 在资源根目录（`<项目>/res`）下加载。
+- `res://<相对路径>` → **项目资源**：`ResourceProvider` 在资源根目录（`<项目>/res`）下加载。`<相对路径>` 原样传入（含 `.json` 扩展名，如 `res://bt/ai_root.json` → 加载 `bt/ai_root.json`）。
 - `<绝对路径>` → 直接读文件系统。
 
 Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` 加载（与主脚本 `require()` 共用加载器）——请把 `scripts/` 等目录纳入 `CodeProvider` 搜索路径。两套加载器各管一摊：JSON 拓扑走 `ResourceProvider`，脚本走 `CodeProvider`。
@@ -67,8 +67,9 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 |------|------|------|
 | `type` | 全部 | 节点类型（必填） |
 | `name` | 全部 | 节点名；Script/Subtree 默认等于 `source` |
-| `children` | 复合/包装 | 子节点数组（包装类仅取第一个） |
-| `condition` | 全部 | 可选的守卫条件（见[条件](#条件)）。**所有节点通用**：复合节点 tick 子节点前先门控（Failure 则跳过/失败）；条件对象上的 `abort` 字段（默认 `None`）再开启 UE4/5 风格的响应式中断（`Self`/`LowerPriority`/`Both`）。`Pipeline` 还额外在首次扫描时用它定起点。 |
+| `children` | 复合 | 子节点数组 |
+| `child` | 包装 | 单个子节点（直接对象，非数组） |
+| `condition` | 全部 | 可选的守卫条件（见[条件](#条件)）。**所有节点通用**：复合节点 tick 子节点前先门控（Failure 则跳过/失败）；条件对象上的 `abort` 字段（默认 `None`）再开启 UE4/5 风格的响应式中断（`Self`/`LowerPriority`/`Both`）。`Pipeline` 还额外在首次扫描时用它定起点。`Subtree` 的 `condition` 还可取特殊字符串 `"@child_condition"`——透传引用所嵌子树**根节点**自身的 condition（共享同一对象，让父复合在子树边界处门控一个定义在子树文件内的条件；`abort` 随子树根条件一起带过来；子树根无 condition 时为 no-op 并告警）。 |
 | `params` | 各类型 | 类型相关参数：Script→`Enter` 参数、Wait→`ms`、Repeat→`count`、Retry→`attempts`、Parallel→`success_policy`/`failure_policy`、Subtree 透传给子树（见[子树参数透传](#子树参数透传)） |
 | `source` | Script / Subtree | Script 的 Lua 脚本路径 / Subtree 的子树 JSON 路径 |
 | `description` | 全部 | 备注（仅文档/调试） |
@@ -83,13 +84,13 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | `Parallel` | 复合 | `params` | 并行所有子节点，策略控制结果 |
 | `RandomSelector` / `RandomSequence` | 复合 | — | 同 Selector/Sequence，每次 Reset 后随机排列子节点顺序 |
 | `Script` | 叶子 | `source`, `params` | 执行 Lua 脚本 |
-| `Subtree` | 叶子 | `source`, `params` | 加载 `source` 指向的子树 JSON（递归）；`params` 透传给子树内节点（见[子树参数透传](#子树参数透传)） |
+| `Subtree` | 叶子 | `source`, `params` | 加载 `source` 指向的子树 JSON（递归）；`params` 透传给子树内节点（见[子树参数透传](#子树参数透传)）；`condition` 支持 `"@child_condition"` 透传子树根的条件（见上[节点结构](#节点结构)） |
 | `Wait` | 叶子 | `params` | 等待 `params.ms` 毫秒（默认 1000） |
-| `Repeat` | 包装 | `params` | 重复执行子节点（`params.count`，默认 -1 无限） |
-| `RetryUntilSuccessful` | 包装 | `params` | 失败重试（`params.attempts`，默认 -1 无限） |
-| `ForceSuccess` | 包装 | - | 执行子节点，结束态强制为 Success（Running 透传） |
-| `ForceFailure` | 包装 | - | 执行子节点，结束态强制为 Failure（Running 透传） |
-| `Inverter` | 包装 | - | 反转子节点结束态 Success↔Failure（Running 透传） |
+| `Repeat` | 包装 | `params`, `child` | 重复执行子节点（`params.count`，默认 -1 无限） |
+| `RetryUntilSuccessful` | 包装 | `params`, `child` | 失败重试（`params.attempts`，默认 -1 无限） |
+| `ForceSuccess` | 包装 | `child` | 执行子节点，结束态强制为 Success（Running 透传） |
+| `ForceFailure` | 包装 | `child` | 执行子节点，结束态强制为 Failure（Running 透传） |
+| `Inverter` | 包装 | `child` | 反转子节点结束态 Success↔Failure（Running 透传） |
 
 **Parallel 策略**（`params.success_policy` / `params.failure_policy`，均 `RequireAll`/`RequireOne`）：默认 `RequireAll` / `RequireOne`。
 
@@ -100,8 +101,8 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `condition` | object | 该步的守卫条件（见[条件](#条件)）；可选，无则视为已成立 |
-| `$timeout` | int (tick) | 等待**本步** condition 成立的 tick 预算；0/缺省 = 无限等 |
-| `$retry` | int | 等待本步 condition 超时后，回退重跑上一步动作的最大次数；0/缺省 = 不重试 |
+| `$timeout` | int 或 `[lo,hi]` (tick) | 等待**本步** condition 成立的 tick 预算；数组形式表示闭区间内**均匀随机**（每次运行、每个步摇一个值，该步本次运行内固定）；0/缺省 = 无限等 |
+| `$retry` | int 或 `[lo,hi]` | 等待本步 condition 超时后，回退重跑上一步动作的最大次数；同样支持 `[lo,hi]` 范围随机；0/缺省 = 不重试 |
 
 执行：
 
@@ -126,6 +127,20 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 ]}
 ```
 
+**范围随机**：`$timeout` / `$retry` 既可写整数（固定值），也可写两元素数组 `[lo, hi]`——表示在该闭区间内**均匀随机**取一个值。Pipeline 在**每次运行**（Reset 后）为每个步各摇一个值，该步本次运行内固定（等价于"随机出的固定值"，不会每次 tick 重新摇）。常用于避免多次运行/多实例的等待与重试完全雷同：
+
+```json
+{ "type":"Pipeline", "children":[
+  { "type":"Script", "source":"scripts/login.lua",
+    "condition":{ "type":"Script", "source":"conds/on_login_page.lua" } },
+  { "type":"Script", "source":"scripts/open_settings.lua",
+    "condition":{ "type":"Script", "source":"conds/on_settings_page.lua" },
+    "$timeout": [40, 80], "$retry": [1, 3] }
+]}
+```
+
+> 范围内若含 0，0 仍保留"无限等/不重试"语义；要表达"有界随机"建议下界 ≥1。`$timeout`/`$retry` 单元素数组 `[v]` 等价于标量 `v`，乱序数组 `[b,a]`(b>a) 会被归一化为 `[a,b]`。
+>
 > `$timeout` 单位是 **tick 数**，实际墙钟时长 = tick 数 × `bt.exec` 的 `interval_ms`。`$timeout`/`$retry` 是边参数（描述进入该步的转移），节点自身（Script 等）不读取它们，Pipeline 在解析时单独取。纯顺序无起点判断/无需等待重试用 `Sequence`。
 
 ## 条件
@@ -210,12 +225,12 @@ return M
 
 ```json
 // 父树引用子树并传入参数
-{ "type":"Subtree", "source":"@bt/greet.json",
+{ "type":"Subtree", "source":"res://bt/greet.json",
   "params":{ "name":"lizhi", "age":18, "active":true, "role":"combat", "threshold":50 } }
 ```
 
 ```json
-// @bt/greet.json —— 任意字段都能用 {{key}}
+// res://bt/greet.json —— 任意字段都能用 {{key}}
 { "type":"Sequence", "children":[
   { "type":"Script", "source":"scripts/{{role}}.lua", "name":"{{role}}_node",
     "params":{ "name":"{{name}}", "age":"{{age}}", "active":"{{active}}", "msg":"hello {{name}}" } }
@@ -228,7 +243,7 @@ return M
 
 ## 完整示例
 
-`bt.init({ root = "@bt/ai_root.json" })`，`@bt/ai_root.json`：
+`bt.init({ root = "res://bt/ai_root.json" })`，`res://bt/ai_root.json`：
 
 ```json
 {
