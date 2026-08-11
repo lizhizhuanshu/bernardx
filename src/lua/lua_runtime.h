@@ -28,6 +28,18 @@ extern "C" {
 #include "lua_types.h"
 #include "timer_manager.h"
 
+// MinGW <winbase.h> defines `Yield()` as an empty macro (a legacy Win16 API).
+// asio pulls <windows.h> -> <winbase.h> in, which clobbers the LuaRuntime::Yield
+// member. The .cc files that call rt->Yield() include <asio.hpp> at varying
+// points (often after this header), so the undef must run AFTER windows.h has
+// been pulled in. Including <asio.hpp> here forces that (it is include-guarded,
+// so a later include in the TU is a no-op and won't re-define the macro), making
+// the undef order-independent for every TU that includes this header.
+#ifdef _WIN32
+#include <asio.hpp>
+#undef Yield
+#endif
+
 namespace async_simple {
 class Executor;
 }  // namespace async_simple

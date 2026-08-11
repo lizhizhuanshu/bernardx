@@ -9,19 +9,39 @@ extern "C" {
 #include "lua_runtime.h"
 
 #include <asio.hpp>
-#include <asio/posix/stream_descriptor.hpp>
+
+// --- Platform abstraction ---------------------------------------------------
+// POSIX uses asio::posix::stream_descriptor over an int fd; Windows uses
+// asio::windows::stream_handle over a HANDLE opened for overlapped IO. Both
+// expose the same async interface (async_read_some / async_write / close), so
+// the Lua-level logic (line reader, metatables, GC) is shared below.
+#ifdef _WIN32
+  #include <asio/windows/stream_handle.hpp>
+
+  #include <windows.h>
+
+  #include <system_error>
+  using AsyncStream = asio::windows::stream_handle;
+#else
+  #include <asio/posix/stream_descriptor.hpp>
+
+  #include <cerrno>
+  #include <cstring>
+  #include <fcntl.h>
+  #include <signal.h>
+  #include <sys/wait.h>
+  #include <unistd.h>
+  using AsyncStream = asio::posix::stream_descriptor;
+#endif
 
 #include <array>
 #include <atomic>
-#include <cerrno>
+#include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <memory>
 #include <optional>
-#include <signal.h>
 #include <string>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <vector>
 
 // --- State management ---
 
@@ -32,27 +52,108 @@ constexpr const char* kProcessMetatable = "async__process";
 
 LibraryState<AsyncIOState> g_async_state{"async__state"};
 
+// --- OS helpers -------------------------------------------------------------
+
+#ifdef _WIN32
+
+// Last error string from a Win32 error code (default: GetLastError()).
+static std::string os_last_error(DWORD e = GetLastError()) {
+  char buf[256] = {};
+  if (FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                     nullptr, e, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                     buf, sizeof(buf), nullptr)) {
+    // Strip trailing whitespace/newlines FormatMessage appends.
+    size_t n = std::strlen(buf);
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' ||
+                     buf[n - 1] == ' ' || buf[n - 1] == '.')) {
+      buf[--n] = '\0';
+    }
+    return std::string(buf);
+  }
+  return "error " + std::to_string(e);
+}
+
+// A one-directional overlapped pipe. The parent keeps the overlapped server
+// end; the child inherits the non-overlapped client end. Named pipes are used
+// (instead of anonymous CreatePipe) because only they can carry
+// FILE_FLAG_OVERLAPPED, which asio::windows::stream_handle requires.
+struct OsPipe {
+  HANDLE parent = nullptr;  // overlapped, owned by parent (asio wraps it)
+  HANDLE child = nullptr;   // non-overlapped, inheritable, passed to child
+};
+
+static unsigned long g_pipe_seq = 0;  // monotonic name suffix (single-threaded call sites)
+
+static bool os_make_pipe(OsPipe& out, bool parent_reads, std::string& err) {
+  char name[128];
+  std::snprintf(name, sizeof(name), "\\\\.\\pipe\\asyncio-%lu-%lu",
+                GetCurrentProcessId(), g_pipe_seq++);
+
+  SECURITY_ATTRIBUTES sa_no_inherit{sizeof(sa_no_inherit), nullptr, FALSE};
+  SECURITY_ATTRIBUTES sa_inherit{sizeof(sa_inherit), nullptr, TRUE};
+
+  DWORD parent_access = parent_reads
+                            ? (PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED)
+                            : (PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED);
+
+  // Server end: overlapped, NOT inherited (so closing it in the parent signals
+  // EOF — the child is the only other end-holder via the inherited client).
+  HANDLE server = CreateNamedPipeA(
+      name, parent_access, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+      1, 4096, 4096, 0, &sa_no_inherit);
+  if (server == INVALID_HANDLE_VALUE) {
+    err = "CreateNamedPipe: " + os_last_error();
+    return false;
+  }
+
+  DWORD client_access = parent_reads ? GENERIC_WRITE : GENERIC_READ;
+  // Client end: inheritable, non-overlapped, opened against the same instance.
+  HANDLE client = CreateFileA(name, client_access, 0, &sa_inherit,
+                              OPEN_EXISTING, 0, nullptr);
+  if (client == INVALID_HANDLE_VALUE) {
+    err = "pipe client: " + os_last_error();
+    CloseHandle(server);
+    return false;
+  }
+  // The instance is now connected (client opened it); no ConnectNamedPipe needed.
+  out.parent = server;
+  out.child = client;
+  return true;
+}
+
+#else  // POSIX
+
+static std::string os_last_error(int e = errno) {
+  return std::string(std::strerror(e));
+}
+
+#endif
+
 // --- Handle types ---
 
 struct FileHandle {
-    std::shared_ptr<AsyncIOState> state;
-    std::optional<asio::posix::stream_descriptor> sd;
-    std::atomic<bool> closed{false};
-    std::string path;
-    std::string read_buffer;
+  std::shared_ptr<AsyncIOState> state;
+  std::optional<AsyncStream> sd;
+  std::atomic<bool> closed{false};
+  std::string path;
+  std::string read_buffer;
 };
 
 struct ProcessHandle {
-    std::shared_ptr<AsyncIOState> state;
-    pid_t pid = -1;
-    std::optional<asio::posix::stream_descriptor> stdin_sd;
-    std::optional<asio::posix::stream_descriptor> stdout_sd;
-    std::atomic<bool> closed{false};
-    std::string cmd;
-    std::string read_buffer;
+  std::shared_ptr<AsyncIOState> state;
+#ifdef _WIN32
+  HANDLE proc = nullptr;  // process handle from CreateProcess
+#else
+  pid_t pid = -1;
+#endif
+  std::optional<AsyncStream> stdin_sd;
+  std::optional<AsyncStream> stdout_sd;
+  std::atomic<bool> closed{false};
+  std::string cmd;
+  std::string read_buffer;
 };
 
-// --- Helpers ---
+// --- Handle accessors ---
 
 static std::shared_ptr<FileHandle> file_get(lua_State* L, int idx) {
     auto* slot = static_cast<std::shared_ptr<FileHandle>*>(
@@ -110,7 +211,7 @@ static std::string strip_trailing_newline(std::string s) {
 
 template <typename HandleT>
 void do_read_line(std::shared_ptr<HandleT> handle,
-                  asio::posix::stream_descriptor& sd,
+                  AsyncStream& sd,
                   LuaRuntime::Ptr rt, AsyncHandle yield_handle) {
     auto pos = handle->read_buffer.find('\n');
     if (pos != std::string::npos) {
@@ -310,11 +411,19 @@ static int process_gc(lua_State* L) {
         if (!h->closed.exchange(true)) {
             if (h->stdin_sd.has_value()) { h->stdin_sd->close(); h->stdin_sd.reset(); }
             if (h->stdout_sd.has_value()) { h->stdout_sd->close(); h->stdout_sd.reset(); }
+#ifdef _WIN32
+            if (h->proc) {
+                TerminateProcess(h->proc, 1);
+                CloseHandle(h->proc);
+                h->proc = nullptr;
+            }
+#else
             if (h->pid > 0) {
                 kill(h->pid, SIGTERM);
                 waitpid(h->pid, nullptr, WNOHANG);
                 h->pid = -1;
             }
+#endif
         }
         slot->~shared_ptr<ProcessHandle>();
     }
@@ -438,6 +547,27 @@ static int process_write(lua_State* L) {
 
 static int process_kill(lua_State* L) {
     auto handle = process_check(L, 1);
+#ifdef _WIN32
+    // Windows has no signals; the signal argument is ignored. TerminateProcess
+    // requests termination with the given exit code (1 mirrors a generic kill).
+    (void)luaL_optinteger(L, 2, 0);
+
+    if (handle->closed.load()) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "process is closed");
+        return 2;
+    }
+    if (!handle->proc) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "no process to kill");
+        return 2;
+    }
+    if (!TerminateProcess(handle->proc, 1)) {
+        lua_pushboolean(L, false);
+        lua_pushfstring(L, "kill failed: %s", os_last_error().c_str());
+        return 2;
+    }
+#else
     int sig = luaL_optinteger(L, 2, SIGTERM);
 
     if (handle->closed.load()) {
@@ -445,19 +575,17 @@ static int process_kill(lua_State* L) {
         lua_pushstring(L, "process is closed");
         return 2;
     }
-
     if (handle->pid <= 0) {
         lua_pushboolean(L, false);
         lua_pushstring(L, "no process to kill");
         return 2;
     }
-
     if (::kill(handle->pid, sig) < 0) {
         lua_pushboolean(L, false);
-        lua_pushfstring(L, "kill failed: %s", strerror(errno));
+        lua_pushfstring(L, "kill failed: %s", os_last_error().c_str());
         return 2;
     }
-
+#endif
     lua_pushboolean(L, true);
     return 1;
 }
@@ -483,7 +611,11 @@ static int process_close(lua_State* L) {
     if (handle->stdout_sd.has_value()) { handle->stdout_sd->close(); handle->stdout_sd.reset(); }
     handle->read_buffer.clear();
 
+#ifdef _WIN32
+    if (!handle->proc) {
+#else
     if (handle->pid <= 0) {
+#endif
         lua_pushinteger(L, 0);
         return 1;
     }
@@ -491,18 +623,37 @@ static int process_close(lua_State* L) {
     auto rt = LuaRuntime::FromLuaState(L);
     auto yield_handle = rt->PreYield(L);
     auto shared_h = process_get(L, 1);
-    auto pid = shared_h->pid;
 
     asio::post(shared_h->state->ioc.get(),
-        [rt, yield_handle, shared_h, pid]() mutable {
+        [rt, yield_handle, shared_h]() mutable {
+#ifdef _WIN32
+            // Blocking wait mirrors the POSIX waitpid-on-ioc behaviour. The
+            // process exits (or was already killed); reap its exit code.
+            HANDLE proc = shared_h->proc;
+            shared_h->proc = nullptr;
+            if (!proc) {
+                rt->PushResume(yield_handle, {LuaValue{(int64_t)0}});
+                return;
+            }
+            WaitForSingleObject(proc, INFINITE);
+            DWORD code = 0;
+            int64_t exit_code = -1;
+            if (GetExitCodeProcess(proc, &code)) {
+                exit_code = static_cast<int64_t>(static_cast<int32_t>(code));
+            }
+            CloseHandle(proc);
+            rt->PushResume(yield_handle, {LuaValue{exit_code}});
+#else
+            pid_t pid = shared_h->pid;
+            shared_h->pid = -1;
+
             int status = 0;
             int rc = waitpid(pid, &status, 0);
-            shared_h->pid = -1;
 
             if (rc < 0) {
                 rt->PushResume(yield_handle, {
                     LuaValue{(int64_t)-1},
-                    LuaValue{std::string("waitpid failed: ") + strerror(errno)}
+                    LuaValue{std::string("waitpid failed: ") + os_last_error()}
                 });
                 return;
             }
@@ -513,6 +664,7 @@ static int process_close(lua_State* L) {
             else if (WIFSIGNALED(status))
                 exit_code = -WTERMSIG(status);
             rt->PushResume(yield_handle, {LuaValue{(int64_t)exit_code}});
+#endif
         });
 
     return rt->Yield(L);
@@ -538,6 +690,35 @@ static int async_open(lua_State* L) {
         return luaL_error(L, "async library is shutting down");
     }
 
+    // Open the handle in overlapped mode (Windows) / as a raw fd (POSIX).
+#ifdef _WIN32
+    DWORD access = GENERIC_READ;
+    DWORD disposition = OPEN_EXISTING;
+    if (strcmp(mode, "r") == 0) { access = GENERIC_READ; disposition = OPEN_EXISTING; }
+    else if (strcmp(mode, "w") == 0) { access = GENERIC_WRITE; disposition = CREATE_ALWAYS; }
+    else if (strcmp(mode, "a") == 0) { access = FILE_APPEND_DATA; disposition = OPEN_ALWAYS; }
+    else if (strcmp(mode, "r+") == 0) { access = GENERIC_READ | GENERIC_WRITE; disposition = OPEN_EXISTING; }
+    else if (strcmp(mode, "w+") == 0) { access = GENERIC_READ | GENERIC_WRITE; disposition = CREATE_ALWAYS; }
+    else { return luaL_error(L, "invalid mode '%s'", mode); }
+
+    HANDLE h = CreateFileA(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           disposition, FILE_FLAG_OVERLAPPED, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "cannot open file '%s': %s", path, os_last_error().c_str());
+        return 2;
+    }
+
+    auto* slot = static_cast<std::shared_ptr<FileHandle>*>(
+        lua_newuserdatauv(L, sizeof(std::shared_ptr<FileHandle>), 0));
+    auto handle = std::make_shared<FileHandle>();
+    handle->state = state;
+    handle->path = path;
+    handle->sd.emplace(state->ioc.get(), h);
+    new (slot) std::shared_ptr<FileHandle>(std::move(handle));
+    luaL_setmetatable(L, kFileMetatable);
+    return 1;
+#else
     int flags = O_RDONLY;
     if (strcmp(mode, "r") == 0) flags = O_RDONLY;
     else if (strcmp(mode, "w") == 0) flags = O_WRONLY | O_CREAT | O_TRUNC;
@@ -549,7 +730,7 @@ static int async_open(lua_State* L) {
     int fd = open(path, flags, 0644);
     if (fd < 0) {
         lua_pushnil(L);
-        lua_pushfstring(L, "cannot open file '%s': %s", path, strerror(errno));
+        lua_pushfstring(L, "cannot open file '%s': %s", path, os_last_error().c_str());
         return 2;
     }
 
@@ -562,6 +743,7 @@ static int async_open(lua_State* L) {
     new (slot) std::shared_ptr<FileHandle>(std::move(handle));
     luaL_setmetatable(L, kFileMetatable);
     return 1;
+#endif
 }
 
 static int async_exec(lua_State* L) {
@@ -572,6 +754,64 @@ static int async_exec(lua_State* L) {
         return luaL_error(L, "async library is shutting down");
     }
 
+    // Build a process with redirected stdin/stdout (stderr merged into stdout).
+    // Parent keeps overlapped handles for async IO; child inherits plain ones.
+#ifdef _WIN32
+    OsPipe stdin_pipe;    // parent writes -> child stdin
+    OsPipe stdout_pipe;   // child stdout/stderr -> parent reads
+    std::string err;
+    if (!os_make_pipe(stdin_pipe, /*parent_reads=*/false, err) ||
+        !os_make_pipe(stdout_pipe, /*parent_reads=*/true, err)) {
+        if (stdin_pipe.parent) CloseHandle(stdin_pipe.parent);
+        if (stdin_pipe.child) CloseHandle(stdin_pipe.child);
+        if (stdout_pipe.parent) CloseHandle(stdout_pipe.parent);
+        if (stdout_pipe.child) CloseHandle(stdout_pipe.child);
+        lua_pushnil(L);
+        lua_pushfstring(L, "pipe creation failed: %s", err.c_str());
+        return 2;
+    }
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = stdin_pipe.child;
+    si.hStdOutput = stdout_pipe.child;
+    si.hStdError = stdout_pipe.child;  // merge stderr into stdout
+
+    // Execute via cmd.exe /c, mirroring POSIX "/bin/sh -c".
+    std::string cmdline = std::string("cmd.exe /c ") + cmd;
+    std::vector<char> cmd_buf(cmdline.begin(), cmdline.end());
+    cmd_buf.push_back('\0');  // CreateProcess may mutate; needs writable buffer
+
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr,
+                        /*bInheritHandles=*/TRUE, 0, nullptr, nullptr, &si, &pi)) {
+        std::string e = os_last_error();
+        CloseHandle(stdin_pipe.parent); CloseHandle(stdin_pipe.child);
+        CloseHandle(stdout_pipe.parent); CloseHandle(stdout_pipe.child);
+        lua_pushnil(L);
+        lua_pushfstring(L, "CreateProcess failed: %s", e.c_str());
+        return 2;
+    }
+
+    // Parent no longer needs the child ends — closing them lets reads see EOF
+    // once the child exits / closes its copies.
+    CloseHandle(stdin_pipe.child);
+    CloseHandle(stdout_pipe.child);
+    CloseHandle(pi.hThread);
+
+    auto* slot = static_cast<std::shared_ptr<ProcessHandle>*>(
+        lua_newuserdatauv(L, sizeof(std::shared_ptr<ProcessHandle>), 0));
+    auto handle = std::make_shared<ProcessHandle>();
+    handle->state = state;
+    handle->proc = pi.hProcess;
+    handle->cmd = cmd;
+    handle->stdin_sd.emplace(state->ioc.get(), stdin_pipe.parent);
+    handle->stdout_sd.emplace(state->ioc.get(), stdout_pipe.parent);
+    new (slot) std::shared_ptr<ProcessHandle>(std::move(handle));
+    luaL_setmetatable(L, kProcessMetatable);
+    return 1;
+#else
     int stdin_pipe[2];
     int stdout_pipe[2];
 
@@ -622,6 +862,7 @@ static int async_exec(lua_State* L) {
     new (slot) std::shared_ptr<ProcessHandle>(std::move(handle));
     luaL_setmetatable(L, kProcessMetatable);
     return 1;
+#endif
 }
 
 }  // namespace

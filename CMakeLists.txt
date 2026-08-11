@@ -144,8 +144,13 @@ target_link_libraries(bernardx_lib PUBLIC
 )
 target_link_libraries(bernardx_lib PRIVATE
     Threads::Threads
-    dl
 )
+# libdl is POSIX-only. On Windows asio additionally needs winsock.
+if(WIN32)
+    target_link_libraries(bernardx_lib PRIVATE ws2_32 mswsock)
+else()
+    target_link_libraries(bernardx_lib PRIVATE dl)
+endif()
 if(OpenSSL_FOUND)
     target_link_libraries(bernardx_lib PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 endif()
