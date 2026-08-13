@@ -139,7 +139,7 @@ target_link_libraries(bernardx_lib PUBLIC
     sol2::sol2
     spdlog::spdlog_header_only
     lua
-    async_simple
+    async_simple_static
     nlohmann_json::nlohmann_json
 )
 target_link_libraries(bernardx_lib PRIVATE
