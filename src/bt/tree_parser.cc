@@ -18,8 +18,7 @@
 
 #include "composite.h"
 #include "condition_composite.h"
-#include "force_failure.h"
-#include "force_success.h"
+#include "constant_node.h"
 #include "inverter.h"
 #include "lua_types.h"
 #include "node.h"
@@ -520,32 +519,15 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRetry(const json& j, ParseC
 }
 
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseWait(const json& j, ParseContext& ctx) {
-    int ms = ParamsInt(j, "ms", 1000);
+    // `min_timeout` (ms, default 1000) is the lower bound. `max_timeout` (ms)
+    // is optional: when absent the wait is FIXED at min_timeout; when present
+    // the wait is a uniformly random value in [min_timeout, max_timeout],
+    // re-rolled per run. 0 succeeds immediately.
+    int min_ms = ParamsInt(j, "min_timeout", 1000);
+    int max_ms = ParamsInt(j, "max_timeout", min_ms);  // absent → fixed at min
     std::string name = j.value("name", "Wait");
     uint32_t id = ctx.next_id++;
-    auto node = std::make_unique<WaitNode>(id, std::move(name), ms);
-    if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
-    ReadDescription(j, node.get());
-    co_return node;
-}
-
-async_simple::coro::Lazy<std::unique_ptr<Node>> ParseForceSuccess(const json& j, ParseContext& ctx) {
-    auto child = co_await ParseSingleChild(j, ctx, "ForceSuccess node requires a child");
-    if (!child) co_return nullptr;
-    std::string name = j.value("name", "ForceSuccess");
-    uint32_t id = ctx.next_id++;
-    auto node = std::make_unique<ForceSuccess>(id, std::move(name), std::move(child));
-    if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
-    ReadDescription(j, node.get());
-    co_return node;
-}
-
-async_simple::coro::Lazy<std::unique_ptr<Node>> ParseForceFailure(const json& j, ParseContext& ctx) {
-    auto child = co_await ParseSingleChild(j, ctx, "ForceFailure node requires a child");
-    if (!child) co_return nullptr;
-    std::string name = j.value("name", "ForceFailure");
-    uint32_t id = ctx.next_id++;
-    auto node = std::make_unique<ForceFailure>(id, std::move(name), std::move(child));
+    auto node = std::make_unique<WaitNode>(id, std::move(name), min_ms, max_ms);
     if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
     ReadDescription(j, node.get());
     co_return node;
@@ -557,6 +539,20 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseInverter(const json& j, Par
     std::string name = j.value("name", "Inverter");
     uint32_t id = ctx.next_id++;
     auto node = std::make_unique<Inverter>(id, std::move(name), std::move(child));
+    if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
+    ReadDescription(j, node.get());
+    co_return node;
+}
+
+// Success / Failure: constant-result leaves. Useful as a guarded terminal
+// branch (e.g. a Selector's "already done → succeed" with a condition + abort).
+async_simple::coro::Lazy<std::unique_ptr<Node>> ParseConstant(const json& j, ParseContext& ctx) {
+    std::string type = j["type"].get<std::string>();
+    std::string name = j.value("name", type);
+    uint32_t id = ctx.next_id++;
+    std::unique_ptr<Node> node = (type == "Success")
+        ? std::unique_ptr<Node>(std::make_unique<SuccessNode>(id, name))
+        : std::unique_ptr<Node>(std::make_unique<FailureNode>(id, name));
     if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
     ReadDescription(j, node.get());
     co_return node;
@@ -583,9 +579,8 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseNode(const json& j, ParseCo
     if (type == "Repeat") co_return co_await ParseRepeat(j, ctx);
     if (type == "RetryUntilSuccessful") co_return co_await ParseRetry(j, ctx);
     if (type == "Wait") co_return co_await ParseWait(j, ctx);
-    if (type == "ForceSuccess") co_return co_await ParseForceSuccess(j, ctx);
-    if (type == "ForceFailure") co_return co_await ParseForceFailure(j, ctx);
     if (type == "Inverter") co_return co_await ParseInverter(j, ctx);
+    if (type == "Success" || type == "Failure") co_return co_await ParseConstant(j, ctx);
 
     SetError(ctx, "unknown node type '" + type + "'");
     co_return nullptr;
@@ -595,7 +590,8 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseNode(const json& j, ParseCo
 
 async_simple::coro::Lazy<ParseResult>
 TreeParser::LoadAndParse(const std::string& root_path,
-                         std::shared_ptr<ResourceProvider> provider) {
+                         std::shared_ptr<ResourceProvider> provider,
+                         nlohmann::json params) {
     ParseResult result;
 
     auto root_content = co_await LoadAsset(root_path, provider);
@@ -618,6 +614,12 @@ TreeParser::LoadAndParse(const std::string& root_path,
         co_return result;
     }
 
+    // Treat the root like a Subtree: substitute {{key}} placeholders across
+    // every string field using the caller-supplied params (bt.init params).
+    if (params.is_object() && !params.empty()) {
+        SubstituteTemplates(root_j, params);
+    }
+
     ParseContext ctx;
     ctx.provider = provider;
 
@@ -631,7 +633,7 @@ TreeParser::LoadAndParse(const std::string& root_path,
     co_return result;
 }
 
-ParseResult TreeParser::Parse(const std::string& root_json) {
+ParseResult TreeParser::Parse(const std::string& root_json, nlohmann::json params) {
     ParseResult result;
     json root_j;
     try {
@@ -645,6 +647,10 @@ ParseResult TreeParser::Parse(const std::string& root_json) {
         result.error = "root must be a JSON object";
         spdlog::error("TreeParser: {}", result.error);
         return result;
+    }
+
+    if (params.is_object() && !params.empty()) {
+        SubstituteTemplates(root_j, params);
     }
 
     ParseContext ctx;  // no provider -> Subtree nodes unsupported

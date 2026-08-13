@@ -96,3 +96,88 @@ inline LuaValue JsonToLuaValue(lua_State* L, LuaRuntime* rt, const nlohmann::jso
     }
     return LuaValue(nullptr);
 }
+
+// Convert a Lua value at index `idx` to json. Scalars map directly; tables
+// become objects, except a table whose keys are all positive integers 1..N
+// (contiguous from 1) becomes a json array (1-based → 0-based). Used to read
+// `params` tables passed to bt.init, and by json.encode.
+//
+// For tables: copies the table to the top of the stack first, so recursive
+// calls with lua_pushnil/lua_next don't invalidate the index.
+inline nlohmann::json LuaToJson(lua_State* L, int idx) {
+    luaL_checkstack(L, 4, nullptr);
+    int abs = lua_absindex(L, idx);
+    int t = lua_type(L, abs);
+    switch (t) {
+    case LUA_TNIL:
+        return nlohmann::json(nullptr);
+    case LUA_TBOOLEAN:
+        return nlohmann::json(static_cast<bool>(lua_toboolean(L, abs)));
+    case LUA_TNUMBER: {
+        if (lua_isinteger(L, abs))
+            return nlohmann::json(static_cast<int64_t>(lua_tointeger(L, abs)));
+        return nlohmann::json(lua_tonumber(L, abs));
+    }
+    case LUA_TSTRING: {
+        size_t len;
+        const char* s = lua_tolstring(L, abs, &len);
+        return nlohmann::json(std::string(s, len));
+    }
+    case LUA_TTABLE: {
+        // Push a copy at top of stack so recursive calls don't invalidate the index
+        lua_pushvalue(L, abs);
+        int table_idx = lua_gettop(L);
+
+        // Check if array (all keys are positive integers starting from 1)
+        bool is_array = true;
+        lua_Integer max_index = 0;
+        lua_pushnil(L);
+        while (lua_next(L, table_idx) != 0) {
+            lua_pop(L, 1); // pop value, keep key
+            if (lua_type(L, -1) != LUA_TNUMBER || !lua_isinteger(L, -1)) {
+                is_array = false;
+                lua_pop(L, 1); // pop remaining key so stack is clean
+                break;
+            }
+            lua_Integer k = lua_tointeger(L, -1);
+            if (k < 1) {
+                is_array = false;
+                lua_pop(L, 1); // pop remaining key
+                break;
+            }
+            if (k > max_index) max_index = k;
+        }
+
+        nlohmann::json result;
+        if (is_array && max_index > 0) {
+            nlohmann::json arr = nlohmann::json::array();
+            for (lua_Integer i = 1; i <= max_index; i++) {
+                lua_rawgeti(L, table_idx, i);
+                arr.push_back(LuaToJson(L, -1));
+                lua_pop(L, 1);
+            }
+            result = std::move(arr);
+        } else {
+            // Object
+            nlohmann::json obj = nlohmann::json::object();
+            lua_pushnil(L);
+            while (lua_next(L, table_idx) != 0) {
+                std::string key;
+                if (lua_type(L, -2) == LUA_TSTRING) {
+                    key = lua_tostring(L, -2);
+                } else if (lua_type(L, -2) == LUA_TNUMBER && lua_isinteger(L, -2)) {
+                    key = std::to_string(lua_tointeger(L, -2));
+                }
+                obj[key] = LuaToJson(L, -1);
+                lua_pop(L, 1);
+            }
+            result = std::move(obj);
+        }
+
+        lua_pop(L, 1); // pop the table copy
+        return result;
+    }
+    default:
+        return nlohmann::json(nullptr);
+    }
+}

@@ -7,11 +7,14 @@ extern "C" {
 
 #include <chrono>
 
+#include <nlohmann/json.hpp>
+
 #include <spdlog/spdlog.h>
 
 #include <async_simple/coro/Sleep.h>
 
 #include "behavior_tree_engine.h"
+#include "json_lua.h"
 #include "lua_runtime.h"
 #include "lua_value_utils.h"
 #include "node.h"
@@ -61,10 +64,11 @@ static async_simple::coro::Lazy<void> InitAsync(
     AsyncHandle handle,
     BehaviorTreeEngine::Ptr engine,
     std::string root_path,
+    nlohmann::json root_params,
     std::shared_ptr<ResourceProvider> provider,
     bool trace_paths,
     uint64_t expected_generation) {
-    auto parse_result = co_await TreeParser::LoadAndParse(root_path, provider);
+    auto parse_result = co_await TreeParser::LoadAndParse(root_path, provider, std::move(root_params));
     if (engine->generation() != expected_generation) {
         // Stopped mid-load; unblock the awaiter so it doesn't hang.
         rt->PushResume(handle, {std::string("stopped")});
@@ -122,8 +126,10 @@ static async_simple::coro::Lazy<void> RunLoop(
         if (engine->has_await_handle()) {
             AsyncHandle h = engine->await_handle();
             engine->clear_await_handle();
-            if (err.empty()) rt->PushResume(h, {std::string(status)});
-            else rt->PushResume(h, {nullptr, std::string(err)});
+            // Always return (status, err): status is the run outcome
+            // ("success"/"failure"/"timeout"); err carries the actionable
+            // detail — for failures, the offending script's file:line:message.
+            rt->PushResume(h, {std::string(status), std::string(err)});
         }
     };
     try {
@@ -141,7 +147,13 @@ static async_simple::coro::Lazy<void> RunLoop(
 
             auto status = engine->TickOnce();
             if (status != NodeStatus::kRunning) {
-                finish(NodeStatusToString(status), "", nullptr);
+                // On failure, surface the root's propagated last_error() —
+                // typically the offending script's "file:line: message" — so
+                // callers can see WHY the tree failed instead of just "failure".
+                std::string err = (status == NodeStatus::kFailure)
+                                      ? engine->last_error()
+                                      : std::string();
+                finish(NodeStatusToString(status), err, nullptr);
                 co_return;
             }
             steps++;
@@ -190,6 +202,15 @@ int bt_init(lua_State* L) {
     }
     bool trace_paths = ReadBoolOpt(L, 1, "trace_paths", true);
 
+    // params: optional table of template values forwarded into the root JSON by
+    // substituting {{key}} placeholders (same rules as Subtree param forwarding).
+    nlohmann::json root_params = nlohmann::json::object();
+    lua_getfield(L, 1, "params");
+    if (lua_istable(L, -1)) {
+        root_params = LuaToJson(L, -1);
+    }
+    lua_pop(L, 1);
+
     auto rt_ctx = LuaRuntime::FromLuaState(L);
     if (!rt_ctx) { lua_pushnil(L); lua_pushstring(L, "no LuaRuntime"); return 2; }
     if (!rt_ctx->executor()) { lua_pushnil(L); lua_pushstring(L, "executor required"); return 2; }
@@ -202,6 +223,7 @@ int bt_init(lua_State* L) {
     uint64_t gen = engine->generation();
     InitAsync(rt_ctx, handle, engine->shared_from_this(),
                std::move(root_path),
+               std::move(root_params),
                rt_ctx->shared_resource_provider(), trace_paths, gen)
         .via(rt_ctx->executor())
         .detach();

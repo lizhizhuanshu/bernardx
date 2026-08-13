@@ -5,6 +5,7 @@
 
 #include "blackboard.h"
 #include "bt_event_queue.h"
+#include "bt_utils.h"
 #include "json_lua.h"
 #include "types.h"
 
@@ -104,7 +105,8 @@ void ScriptNode::CallExit(const std::string& reason) {
 NodeStatus ScriptNode::HandleScriptResult(const ScriptResult& result) {
     if (result.status != LUA_OK) {
         spdlog::error("{}", BuildErrorJson(name_, "Tick", result.error_detail));
-        std::string msg = "'" + name_ + "' coroutine error: " + result.error;
+        std::string msg = "'" + name_ + "' (" + script_path_ + ") Tick failed: " +
+                          FormatScriptError(result.error_detail);
         set_last_error(msg);
         active_ = false;
         CallExit("failure");
@@ -124,7 +126,8 @@ NodeStatus ScriptNode::HandleScriptResult(const ScriptResult& result) {
 NodeStatus ScriptNode::HandleEnterResult(const ScriptResult& result) {
     if (result.status != LUA_OK) {
         spdlog::error("{}", BuildErrorJson(name_, "Enter", result.error_detail));
-        std::string msg = "'" + name_ + "' Enter error: " + result.error;
+        std::string msg = "'" + name_ + "' (" + script_path_ + ") Enter failed: " +
+                          FormatScriptError(result.error_detail);
         set_last_error(msg);
         active_ = false;
         CallExit("failure");

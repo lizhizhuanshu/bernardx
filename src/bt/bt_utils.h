@@ -14,6 +14,7 @@ extern "C" {
 #include <spdlog/spdlog.h>
 
 #include "lua_runtime.h"
+#include "lua_types.h"
 #include "time_utils.h"
 
 inline void ReleaseLuaRef(lua_State* L, int& ref) {
@@ -44,6 +45,23 @@ inline void PushArgsTable(lua_State* L,
         LuaRuntime::PushValues(L, {value});
         lua_settable(L, -3);
     }
+}
+
+// Format a script error for surfacing to callers (bt.exec's second return
+// value). Lua 5.4 runtime errors already embed "source:line: " in the message,
+// so it is returned verbatim when present; otherwise the debug source/line
+// (stripped of Lua's "@" chunk marker) are synthesized so the result always
+// carries a location. Returns "unknown error" only when nothing is available.
+inline std::string FormatScriptError(const ScriptErrorDetail& d) {
+    if (!d.message.empty()) return d.message;
+    std::string src = d.source;
+    if (!src.empty() && src.front() == '@') src.erase(0, 1);
+    std::string out = src;
+    if (d.line > 0) {
+        if (!out.empty()) out += ":";
+        out += std::to_string(d.line);
+    }
+    return out.empty() ? "unknown error" : out;
 }
 
 class ShuffledIndexTracker {

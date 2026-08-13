@@ -66,6 +66,13 @@ public:
     BtState state() const { return state_; }
     void set_state(BtState s) { state_ = s; }
 
+    // Detail string for the last terminal failure — the offending node's
+    // last_error() propagated up to the root (e.g. a script's
+    // "file:line: message"). Captured before ResetTree() clears node state, so
+    // it stays valid after TickOnce() returns. Empty unless the last run ended
+    // in failure. Surfaced to Lua as bt.exec's second return value.
+    const std::string& last_error() const { return last_error_; }
+
     const RunOutcome& last_outcome() const { return last_outcome_; }
     void SetOutcome(std::string status, std::string error) {
         last_outcome_.done = true;

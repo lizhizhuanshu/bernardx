@@ -120,8 +120,6 @@ add_library(bernardx_lib STATIC
     src/bt/pipeline.cc
     src/bt/parallel.cc
     src/bt/inverter.cc
-    src/bt/force_success.cc
-    src/bt/force_failure.cc
     src/bt/repeat.cc
     src/bt/retry_until_successful.cc
     src/bt/random_selector.cc

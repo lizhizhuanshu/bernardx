@@ -29,6 +29,7 @@ local bt = require('bt')
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `root` | string | **是** | 根节点 JSON 文件路径（见[路径解析](#路径解析)） |
+| `params` | table | 否 | 根模板参数：把根 JSON 里任意字符串字段的 `{{key}}` 占位符按值替换（规则同[子树参数透传](#子树参数透传)：整值占位保留类型、片段占位按文本插值、未知 key 留字面量并告警）。不传则根按原样加载 |
 | `trace_paths` | bool | 否 | 采集路径数据（默认 `true`） |
 
 `bt.exec`：
@@ -38,6 +39,27 @@ local bt = require('bt')
 | `interval` | integer | 否 | tick 间隔（毫秒），默认 50，需 > 0 |
 | `max_step` | integer | 否 | 最大 tick 步数，未设则无限 |
 | `timeout` | integer | 否 | 超时（毫秒），未设则不超时 |
+
+### 根参数模板化
+
+`bt.init` 的 `params` 把**根 JSON 当作子树**处理：根里任意字符串字段的 `{{key}}` 占位符都会被 `params` 的值替换（规则与[子树参数透传](#子树参数透传)完全一致——整值占位 `"{{age}}"` 保留原始类型，片段占位 `"hello {{name}}"` 按文本插值，未知 key 留字面量并告警）。同一份 JSON 可被不同参数复用：
+
+```lua
+bt.init({ root = "res://open_app.json",
+          params = { package_name = "com.example.app",
+                     min_timeout = 500, max_timeout = 2000 } })
+bt.exec({ interval = 50 })
+```
+
+```json
+// res://open_app.json —— 任意字段都能用 {{key}}
+{ "type":"Selector", "children":[
+  { "type":"Script", "source":"scripts/in_app.lua",
+    "condition":{ "type":"Script", "source":"conds/in_app.lua",
+                  "params":{ "package_name":"{{package_name}}" } } },
+  { "type":"Wait", "params":{ "min_timeout":"{{min_timeout}}", "max_timeout":"{{max_timeout}}" } }
+]}
+```
 
 ## 路径解析
 
@@ -70,7 +92,7 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | `children` | 复合 | 子节点数组 |
 | `child` | 包装 | 单个子节点（直接对象，非数组） |
 | `condition` | 全部 | 可选的守卫条件（见[条件](#条件)）。**所有节点通用**：复合节点 tick 子节点前先门控（Failure 则跳过/失败）；条件对象上的 `abort` 字段（默认 `None`）再开启 UE4/5 风格的响应式中断（`Self`/`LowerPriority`/`Both`）。`Pipeline` 还额外在首次扫描时用它定起点。`Subtree` 的 `condition` 还可取特殊字符串 `"@child_condition"`——透传引用所嵌子树**根节点**自身的 condition（共享同一对象，让父复合在子树边界处门控一个定义在子树文件内的条件；`abort` 随子树根条件一起带过来；子树根无 condition 时为 no-op 并告警）。 |
-| `params` | 各类型 | 类型相关参数：Script→`Enter` 参数、Wait→`ms`、Repeat→`count`、Retry→`attempts`、Parallel→`success_policy`/`failure_policy`、Subtree 透传给子树（见[子树参数透传](#子树参数透传)） |
+| `params` | 各类型 | 类型相关参数：Script→`Enter` 参数、Wait→`min_timeout`/`max_timeout`、Repeat→`count`、Retry→`attempts`、Parallel→`success_policy`/`failure_policy`、Subtree 透传给子树（见[子树参数透传](#子树参数透传)） |
 | `source` | Script / Subtree | Script 的 Lua 脚本路径 / Subtree 的子树 JSON 路径 |
 | `description` | 全部 | 备注（仅文档/调试） |
 
@@ -85,11 +107,11 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | `RandomSelector` / `RandomSequence` | 复合 | — | 同 Selector/Sequence，每次 Reset 后随机排列子节点顺序 |
 | `Script` | 叶子 | `source`, `params` | 执行 Lua 脚本 |
 | `Subtree` | 叶子 | `source`, `params` | 加载 `source` 指向的子树 JSON（递归）；`params` 透传给子树内节点（见[子树参数透传](#子树参数透传)）；`condition` 支持 `"@child_condition"` 透传子树根的条件（见上[节点结构](#节点结构)） |
-| `Wait` | 叶子 | `params` | 等待 `params.ms` 毫秒（默认 1000） |
+| `Wait` | 叶子 | `params` | 等待若干毫秒后 Success：`params.min_timeout`（毫秒，默认 1000）为下界；`params.max_timeout` 可选，缺省则固定等于 `min_timeout`，给则闭区间随机 `[min_timeout, max_timeout]`（每次运行重摇）。`0` 立即 Success |
+| `Success` | 叶子 | — | 恒 Success（常用于挂 `condition` 的"已达成→成功"分支，如 Selector 第一支：条件成立即短路） |
+| `Failure` | 叶子 | — | 恒 Failure |
 | `Repeat` | 包装 | `params`, `child` | 重复执行子节点（`params.count`，默认 -1 无限） |
 | `RetryUntilSuccessful` | 包装 | `params`, `child` | 失败重试（`params.attempts`，默认 -1 无限） |
-| `ForceSuccess` | 包装 | `child` | 执行子节点，结束态强制为 Success（Running 透传） |
-| `ForceFailure` | 包装 | `child` | 执行子节点，结束态强制为 Failure（Running 透传） |
 | `Inverter` | 包装 | `child` | 反转子节点结束态 Success↔Failure（Running 透传） |
 
 **Parallel 策略**（`params.success_policy` / `params.failure_policy`，均 `RequireAll`/`RequireOne`）：默认 `RequireAll` / `RequireOne`。

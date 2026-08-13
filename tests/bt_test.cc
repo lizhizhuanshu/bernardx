@@ -2,6 +2,7 @@
 
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <filesystem>
@@ -16,8 +17,7 @@
 #include "blackboard_library.h"
 #include "composite.h"
 #include "condition_composite.h"
-#include "force_success.h"
-#include "force_failure.h"
+#include "constant_node.h"
 #include "inverter.h"
 #include "lua_runtime.h"
 #include "node.h"
@@ -366,37 +366,6 @@ TEST(InverterTest, NoChildFails) {
     EXPECT_EQ(inv.Tick(bb, events), NodeStatus::kFailure);
 }
 
-TEST(ForceSuccessTest, ForcesFailureToSuccess) {
-    Blackboard bb;
-    BtEventQueue events;
-    auto* child = new MockNode(2, "child", NodeStatus::kFailure);
-    ForceSuccess fs(1, "fs", std::unique_ptr<Node>(child));
-    EXPECT_EQ(fs.Tick(bb, events), NodeStatus::kSuccess);
-}
-
-TEST(ForceSuccessTest, KeepsSuccess) {
-    Blackboard bb;
-    BtEventQueue events;
-    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
-    ForceSuccess fs(1, "fs", std::unique_ptr<Node>(child));
-    EXPECT_EQ(fs.Tick(bb, events), NodeStatus::kSuccess);
-}
-
-TEST(ForceSuccessTest, PassthroughRunning) {
-    Blackboard bb;
-    BtEventQueue events;
-    auto* child = new MockNode(2, "child", NodeStatus::kRunning);
-    ForceSuccess fs(1, "fs", std::unique_ptr<Node>(child));
-    EXPECT_EQ(fs.Tick(bb, events), NodeStatus::kRunning);
-}
-
-TEST(ForceSuccessTest, NoChildFails) {
-    Blackboard bb;
-    BtEventQueue events;
-    ForceSuccess fs(1, "fs", nullptr);
-    EXPECT_EQ(fs.Tick(bb, events), NodeStatus::kFailure);
-}
-
 // --- BehaviorTreeEngine Tests ---
 
 class BehaviorTreeEngineTest : public ::testing::Test {
@@ -430,6 +399,22 @@ TEST_F(BehaviorTreeEngineTest, WrapperNodeTakesSingularChild) {
         R"({"type":"Repeat","params":{"count":2},"children":[{"type":"Script","source":"a.lua"}]})");
     EXPECT_EQ(nullptr, legacy.root);
     EXPECT_NE(legacy.error.find("requires a child"), std::string::npos);
+}
+
+TEST_F(BehaviorTreeEngineTest, ParseAppliesRootParamsToTypeField) {
+    // Root params template EVERY string field, including `type`: {{kind}} is
+    // substituted from params so the root parses as a Sequence. Without params
+    // the literal '{{kind}}' is an unknown node type.
+    auto with = TreeParser::Parse(
+        R"({"type":"{{kind}}","children":[{"type":"Script","source":"a.lua"}]})",
+        nlohmann::json{{"kind", "Sequence"}});
+    EXPECT_NE(with.root, nullptr);
+    EXPECT_TRUE(with.error.empty());
+
+    auto without = TreeParser::Parse(
+        R"({"type":"{{kind}}","children":[{"type":"Script","source":"a.lua"}]})");
+    EXPECT_EQ(without.root, nullptr);
+    EXPECT_NE(without.error.find("unknown node type"), std::string::npos);
 }
 
 TEST_F(BehaviorTreeEngineTest, StatusBeforeLoad) {
@@ -1000,6 +985,87 @@ TEST_F(ScriptNodeIntegrationTest, SubtreeTableParamForwarded) {
     EXPECT_EQ(std::get<int64_t>(r.values[1]), 100);
 }
 
+TEST_F(ScriptNodeIntegrationTest, RootParamsTemplatingReachesEnter) {
+    // bt.init `params` templates the ROOT json exactly like a Subtree's params
+    // template their subtree: whole-value placeholders preserve type, embedded
+    // ones interpolate as text. Here a root Script reads templated params.
+    PutRoot(R"({"type":"Script","source":"scripts/subtree_args.lua",)"
+            R"("params":{"name":"hello {{name}}","age":"{{age}}","active":"{{active}}"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bt.init({root = "res://root.json",
+                 params = { name = "lizhi", age = 18, active = true }})
+        bt.exec({interval = 10})
+        return bb.get("sub_name"), bb.get("sub_age"), bb.get("sub_active")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 3u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "hello lizhi");  // partial
+    EXPECT_EQ(std::get<int64_t>(r.values[1]), 18);                 // whole, type kept
+    EXPECT_EQ(std::get<bool>(r.values[2]), true);                  // whole, type kept
+}
+
+TEST_F(ScriptNodeIntegrationTest, RootParamsTemplatingWaitRange) {
+    // Root params flow into a Wait's min_ms/max_ms. With lo=hi=0 the Wait
+    // succeeds immediately, proving the templated values reached the range
+    // params (and that min_ms/max_ms parse end-to-end via bt.init).
+    PutRoot(R"({"type":"Sequence","children":[)"
+            R"({"type":"Wait","params":{"min_timeout":"{{lo}}","max_timeout":"{{hi}}"}},)"
+            R"({"type":"Script","source":"scripts/no_args.lua"}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json", params = { lo = 0, hi = 0 }})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(*s, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, RootParamsWithoutPlaceholdersIsNoop) {
+    // Passing params to a root with no placeholders must parse unchanged.
+    PutRoot(R"({"type":"Script","source":"scripts/no_args.lua"})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json", params = { unused = 1 }})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(*s, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, GuardedSuccessBranchShortCircuits) {
+    // The open_app pattern: a Selector whose first branch is a Success leaf
+    // gated by a condition. Condition met → Success short-circuits (fallback
+    // never needed); condition not met → fallback Script runs. {{cond}} picks
+    // the condition script via root params.
+    PutRoot(R"({"type":"Selector","children":[)"
+            R"({"type":"Success","condition":{"type":"Script","source":"{{cond}}"}},)"
+            R"({"type":"Script","source":"scripts/no_args.lua"}]})");
+
+    // Condition met (cond_truthy) → first branch Success → Selector Success.
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json", params = { cond = "scripts/cond_truthy.lua" }})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+
+    // Condition not met (cond_falsy) → Success branch skipped → fallback runs.
+    r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json", params = { cond = "scripts/cond_falsy.lua" }})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+}
+
 TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
     PutRoot(R"({"type":"Script","source":"scripts/counter.lua"})");
     auto status = RunBtScript(R"(
@@ -1212,39 +1278,6 @@ TEST_F(BtRunOptionsTest, CombinedMaxStepAndInterval) {
     auto* s = std::get_if<std::string>(&r.values[0]);
     ASSERT_NE(s, nullptr);
     EXPECT_EQ(*s, "timeout");
-}
-
-// --- ForceFailure Tests ---
-
-TEST(ForceFailureTest, ForcesSuccessToFailure) {
-    Blackboard bb;
-    BtEventQueue events;
-    auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
-    ForceFailure ff(1, "ff", std::unique_ptr<Node>(child));
-    EXPECT_EQ(ff.Tick(bb, events), NodeStatus::kFailure);
-}
-
-TEST(ForceFailureTest, KeepsFailure) {
-    Blackboard bb;
-    BtEventQueue events;
-    auto* child = new MockNode(2, "child", NodeStatus::kFailure);
-    ForceFailure ff(1, "ff", std::unique_ptr<Node>(child));
-    EXPECT_EQ(ff.Tick(bb, events), NodeStatus::kFailure);
-}
-
-TEST(ForceFailureTest, PassthroughRunning) {
-    Blackboard bb;
-    BtEventQueue events;
-    auto* child = new MockNode(2, "child", NodeStatus::kRunning);
-    ForceFailure ff(1, "ff", std::unique_ptr<Node>(child));
-    EXPECT_EQ(ff.Tick(bb, events), NodeStatus::kRunning);
-}
-
-TEST(ForceFailureTest, NoChildFails) {
-    Blackboard bb;
-    BtEventQueue events;
-    ForceFailure ff(1, "ff", nullptr);
-    EXPECT_EQ(ff.Tick(bb, events), NodeStatus::kFailure);
 }
 
 // --- Repeat Tests ---
@@ -1472,14 +1505,14 @@ TEST(RandomSequenceTest, RunningRemembered) {
 TEST(WaitNodeTest, ZeroMsSucceedsImmediately) {
     Blackboard bb;
     BtEventQueue events;
-    auto wait = std::make_unique<WaitNode>(1, "wait", 0);
+    auto wait = std::make_unique<WaitNode>(1, "wait", 0, 0);
     EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kSuccess);
 }
 
 TEST(WaitNodeTest, ReturnsRunningBeforeTimeout) {
     Blackboard bb;
     BtEventQueue events;
-    auto wait = std::make_unique<WaitNode>(1, "wait", 1000);
+    auto wait = std::make_unique<WaitNode>(1, "wait", 1000, 1000);
 
     // First tick starts the timer
     EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
@@ -1490,7 +1523,7 @@ TEST(WaitNodeTest, ReturnsRunningBeforeTimeout) {
 TEST(WaitNodeTest, CompletesAfterMs) {
     Blackboard bb;
     BtEventQueue events;
-    auto wait = std::make_unique<WaitNode>(1, "wait", 50);
+    auto wait = std::make_unique<WaitNode>(1, "wait", 50, 50);
 
     EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -1500,7 +1533,7 @@ TEST(WaitNodeTest, CompletesAfterMs) {
 TEST(WaitNodeTest, ResetRestartsTimer) {
     Blackboard bb;
     BtEventQueue events;
-    auto wait = std::make_unique<WaitNode>(1, "wait", 50);
+    auto wait = std::make_unique<WaitNode>(1, "wait", 50, 50);
 
     wait->Tick(bb, events);
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -1509,6 +1542,68 @@ TEST(WaitNodeTest, ResetRestartsTimer) {
 
     // After reset, timer starts fresh
     EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
+}
+
+TEST(WaitNodeTest, RangeLoEqHiBehavesAsFixed) {
+    // A degenerate range [50,50] collapses to a fixed 50ms wait.
+    Blackboard bb;
+    BtEventQueue events;
+    auto wait = std::make_unique<WaitNode>(1, "wait", 50, 50);
+
+    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(WaitNodeTest, RangeZeroSucceedsImmediately) {
+    Blackboard bb;
+    BtEventQueue events;
+    auto wait = std::make_unique<WaitNode>(1, "wait", 0, 0);
+    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(WaitNodeTest, RangeResolvedValueStaysInBounds) {
+    // Whatever value is rolled in [20,40], the node must still be Running
+    // before 20ms and Success after 40ms.
+    Blackboard bb;
+    BtEventQueue events;
+    auto wait = std::make_unique<WaitNode>(1, "wait", 20, 40);
+
+    ASSERT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);  // rolls + stamps
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);  // 10ms < min 20
+    std::this_thread::sleep_for(std::chrono::milliseconds(45));  // ~55ms >= max 40
+    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kSuccess);
+}
+
+// --- ConstantNode (Success / Failure) Tests ---
+
+TEST(ConstantNodeTest, SuccessAlwaysSucceeds) {
+    Blackboard bb;
+    BtEventQueue events;
+    SuccessNode node(1, "ok");
+    EXPECT_EQ(node.Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(node.Tick(bb, events), NodeStatus::kSuccess);  // stays Success
+}
+
+TEST(ConstantNodeTest, FailureAlwaysFails) {
+    Blackboard bb;
+    BtEventQueue events;
+    FailureNode node(1, "nope");
+    EXPECT_EQ(node.Tick(bb, events), NodeStatus::kFailure);
+    EXPECT_EQ(node.Tick(bb, events), NodeStatus::kFailure);
+}
+
+TEST_F(BehaviorTreeEngineTest, ParseConstantNodeTypes) {
+    // Both constant leaves parse and tick their fixed status.
+    auto ok = TreeParser::Parse(
+        R"({"type":"Selector","children":[)"
+        R"({"type":"Failure"},{"type":"Success"}]})");
+    ASSERT_NE(ok.root, nullptr);
+    EXPECT_TRUE(ok.error.empty());
+    engine->SetRoot(std::move(ok.root));
+    // First child fails → Selector moves on → second child (Success) → Success.
+    EXPECT_EQ(engine->TickOnce(), NodeStatus::kSuccess);
 }
 
 // --- PathTracer Tests ---
@@ -1580,7 +1675,7 @@ TEST(PathTracerTest, ResetBetweenRuns) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
-    PutRoot(R"({"type":"Wait","params":{"ms":999999}})");
+    PutRoot(R"({"type":"Wait","params":{"min_timeout":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -1598,7 +1693,7 @@ TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
-    PutRoot(R"({"type":"Wait","params":{"ms":999999}})");
+    PutRoot(R"({"type":"Wait","params":{"min_timeout":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json", trace_paths=false})
@@ -1613,7 +1708,7 @@ TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
-    PutRoot(R"({"type":"Wait","params":{"ms":999999}})");
+    PutRoot(R"({"type":"Wait","params":{"min_timeout":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -1632,8 +1727,8 @@ TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathLegal) {
     PutRoot(R"({"type":"Sequence","name":"root","children":[)"
-            R"({"type":"Wait","name":"w1","params":{"ms":99999}},)"
-            R"({"type":"Wait","name":"w2","params":{"ms":99999}}]})");
+            R"({"type":"Wait","name":"w1","params":{"min_timeout":99999}},)"
+            R"({"type":"Wait","name":"w2","params":{"min_timeout":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -1647,7 +1742,7 @@ TEST_F(BehaviorTreeLibraryTest, GotoPathLegal) {
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathNameNotFound) {
     PutRoot(R"({"type":"Sequence","name":"root","children":[)"
-            R"({"type":"Wait","name":"w1","params":{"ms":99999}}]})");
+            R"({"type":"Wait","name":"w1","params":{"min_timeout":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -1662,7 +1757,7 @@ TEST_F(BehaviorTreeLibraryTest, GotoPathNameNotFound) {
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathRejectsParallel) {
     PutRoot(R"({"type":"Parallel","name":"par","children":[)"
-            R"({"type":"Wait","name":"w1","params":{"ms":99999}}]})");
+            R"({"type":"Wait","name":"w1","params":{"min_timeout":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})

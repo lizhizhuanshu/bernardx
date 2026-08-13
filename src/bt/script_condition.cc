@@ -54,7 +54,8 @@ NodeStatus ScriptCondition::ParseReturnValue(const LuaValue& v) {
 NodeStatus ScriptCondition::HandleResult(const ScriptResult& result) {
     if (result.status != LUA_OK) {
         spdlog::error("ScriptCondition '{}': Tick error: {}", name_, result.error);
-        set_last_error("'" + name_ + "' condition error: " + result.error);
+        set_last_error("'" + name_ + "' (" + script_path_ +
+                       ") condition Tick failed: " + FormatScriptError(result.error_detail));
         return NodeStatus::kFailure;
     }
     if (result.values.empty()) {
@@ -88,7 +89,8 @@ NodeStatus ScriptCondition::Tick(Blackboard& /*bb*/, BtEventQueue& /*events*/) {
             entering_ = false;
             if (result.status != LUA_OK) {
                 spdlog::error("ScriptCondition '{}': Enter error: {}", name_, result.error);
-                set_last_error("'" + name_ + "' Enter error: " + result.error);
+                set_last_error("'" + name_ + "' (" + script_path_ +
+                               ") condition Enter failed: " + FormatScriptError(result.error_detail));
                 return NodeStatus::kFailure;
             }
             // Enter finished — fall through to the first real Tick this tick.
@@ -120,7 +122,8 @@ NodeStatus ScriptCondition::Tick(Blackboard& /*bb*/, BtEventQueue& /*events*/) {
             has_result_ = false;
             if (result_.status != LUA_OK) {
                 spdlog::error("ScriptCondition '{}': Enter error: {}", name_, result_.error);
-                set_last_error("'" + name_ + "' Enter error: " + result_.error);
+                set_last_error("'" + name_ + "' (" + script_path_ +
+                               ") condition Enter failed: " + FormatScriptError(result_.error_detail));
                 return NodeStatus::kFailure;
             }
         }
