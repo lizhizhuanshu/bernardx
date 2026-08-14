@@ -319,14 +319,6 @@ int bt_stop(lua_State* L) {
     return 0;
 }
 
-int bt_notify(lua_State* L) {
-    auto* engine = GetEngine(L);
-    const char* name = luaL_checkstring(L, 1);
-    auto data = PopLuaValue(L, 2);
-    engine->Notify(name, std::move(data));
-    return 0;
-}
-
 int bt_get_status(lua_State* L) {
     auto status = GetEngine(L)->GetStatus();
     lua_pushstring(L, status.c_str());
@@ -362,7 +354,6 @@ void BehaviorTreeLibrary::Open(lua_State* L) {
         {"exec", bt_exec},
         {"goto_path", bt_goto_path},
         {"stop", bt_stop},
-        {"notify", bt_notify},
         {"get_status", bt_get_status},
         {"dump_paths", bt_dump_paths},
         {"path_report", bt_path_report},

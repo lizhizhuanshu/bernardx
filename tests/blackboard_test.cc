@@ -68,3 +68,74 @@ TEST(BlackboardTest, MultipleTypes) {
     EXPECT_DOUBLE_EQ(std::get<double>(*bb.Get("dbl_val")), 3.14);
     EXPECT_EQ(std::get<std::string>(*bb.Get("str_val")), "text");
 }
+
+// --- Value provider Tests ---
+//
+// SetProvider installs a computed-value source: every Get invokes it fresh.
+// A key holds either a static value or a provider — last writer wins.
+
+TEST(BlackboardTest, ProviderInvokedOnEveryGet) {
+    Blackboard bb;
+    int calls = 0;
+    bb.SetProvider("n", [&calls]() -> LuaValue {
+        ++calls;
+        return LuaValue(static_cast<int64_t>(calls));
+    });
+    EXPECT_EQ(std::get<int64_t>(*bb.Get("n")), 1);
+    EXPECT_EQ(std::get<int64_t>(*bb.Get("n")), 2);
+    EXPECT_EQ(std::get<int64_t>(*bb.Get("n")), 3);
+}
+
+TEST(BlackboardTest, ProviderCanReadOtherKeys) {
+    Blackboard bb;
+    bb.Set("base", LuaValue(static_cast<int64_t>(10)));
+    bb.SetProvider("double_base", [&bb]() -> LuaValue {
+        auto base = bb.Get("base");  // re-enters the blackboard (no lock held)
+        return LuaValue(static_cast<int64_t>(std::get<int64_t>(*base) * 2));
+    });
+    EXPECT_EQ(std::get<int64_t>(*bb.Get("double_base")), 20);
+    bb.Set("base", LuaValue(static_cast<int64_t>(50)));
+    EXPECT_EQ(std::get<int64_t>(*bb.Get("double_base")), 100);  // live
+}
+
+TEST(BlackboardTest, SetReplacesProviderAndViceVersa) {
+    Blackboard bb;
+    bb.SetProvider("k", []() -> LuaValue { return LuaValue(std::string("computed")); });
+    EXPECT_EQ(std::get<std::string>(*bb.Get("k")), "computed");
+    bb.Set("k", LuaValue(std::string("static")));
+    EXPECT_EQ(std::get<std::string>(*bb.Get("k")), "static");
+    bb.SetProvider("k", []() -> LuaValue { return LuaValue(std::string("again")); });
+    EXPECT_EQ(std::get<std::string>(*bb.Get("k")), "again");
+}
+
+TEST(BlackboardTest, ProviderHasRemoveClear) {
+    Blackboard bb;
+    bb.SetProvider("p", []() -> LuaValue { return LuaValue(static_cast<int64_t>(1)); });
+    EXPECT_TRUE(bb.Has("p"));  // provider counts as present
+    bb.Remove("p");
+    EXPECT_FALSE(bb.Has("p"));
+    bb.SetProvider("q", []() -> LuaValue { return LuaValue(static_cast<int64_t>(1)); });
+    bb.Clear();
+    EXPECT_FALSE(bb.Has("q"));
+}
+
+TEST(BlackboardTest, ProviderReturningNilIsPresentNil) {
+    Blackboard bb;
+    bb.SetProvider("nils", []() -> LuaValue { return LuaValue(nullptr); });
+    auto v = bb.Get("nils");
+    ASSERT_TRUE(v.has_value());  // present (provider installed)...
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(*v));  // ...but nil
+}
+
+TEST(BlackboardTest, ProviderSelfReadStopsAtRecursionLimit) {
+    Blackboard bb;
+    // Provider reading its own key: guarded, returns nullopt instead of
+    // recursing forever (the nested Get hits the depth cap).
+    bb.SetProvider("loop", [&bb]() -> LuaValue {
+        auto v = bb.Get("loop");
+        return v ? *v : LuaValue(nullptr);
+    });
+    auto v = bb.Get("loop");
+    EXPECT_TRUE(v.has_value());  // outer Get returns the provider's nil
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(*v));
+}

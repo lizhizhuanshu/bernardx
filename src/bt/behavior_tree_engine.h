@@ -14,10 +14,11 @@ extern "C" {
 #include <async_simple/coro/Lazy.h>
 
 #include "blackboard.h"
-#include "bt_event_queue.h"
 #include "node.h"
 #include "path_tracer.h"
 #include "types.h"
+
+class BtEventQueue;
 
 class BehaviorTreeEngine : public std::enable_shared_from_this<BehaviorTreeEngine> {
 public:
@@ -44,8 +45,6 @@ public:
     std::string GetStatus() const;
 
     Blackboard& blackboard() { return *blackboard_; }
-
-    void Notify(const std::string& event_name, LuaValue data);
 
     // Async-load all Script nodes (and subtrees thereof). Also inits every
     // node's guard `condition` via InitConditionsRecursive.
@@ -92,13 +91,12 @@ public:
     std::optional<std::string> GotoPath(const std::vector<std::string>& names);
 
 private:
-    void HandleEvents();
     void ResetTree();
     // Reactive abort (LowerPriority / Both): walk the tree, evaluate guard
     // conditions, and on a false→true flip preempt the currently-running
     // lower-priority branch. Self abort is handled per-node in Node::TickAndRecord.
     void EvaluateAborts();
-    void EvaluateAbortsRecursive(Node* node);
+    void EvaluateAbortsRecursive(Node* node, BtEventQueue& events);
     // On a LowerPriority flip at `source`, walk up to the nearest ancestor
     // Composite where source's branch outranks the running branch; abort that
     // running branch and route the composite to source's branch.
@@ -114,7 +112,6 @@ private:
 
     std::unique_ptr<Node> root_;
     std::shared_ptr<Blackboard> blackboard_;
-    BtEventQueue event_queue_;
     std::unordered_map<Node*, NodeStatus> cond_state_;  // prev effective status (flip detection)
 
     std::string last_error_;

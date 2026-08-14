@@ -14,7 +14,6 @@ local bt = require('bt')
 | `bt.exec(opts)` | 启动后台 tick 并**阻塞**到本次 run 结束（协程 yield）；返回 `"success"`/`"failure"`/`"timeout"`/`"stopped"` 或 `nil, err` |
 | `bt.goto_path(names)` | 跳到指定节点名路径（如 `{"combat","attack"}`），重置树让叶子重新 `Enter` |
 | `bt.stop()` | 停止并清理当前树 |
-| `bt.notify(event, data)` | 发事件到队列（下个 tick 写入黑板 `_event_{name}`） |
 | `bt.get_status()` | `"idle"`/`"ready"`/`"running"`/`"paused"`/`"success"`/`"failure"` |
 | `bt.dump_paths()` / `bt.path_report()` | 路径数据/报告（见[路径记录](#路径记录)） |
 
@@ -47,7 +46,7 @@ local bt = require('bt')
 ```lua
 bt.init({ root = "res://open_app.json",
           params = { package_name = "com.example.app",
-                     min_timeout = 500, max_timeout = 2000 } })
+                     timeout = { 500, 2000 } } })
 bt.exec({ interval = 50 })
 ```
 
@@ -57,7 +56,7 @@ bt.exec({ interval = 50 })
   { "type":"Script", "source":"scripts/in_app.lua",
     "condition":{ "type":"Script", "source":"conds/in_app.lua",
                   "params":{ "package_name":"{{package_name}}" } } },
-  { "type":"Wait", "params":{ "min_timeout":"{{min_timeout}}", "max_timeout":"{{max_timeout}}" } }
+  { "type":"Wait", "params":{ "timeout":"{{timeout}}" } }
 ]}
 ```
 
@@ -92,7 +91,7 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | `children` | 复合 | 子节点数组 |
 | `child` | 包装 | 单个子节点（直接对象，非数组） |
 | `condition` | 全部 | 可选的守卫条件（见[条件](#条件)）。**所有节点通用**：复合节点 tick 子节点前先门控（Failure 则跳过/失败）；条件对象上的 `abort` 字段（默认 `None`）再开启 UE4/5 风格的响应式中断（`Self`/`LowerPriority`/`Both`）。`Pipeline` 还额外在首次扫描时用它定起点。`Subtree` 的 `condition` 还可取特殊字符串 `"child_condition"`——透传引用所嵌子树**根节点**自身的 condition（共享同一对象，让父复合在子树边界处门控一个定义在子树文件内的条件；`abort` 随子树根条件一起带过来；子树根无 condition 时为 no-op 并告警）。 |
-| `params` | 各类型 | 类型相关参数：Script→`Enter` 参数、Wait→`min_timeout`/`max_timeout`、Repeat→`count`、Retry→`max_count`、Parallel→`success_policy`/`failure_policy`、Subtree 透传给子树（见[子树参数透传](#子树参数透传)） |
+| `params` | 各类型 | 类型相关参数：Script→`Enter` 参数、Wait→`timeout`、Repeat→`count`、Retry→`max_count`、Parallel→`success_policy`/`failure_policy`、Subtree 透传给子树（见[子树参数透传](#子树参数透传)） |
 | `source` | Script / Subtree | Script 的 Lua 脚本路径 / Subtree 的子树 JSON 路径 |
 | `description` | 全部 | 备注（仅文档/调试） |
 
@@ -106,31 +105,32 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | `Parallel` | 复合 | `params` | 并行所有子节点，策略控制结果 |
 | `RandomSelector` / `RandomSequence` | 复合 | — | 同 Selector/Sequence，每次 Reset 后随机排列子节点顺序 |
 | `Script` | 叶子 | `source`, `params` | 执行 Lua 脚本 |
+| `Set` | 叶子 | `params` | **内置黑板写 Action**（零脚本）：`params.key`（必填）写入目标键；`params.value`（标量，缺省写 nil）写入值。字符串值以 `$` 开头为黑板引用——`"$src"` 在**每次 Tick** 实时读 `blackboard[src]` 拷入（缺键写 nil 并告警），`"$$x"` 转义为字面 `"$x"`。写入后立即 Success，常与 `Blackboard` 条件配合组成纯声明式树 |
 | `Subtree` | 叶子 | `source`, `params` | 加载 `source` 指向的子树 JSON（递归）；`params` 透传给子树内节点（见[子树参数透传](#子树参数透传)）；`condition` 支持 `"child_condition"` 透传子树根的条件（见上[节点结构](#节点结构)） |
-| `Wait` | 叶子 | `params` | 等待若干毫秒后 Success：`params.min_timeout`（毫秒，默认 1000）为下界；`params.max_timeout` 可选，缺省则固定等于 `min_timeout`，给则闭区间随机 `[min_timeout, max_timeout]`（每次运行重摇）。`0` 立即 Success |
+| `Wait` | 叶子 | `params` | 等待若干毫秒后 Success：`params.timeout` 为**数值**（固定等待，默认 1000）或**两元素数组 `[lo, hi]`**（闭区间均匀随机，每次运行重摇；`[v]` 等价固定 v）。`0` 立即 Success。旧 `min_timeout`/`max_timeout` 已移除，出现即解析报错 |
 | `Success` | 叶子 | — | 恒 Success（常用于挂 `condition` 的"已达成→成功"分支，如 Selector 第一支：条件成立即短路） |
 | `Failure` | 叶子 | — | 恒 Failure |
-| `Repeat` | 包装 | `params`, `child` | 重复执行子节点（`params.count`，默认 -1 无限） |
-| `Retry` | 包装 | `params`, `child` | 失败重试（`params.max_count`，默认 -1 无限） |
+| `Repeat` | 包装 | `params`, `child` | 重复执行子节点：`params.count` 为**数值**（默认 -1 无限）或 **`[lo,hi]` 数组**（每次运行摇一次、本次运行内固定） |
+| `Retry` | 包装 | `params`, `child` | 失败重试：`params.max_count` 同上（数值或 `[lo,hi]`，默认 -1 无限） |
 | `Inverter` | 包装 | `child` | 反转子节点结束态 Success↔Failure（Running 透传） |
 
 **Parallel 策略**（`params.success_policy` / `params.failure_policy`，均 `RequireAll`/`RequireOne`）：默认 `RequireAll` / `RequireOne`。
 
 ### Pipeline —— 扫描定起点 + 顺序执行
 
-为软件自动化的"判断页面 → 动作 → 判断是否到达目标页 → 动作"流程设计。**纯 tick 驱动的状态机**——内部不 sleep、不看墙钟，只记录状态（当前步、相位、已等待 tick 数、已用重试），每个 tick 根据状态决定动作。`children` 是有序步骤，每个子节点可带一个 `condition`（判断"我现在处于哪一步"）和两个 **Pipeline 边参数** `*timeout` / `*retry`（`*` 前缀标记，表明它们是管线边参数、节点自身忽略）：
+为软件自动化的"判断页面 → 动作 → 判断是否到达目标页 → 动作"流程设计。**tick 驱动的状态机**——内部不 sleep，只记录状态（当前步、相位、等待起点、已用重试），每个 tick 根据状态决定动作；唯一用到的墙钟是 `*timeout` 的毫秒预算。`children` 是有序步骤，每个子节点可带一个 `condition`（判断"我现在处于哪一步"）和两个 **Pipeline 边参数** `*timeout` / `*retry`（`*` 前缀标记，表明它们是管线边参数、节点自身忽略）：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `condition` | object | 该步的守卫条件（见[条件](#条件)）；可选，无则视为已成立 |
-| `*timeout` | int 或 `[lo,hi]` (tick) | 等待**本步** condition 成立的 tick 预算；数组形式表示闭区间内**均匀随机**（每次运行、每个步摇一个值，该步本次运行内固定）；0/缺省 = 无限等 |
+| `*timeout` | int 或 `[lo,hi]` (**毫秒**) | 等待**本步** condition 成立的墙钟预算；数组形式表示闭区间内**均匀随机**（每次运行、每个步摇一个值，该步本次运行内固定）；0/缺省 = 无限等 |
 | `*retry` | int 或 `[lo,hi]` | 等待本步 condition 超时后，回退重跑上一步动作的最大次数；同样支持 `[lo,hi]` 范围随机；0/缺省 = 不重试 |
 
 执行：
 
 - **首次 tick 扫描（断点续传）** — 自上而下找**首个** `condition` 成立（Success）或无 `condition` 的子节点作为起点；扫到 Running 则整条流水线 Running、下 tick 续扫；扫到 Failure 跳过该步；**全部不成立 → 从 step0 起等 condition0**（用 `*timeout`0）。
 - **跑动作** — 起点选定（condition 已成立）后 tick 其动作；动作 Success → 进入下一步的等待；动作 Failure → Pipeline failure。
-- **等下一步 condition（带超时+重试）** — 动作完成后，每 tick 求值下一步 condition：成立 → 跑该步动作；不成立 → 消耗一个等待 tick，达到 `*timeout` 即超时。超时后：若 `*retry` 还有余额，**回退一步**重新求值上一步 condition，成立则 Reset+重跑上一步动作、随后重新等下一步 condition（重置 tick 预算）；若上一步 condition 不成立 或 `*retry` 耗尽 → Pipeline failure。
+- **等下一步 condition（带超时+重试）** — 动作完成后，每 tick 求值下一步 condition：成立 → 跑该步动作；不成立 → 记为等待，墙钟时长达到 `*timeout` 毫秒即超时。超时后：若 `*retry` 还有余额，**回退一步**重新求值上一步 condition，成立则 Reset+重跑上一步动作、随后重新等下一步 condition（重置毫秒预算）；若上一步 condition 不成立 或 `*retry` 耗尽 → Pipeline failure。
 
 当每个 `condition` 表示一个独立的页面/状态时，"首个成立"= 当前所处步骤——正好对应"落在中间页就从该步接着做"的断点续传；超时+回退重跑则覆盖"上一步动作再触发一次，好让下一步页面出现"的常见自动化重试。
 
@@ -142,10 +142,10 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
     "condition":{ "type":"And", "children":[
         { "type":"Script", "source":"conds/logged_in.lua" },
         { "type":"Not", "child":{ "type":"Script", "source":"conds/on_login_page.lua" } } ] },
-    "*timeout": 50, "*retry": 2 },
+    "*timeout": 500, "*retry": 2 },
   { "type":"Script", "source":"scripts/toggle_switch.lua",
     "condition":{ "type":"Script", "source":"conds/on_settings_page.lua" },
-    "*timeout": 50, "*retry": 2 }
+    "*timeout": 500, "*retry": 2 }
 ]}
 ```
 
@@ -157,13 +157,13 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
     "condition":{ "type":"Script", "source":"conds/on_login_page.lua" } },
   { "type":"Script", "source":"scripts/open_settings.lua",
     "condition":{ "type":"Script", "source":"conds/on_settings_page.lua" },
-    "*timeout": [40, 80], "*retry": [1, 3] }
+    "*timeout": [400, 800], "*retry": [1, 3] }
 ]}
 ```
 
-> 范围内若含 0，0 仍保留"无限等/不重试"语义；要表达"有界随机"建议下界 ≥1。`*timeout`/`*retry` 单元素数组 `[v]` 等价于标量 `v`，乱序数组 `[b,a]`(b>a) 会被归一化为 `[a,b]`。
+> 范围内若含 0，0 仍保留"无限等/不重试"语义；要表达"有界随机"建议下界 ≥1（毫秒）。`*timeout`/`*retry` 单元素数组 `[v]` 等价于标量 `v`，乱序数组 `[b,a]`(b>a) 会被归一化为 `[a,b]`。
 >
-> `*timeout` 单位是 **tick 数**，实际墙钟时长 = tick 数 × `bt.exec` 的 `interval_ms`。`*timeout`/`*retry` 是边参数（描述进入该步的转移），节点自身（Script 等）不读取它们，Pipeline 在解析时单独取。纯顺序无起点判断/无需等待重试用 `Sequence`。
+> `Wait` 的 `timeout` 与 Pipeline 的 `*timeout` 单位一致，均为**毫秒**。`*timeout`/`*retry` 是边参数（描述进入该步的转移），节点自身（Script 等）不读取它们，Pipeline 在解析时单独取。纯顺序无起点判断/无需等待重试用 `Sequence`。
 
 ## 条件
 
@@ -317,7 +317,7 @@ return M
 
 ## 运行机制（每个 tick）
 
-1. **处理事件** — `bt.notify()` 推入的事件写入黑板（`_event_{name}`）
-2. **响应式中断评估** — 扫描各 condition（`LowerPriority`/`Both`），false→true 翻转时抢占正在运行的低优先级兄弟分支（`Self` 中断在 tick 树时由各节点自行处理）
-3. **Tick 树** — 从根节点执行；复合节点对每个子节点先门控（condition），再 tick。`Pipeline` 是 tick 驱动状态机：首次扫描定起点，之后每步按 `*timeout` 等待下一步 condition、超时按 `*retry` 回退重跑上一步动作
-4. **树完成时重置** — 返回 success/failure 时重置树（清空复合节点游标、`Pipeline` 扫描状态、各节点条件状态、中断监视缓存）
+0. **盖时间戳** — 引擎在 tick 开始读一次单调时钟缓存进 per-tick 上下文；节点（Wait、Pipeline 的 `*timeout` 预算）统一读该缓存时间，同 tick 内看到同一时刻、不再各自调时钟
+1. **响应式中断评估** — 扫描各 condition（`LowerPriority`/`Both`），false→true 翻转时抢占正在运行的低优先级兄弟分支（`Self` 中断在 tick 树时由各节点自行处理）
+2. **Tick 树** — 从根节点执行；复合节点对每个子节点先门控（condition），再 tick。`Pipeline` 是 tick 驱动状态机：首次扫描定起点，之后每步按 `*timeout` 等待下一步 condition、超时按 `*retry` 回退重跑上一步动作
+3. **树完成时重置** — 返回 success/failure 时重置树（清空复合节点游标、`Pipeline` 扫描状态、各节点条件状态、中断监视缓存）

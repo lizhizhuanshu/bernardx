@@ -1,15 +1,34 @@
 #include "repeat.h"
 
+#include "bt_utils.h"
+
 Repeat::Repeat(uint32_t id, std::string name, int count,
                std::unique_ptr<Node> child)
     : SingleChildNode(id, "Repeat", std::move(name), std::move(child)),
       max_count_(count) {}
+
+Repeat::Repeat(uint32_t id, std::string name, int lo, int hi,
+               std::unique_ptr<Node> child)
+    : SingleChildNode(id, "Repeat", std::move(name), std::move(child)),
+      max_count_(lo),
+      lo_(lo),
+      hi_(hi),
+      resolved_(false) {}
+
+void Repeat::ResolveCount() {
+    resolved_ = true;
+    if (lo_ <= hi_) {  // range mode: roll once per run
+        max_count_ = RollIntInRange(lo_, hi_, rng_);
+    }
+}
 
 NodeStatus Repeat::Tick(Blackboard& bb, BtEventQueue& events) {
     if (!child_) {
         set_last_error("no child node");
         return NodeStatus::kFailure;
     }
+
+    if (!resolved_) ResolveCount();
 
     if (max_count_ == kInfinite) {
         auto status = child_->TickAndRecord(bb, events);
@@ -48,5 +67,6 @@ NodeStatus Repeat::Tick(Blackboard& bb, BtEventQueue& events) {
 
 void Repeat::Reset() {
     current_count_ = 0;
+    resolved_ = false;  // re-roll the range on the next run
     SingleChildNode::Reset();
 }

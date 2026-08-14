@@ -1,5 +1,7 @@
 #include "wait_node.h"
 
+#include "bt_event_queue.h"
+
 WaitNode::WaitNode(uint32_t id, std::string name, int min_ms, int max_ms)
     : Leaf(id, "Wait", std::move(name)),
       rng_(std::random_device{}()) {
@@ -10,21 +12,18 @@ WaitNode::WaitNode(uint32_t id, std::string name, int min_ms, int max_ms)
     max_ms_ = hi;
 }
 
-NodeStatus WaitNode::Tick(Blackboard& /*bb*/, BtEventQueue& /*events*/) {
+NodeStatus WaitNode::Tick(Blackboard& /*bb*/, BtEventQueue& events) {
     if (!resolved_) {
         resolved_ = true;
         cur_ms_ = RollIntInRange(min_ms_, max_ms_, rng_);
-        start_time_ = std::chrono::steady_clock::now();
+        start_ms_ = events.now_ms();  // per-tick cached time
     }
 
     if (cur_ms_ <= 0) {
         return NodeStatus::kSuccess;
     }
 
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start_time_).count();
-
-    if (elapsed >= cur_ms_) {
+    if (events.now_ms() - start_ms_ >= cur_ms_) {
         return NodeStatus::kSuccess;
     }
     return NodeStatus::kRunning;

@@ -66,7 +66,7 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
         } else {
             current_child_index_ = 0;
             phase_ = Phase::kWait;
-            wait_ticks_ = 0;
+            wait_start_ms_ = events.now_ms();
             ResolveStepBudgets(current_child_index_);
         }
     }
@@ -87,7 +87,7 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
             ++current_child_index_;
             if (current_child_index_ >= n) return NodeStatus::kSuccess;
             phase_ = Phase::kWait;
-            wait_ticks_ = 0;
+            wait_start_ms_ = events.now_ms();
             ResolveStepBudgets(current_child_index_);
             // fall through to the wait this tick
         }
@@ -99,10 +99,9 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
             phase_ = Phase::kAct;
             continue;  // run the action this tick
         }
-        // Running or Failure → not yet met; spend one wait tick.
-        ++wait_ticks_;
+        // Running or Failure → not yet met; check the wall-clock budget.
         int timeout = cur_timeout_[current_child_index_];
-        if (timeout > 0 && wait_ticks_ >= timeout) {
+        if (timeout > 0 && events.now_ms() - wait_start_ms_ >= timeout) {
             return OnWaitTimeout(bb, events);
         }
         return NodeStatus::kRunning;
@@ -121,7 +120,7 @@ NodeStatus Pipeline::OnWaitTimeout(Blackboard& bb, BtEventQueue& events) {
 
     // Back up one step: re-check the previous step's condition; if it holds,
     // reset + re-run its action, then resume waiting for this step's condition
-    // (with a fresh tick budget) on subsequent ticks.
+    // (with a fresh ms budget) on subsequent ticks.
     ++retries_used_[i];
     current_child_index_ = i - 1;
     NodeCondition* prev_cond = children_[current_child_index_]->condition();
@@ -139,7 +138,7 @@ NodeStatus Pipeline::OnWaitTimeout(Blackboard& bb, BtEventQueue& events) {
 void Pipeline::Reset() {
     started_ = false;
     phase_ = Phase::kWait;
-    wait_ticks_ = 0;
+    wait_start_ms_ = 0;
     std::fill(retries_used_.begin(), retries_used_.end(), 0);
     std::fill(cur_timeout_.begin(), cur_timeout_.end(), -1);  // re-roll next run
     std::fill(cur_retry_.begin(), cur_retry_.end(), -1);
@@ -149,7 +148,7 @@ void Pipeline::Reset() {
 void Pipeline::OnAborted() {
     started_ = false;
     phase_ = Phase::kWait;
-    wait_ticks_ = 0;
+    wait_start_ms_ = 0;
     std::fill(cur_timeout_.begin(), cur_timeout_.end(), -1);
     std::fill(cur_retry_.begin(), cur_retry_.end(), -1);
     Composite::OnAborted();

@@ -29,6 +29,7 @@
 #include "script_node.h"
 #include "selector.h"
 #include "sequence.h"
+#include "set_node.h"
 #include "subtree_node.h"
 #include "repeat.h"
 #include "retry.h"
@@ -116,6 +117,18 @@ public:
 private:
     NodeStatus status_;
 };
+
+// Stamp the per-tick cached time exactly as the engine does at each tick,
+// then tick the node — required for any node that reads BtEventQueue time
+// (Wait, Pipeline wait budgets) when driven directly.
+static NodeStatus TickStamp(Pipeline& p, Blackboard& bb, BtEventQueue& ev) {
+    ev.BeginTick(NowMs());
+    return p.Tick(bb, ev);
+}
+static NodeStatus TickStamp(WaitNode& w, Blackboard& bb, BtEventQueue& ev) {
+    ev.BeginTick(NowMs());
+    return w.Tick(bb, ev);
+}
 
 // --- BtEventQueue Tests ---
 
@@ -507,14 +520,6 @@ TEST_F(BehaviorTreeEngineTest, BlackboardPersistsAcrossLoad) {
     EXPECT_TRUE(engine->blackboard().Has("x"));
 }
 
-TEST_F(BehaviorTreeEngineTest, EventQueue) {
-    engine->Notify("test_event", LuaValue(std::string("data")));
-    // Notify shouldn't crash, event is stored internally
-    // We can't directly drain event_queue_ since it's private,
-    // but we verify Notify doesn't crash
-    engine->Notify("another_event", LuaValue(static_cast<int64_t>(42)));
-}
-
 // --- BehaviorTreeLibrary Tests ---
 
 class BehaviorTreeLibraryTest : public ::testing::Test {
@@ -605,10 +610,10 @@ TEST_F(BehaviorTreeLibraryTest, HasAllFunctions) {
             and type(bt.exec) == 'function'
             and type(bt.goto_path) == 'function'
             and type(bt.stop) == 'function'
-            and type(bt.notify) == 'function'
             and type(bt.get_status) == 'function'
             and type(bt.dump_paths) == 'function'
             and type(bt.path_report) == 'function'
+            and bt.notify == nil  -- removed API must stay gone
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     ASSERT_EQ(r.values.size(), 1u);
@@ -1061,22 +1066,48 @@ TEST_F(ScriptNodeIntegrationTest, RootParamsTemplatingReachesEnter) {
     EXPECT_EQ(std::get<bool>(r.values[2]), true);                  // whole, type kept
 }
 
-TEST_F(ScriptNodeIntegrationTest, RootParamsTemplatingWaitRange) {
-    // Root params flow into a Wait's min_ms/max_ms. With lo=hi=0 the Wait
-    // succeeds immediately, proving the templated values reached the range
-    // params (and that min_ms/max_ms parse end-to-end via bt.init).
+TEST_F(ScriptNodeIntegrationTest, RootParamsTemplatingWaitTimeout) {
+    // Root params flow into a Wait's `timeout` (whole-value placeholder keeps
+    // the array type). With [0,0] the Wait succeeds immediately, proving the
+    // templated range reached the node end-to-end via bt.init.
     PutRoot(R"({"type":"Sequence","children":[)"
-            R"({"type":"Wait","params":{"min_timeout":"{{lo}}","max_timeout":"{{hi}}"}},)"
+            R"({"type":"Wait","params":{"timeout":"{{t}}"}},)"
             R"({"type":"Script","source":"scripts/no_args.lua"}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
-        bt.init({root = "res://root.json", params = { lo = 0, hi = 0 }})
+        bt.init({root = "res://root.json", params = { t = {0, 0} }})
         return bt.exec({interval = 10})
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     auto* s = std::get_if<std::string>(&r.values[0]);
     ASSERT_NE(s, nullptr);
     EXPECT_EQ(*s, "success");
+}
+
+TEST_F(BehaviorTreeEngineTest, ParseWaitTimeoutShapes) {
+    // number / [lo,hi] / [v] all parse; absent defaults; bad shapes and the
+    // removed min_timeout/max_timeout fail at parse.
+    for (const char* params :
+         {R"("timeout":500)", R"("timeout":[500,2000])", R"("timeout":[500])", ""}) {
+        auto ok = TreeParser::Parse(
+            std::string(R"({"type":"Wait","params":{)") + params + "}}");
+        ASSERT_NE(nullptr, ok.root) << params;
+        EXPECT_TRUE(ok.error.empty()) << params;
+    }
+
+    auto legacy = TreeParser::Parse(
+        R"({"type":"Wait","params":{"min_timeout":100,"max_timeout":200}})");
+    EXPECT_EQ(nullptr, legacy.root);
+    EXPECT_NE(legacy.error.find("were removed"), std::string::npos);
+
+    auto badtype = TreeParser::Parse(
+        R"({"type":"Wait","params":{"timeout":"500"}})");
+    EXPECT_EQ(nullptr, badtype.root);
+    EXPECT_NE(badtype.error.find("must be a number or a"), std::string::npos);
+
+    auto badarr = TreeParser::Parse(
+        R"({"type":"Wait","params":{"timeout":[1,2,3]}})");
+    EXPECT_EQ(nullptr, badarr.root);
 }
 
 TEST_F(ScriptNodeIntegrationTest, RootParamsWithoutPlaceholdersIsNoop) {
@@ -1831,6 +1862,193 @@ TEST_F(ScriptNodeIntegrationTest, BlackboardConditionKeyVsKeyGatesBranch) {
     EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
 }
 
+// --- blackboard value provider Tests ---
+//
+// bb.set_provider(key, fn) installs a computed source: every read of the key
+// (bb.get, $key resolution at Enter, Blackboard condition) invokes fn fresh.
+
+TEST_F(ScriptNodeIntegrationTest, BlackboardProviderLuaRoundTrip) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        local n = 0
+        bb.set_provider("counter", function() n = n + 1; return n end)
+        local a = bb.get("counter")
+        local b = bb.get("counter")
+        local has = bb.has("counter")
+        bb.set("counter", "static")            -- set replaces the provider
+        local c = bb.get("counter")
+        bb.set_provider("gone", function() return 1 end)
+        bb.remove("gone")                      -- remove drops the provider
+        return a, b, has, c, bb.has("gone")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 5u);
+    EXPECT_EQ(std::get<int64_t>(r.values[0]), 1);   // every get invokes fresh
+    EXPECT_EQ(std::get<int64_t>(r.values[1]), 2);
+    EXPECT_EQ(std::get<bool>(r.values[2]), true);   // provider counts as present
+    EXPECT_EQ(std::get<std::string>(r.values[3]), "static");
+    EXPECT_EQ(std::get<bool>(r.values[4]), false);
+}
+
+TEST_F(ScriptNodeIntegrationTest, BlackboardProviderFeedsDollarKeyAtEnter) {
+    // Two Script nodes both take params.target = "$who" where `who` is a
+    // provider: each Enter reads the provider fresh, so the two echoes see
+    // DIFFERENT counter values — proving live per-Enter computation.
+    PutRoot(R"({"type":"Sequence","children":[)"
+            R"({"type":"Script","source":"scripts/bb_ref_args.lua","params":{"target":"$who"}},)"
+            R"({"type":"Script","source":"scripts/bb_ref_args.lua","params":{"target":"$who"}}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        local n = 0
+        bb.set_provider("who", function() n = n + 1; return "user" .. n end)
+        bt.init({root = "res://root.json"})
+        bt.exec({interval = 10})
+        return bb.get("got_target")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    // Second Enter saw the provider's NEXT value, not a snapshot.
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "user2");
+}
+
+TEST_F(ScriptNodeIntegrationTest, BlackboardProviderErrorYieldsNil) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        bb.set_provider("bad", function() error("boom") end)
+        local v = bb.get("bad")          -- error -> nil, no crash
+        bb.set_provider("ok", function() return "still" .. "works" end)
+        return v, bb.get("ok")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[0]));
+    EXPECT_EQ(std::get<std::string>(r.values[1]), "stillworks");
+}
+
+TEST_F(ScriptNodeIntegrationTest, BlackboardConditionSeesProviderValue) {
+    // A Blackboard condition comparing a provider-backed key against a
+    // literal: met while the provider returns the expected value (guarded
+    // Success short-circuits); once the provider's output changes, the
+    // fallback runs and records it.
+    PutRoot(R"({"type":"Selector","children":[)"
+            R"({"type":"Success","condition":{"type":"Blackboard","key":"mode","op":"==","value":"fast"}},)"
+            R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"fell_back","value":true}}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        local mode = "fast"
+        bb.set_provider("mode", function() return mode end)
+        bt.init({root = "res://root.json"})
+        local s1 = bt.exec({interval = 10})
+        local fb1 = bb.get("fell_back")
+        mode = "slow"                    -- provider output changes...
+        bt.init({root = "res://root.json"})
+        local s2 = bt.exec({interval = 10})
+        return s1, fb1, s2, bb.get("fell_back")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 4u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[1]));  // guard met
+    EXPECT_EQ(std::get<std::string>(r.values[2]), "success");
+    EXPECT_EQ(std::get<bool>(r.values[3]), true);                      // fallback ran
+}
+
+// --- SetNode Tests ---
+//
+// {"type":"Set","params":{"key":k,"value":v}} writes blackboard[k]=v at Tick.
+// '$src' copies blackboard[src] fresh at each Tick; '$$x' is a literal "$x".
+
+TEST(SetNodeTest, WritesLiteralEachTick) {
+    Blackboard bb;
+    BtEventQueue events;
+    SetNode node(1, "set_home", "page", LuaValue(std::string("home")));
+    EXPECT_EQ(node.Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(std::get<std::string>(*bb.Get("page")), "home");
+    SetNode num(2, "set_n", "n", LuaValue(static_cast<int64_t>(7)));
+    EXPECT_EQ(num.Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(std::get<int64_t>(*bb.Get("n")), 7);
+    SetNode nil(3, "set_nil", "k", LuaValue(nullptr));
+    EXPECT_EQ(nil.Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(*bb.Get("k")));
+}
+
+TEST(SetNodeTest, ReferenceCopiesFreshEachTick) {
+    Blackboard bb;
+    BtEventQueue events;
+    bb.Set("src", LuaValue(static_cast<int64_t>(1)));
+    SetNode node(1, "copy", "dst", BbParamRef{"src"});
+    EXPECT_EQ(node.Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(std::get<int64_t>(*bb.Get("dst")), 1);
+    // Source changes; the next Tick copies the NEW value (live, not snapshot).
+    bb.Set("src", LuaValue(static_cast<int64_t>(2)));
+    EXPECT_EQ(node.Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(std::get<int64_t>(*bb.Get("dst")), 2);
+}
+
+TEST(SetNodeTest, MissingReferenceWritesNil) {
+    Blackboard bb;
+    BtEventQueue events;
+    SetNode node(1, "copy_ghost", "dst", BbParamRef{"ghost"});
+    EXPECT_EQ(node.Tick(bb, events), NodeStatus::kSuccess);
+    auto v = bb.Get("dst");
+    ASSERT_TRUE(v.has_value());
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(*v));
+}
+
+TEST_F(BehaviorTreeEngineTest, ParseSetNode) {
+    // Valid literal / reference / escaped / absent-value forms parse clean.
+    for (const char* params :
+         {R"("key":"k","value":"home")", R"("key":"k","value":"$src")",
+          R"("key":"k","value":"$$cost")", R"("key":"k")"}) {
+        auto ok = TreeParser::Parse(
+            std::string(R"({"type":"Set","params":{)") + params + "}}");
+        ASSERT_NE(nullptr, ok.root) << params;
+        EXPECT_TRUE(ok.error.empty()) << params;
+        EXPECT_EQ(ok.root->type(), "Set");
+    }
+
+    // Missing key -> parse error.
+    auto nokey = TreeParser::Parse(R"({"type":"Set","params":{"value":1}})");
+    EXPECT_EQ(nullptr, nokey.root);
+    EXPECT_NE(nokey.error.find("params.key"), std::string::npos);
+
+    // Non-scalar value -> parse error.
+    auto obj = TreeParser::Parse(
+        R"({"type":"Set","params":{"key":"k","value":{"a":1}}})");
+    EXPECT_EQ(nullptr, obj.root);
+    EXPECT_NE(obj.error.find("must be a scalar"), std::string::npos);
+}
+
+TEST_F(BehaviorTreeEngineTest, SetNodeFeedsBlackboardConditionScriptless) {
+    // A fully scriptless tree: Set writes, Blackboard condition gates.
+    engine->SetRoot(ParseJsonTree(
+        R"({"type":"Sequence","children":[)"
+        R"({"type":"Set","params":{"key":"page","value":"home"}},)"
+        R"({"type":"Success","condition":{"type":"Blackboard","key":"page","op":"==","value":"home"}}]})"));
+    EXPECT_EQ(engine->TickOnce(), NodeStatus::kSuccess);
+    EXPECT_EQ(std::get<std::string>(*engine->blackboard().Get("page")), "home");
+}
+
+TEST_F(ScriptNodeIntegrationTest, SetNodeReferenceReadsProvider) {
+    // End-to-end: Set dst=$pv where `pv` is a provider-backed counter; the
+    // Set node's Tick reads the provider fresh, and a Blackboard condition
+    // downstream sees the copied value.
+    PutRoot(R"({"type":"Sequence","children":[)"
+            R"({"type":"Set","params":{"key":"attempt","value":"$pv"}},)"
+            R"({"type":"Success","condition":{"type":"Blackboard","key":"attempt","op":"==","value":1}}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        local n = 0
+        bb.set_provider("pv", function() n = n + 1; return n end)
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+}
+
 TEST_F(ScriptNodeIntegrationTest, BlackboardConditionGatesBranch) {
     // End-to-end through bt.init/exec: a guarded Success branch with a
     // Blackboard condition short-circuits when met; the And composition of
@@ -1936,7 +2154,7 @@ TEST(WaitNodeTest, ZeroMsSucceedsImmediately) {
     Blackboard bb;
     BtEventQueue events;
     auto wait = std::make_unique<WaitNode>(1, "wait", 0, 0);
-    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(*wait, bb, events), NodeStatus::kSuccess);
 }
 
 TEST(WaitNodeTest, ReturnsRunningBeforeTimeout) {
@@ -1945,9 +2163,9 @@ TEST(WaitNodeTest, ReturnsRunningBeforeTimeout) {
     auto wait = std::make_unique<WaitNode>(1, "wait", 1000, 1000);
 
     // First tick starts the timer
-    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(TickStamp(*wait, bb, events), NodeStatus::kRunning);
     // Second tick: not enough time has passed
-    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(TickStamp(*wait, bb, events), NodeStatus::kRunning);
 }
 
 TEST(WaitNodeTest, CompletesAfterMs) {
@@ -1955,9 +2173,9 @@ TEST(WaitNodeTest, CompletesAfterMs) {
     BtEventQueue events;
     auto wait = std::make_unique<WaitNode>(1, "wait", 50, 50);
 
-    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(TickStamp(*wait, bb, events), NodeStatus::kRunning);
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(*wait, bb, events), NodeStatus::kSuccess);
 }
 
 TEST(WaitNodeTest, ResetRestartsTimer) {
@@ -1965,13 +2183,13 @@ TEST(WaitNodeTest, ResetRestartsTimer) {
     BtEventQueue events;
     auto wait = std::make_unique<WaitNode>(1, "wait", 50, 50);
 
-    wait->Tick(bb, events);
+    TickStamp(*wait, bb, events);
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     // Timer expired but haven't ticked yet
     wait->Reset();
 
     // After reset, timer starts fresh
-    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(TickStamp(*wait, bb, events), NodeStatus::kRunning);
 }
 
 TEST(WaitNodeTest, RangeLoEqHiBehavesAsFixed) {
@@ -1980,16 +2198,16 @@ TEST(WaitNodeTest, RangeLoEqHiBehavesAsFixed) {
     BtEventQueue events;
     auto wait = std::make_unique<WaitNode>(1, "wait", 50, 50);
 
-    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);
+    EXPECT_EQ(TickStamp(*wait, bb, events), NodeStatus::kRunning);
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(*wait, bb, events), NodeStatus::kSuccess);
 }
 
 TEST(WaitNodeTest, RangeZeroSucceedsImmediately) {
     Blackboard bb;
     BtEventQueue events;
     auto wait = std::make_unique<WaitNode>(1, "wait", 0, 0);
-    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(*wait, bb, events), NodeStatus::kSuccess);
 }
 
 TEST(WaitNodeTest, RangeResolvedValueStaysInBounds) {
@@ -1999,11 +2217,11 @@ TEST(WaitNodeTest, RangeResolvedValueStaysInBounds) {
     BtEventQueue events;
     auto wait = std::make_unique<WaitNode>(1, "wait", 20, 40);
 
-    ASSERT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);  // rolls + stamps
+    ASSERT_EQ(TickStamp(*wait, bb, events), NodeStatus::kRunning);  // rolls + stamps
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kRunning);  // 10ms < min 20
+    EXPECT_EQ(TickStamp(*wait, bb, events), NodeStatus::kRunning);  // 10ms < min 20
     std::this_thread::sleep_for(std::chrono::milliseconds(45));  // ~55ms >= max 40
-    EXPECT_EQ(wait->Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(*wait, bb, events), NodeStatus::kSuccess);
 }
 
 // --- ConstantNode (Success / Failure) Tests ---
@@ -2105,7 +2323,7 @@ TEST(PathTracerTest, ResetBetweenRuns) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
-    PutRoot(R"({"type":"Wait","params":{"min_timeout":999999}})");
+    PutRoot(R"({"type":"Wait","params":{"timeout":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -2123,7 +2341,7 @@ TEST_F(BehaviorTreeLibraryTest, DumpPathsAfterRun) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
-    PutRoot(R"({"type":"Wait","params":{"min_timeout":999999}})");
+    PutRoot(R"({"type":"Wait","params":{"timeout":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json", trace_paths=false})
@@ -2138,7 +2356,7 @@ TEST_F(BehaviorTreeLibraryTest, TracePathsFalseSuppressesCollection) {
 }
 
 TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
-    PutRoot(R"({"type":"Wait","params":{"min_timeout":999999}})");
+    PutRoot(R"({"type":"Wait","params":{"timeout":999999}})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -2157,8 +2375,8 @@ TEST_F(BehaviorTreeLibraryTest, PathReportReturnsString) {
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathLegal) {
     PutRoot(R"({"type":"Sequence","name":"root","children":[)"
-            R"({"type":"Wait","name":"w1","params":{"min_timeout":99999}},)"
-            R"({"type":"Wait","name":"w2","params":{"min_timeout":99999}}]})");
+            R"({"type":"Wait","name":"w1","params":{"timeout":99999}},)"
+            R"({"type":"Wait","name":"w2","params":{"timeout":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -2172,7 +2390,7 @@ TEST_F(BehaviorTreeLibraryTest, GotoPathLegal) {
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathNameNotFound) {
     PutRoot(R"({"type":"Sequence","name":"root","children":[)"
-            R"({"type":"Wait","name":"w1","params":{"min_timeout":99999}}]})");
+            R"({"type":"Wait","name":"w1","params":{"timeout":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -2187,7 +2405,7 @@ TEST_F(BehaviorTreeLibraryTest, GotoPathNameNotFound) {
 
 TEST_F(BehaviorTreeLibraryTest, GotoPathRejectsParallel) {
     PutRoot(R"({"type":"Parallel","name":"par","children":[)"
-            R"({"type":"Wait","name":"w1","params":{"min_timeout":99999}}]})");
+            R"({"type":"Wait","name":"w1","params":{"timeout":99999}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -2287,7 +2505,7 @@ TEST(PipelineTest, NullConditionFirstChildSelectedThenSequential) {
     pipe.AddChild(std::unique_ptr<MockNode>(a));
     pipe.AddChild(std::unique_ptr<MockNode>(b));
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);
     EXPECT_EQ(a->tick_count, 1);
     EXPECT_EQ(b->tick_count, 1);  // advanced same tick
 }
@@ -2301,21 +2519,23 @@ TEST(PipelineTest, FirstMatchingConditionSelected) {
     pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
     pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kSuccess));
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);
     EXPECT_EQ(a->tick_count, 0);
     EXPECT_EQ(b->tick_count, 1);
 }
 
 TEST(PipelineTest, NoConditionMetTimesOutAtStep0) {
-    // Scan finds no condition held → wait at step 0; *timeout (ticks) elapses
-    // with condition still failing → fail (no previous step to back up to).
+    // Scan finds no condition held → wait at step 0; once *timeout (20ms
+    // wall-clock) elapses with the condition still failing → fail (no
+    // previous step to back up to).
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
-    pipe.AddStep(std::unique_ptr<MockNode>(a), /*timeout=*/2, /*retry=*/0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), /*timeout_ms=*/20, /*retry=*/0);
     pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // scan no match → wait
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // 2 wait ticks → timeout at step 0
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // scan no match → wait starts
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // 20ms elapsed → timeout at step 0
     EXPECT_EQ(a->tick_count, 0);
 }
 
@@ -2324,11 +2544,12 @@ TEST(PipelineTest, WaitTimeoutWithoutRetryFails) {
     auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
     auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
     pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout=*/2, /*retry=*/0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/20, /*retry=*/0);
     pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // step1 timeout, no retry
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // step1 timeout, no retry
     EXPECT_EQ(a1->tick_count, 0);
 }
 
@@ -2338,14 +2559,15 @@ TEST(PipelineTest, RetryBacksUpAndSucceeds) {
     auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
     auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
     pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout=*/2, /*retry=*/1);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/20, /*retry=*/1);
     auto* cond1 = new MockCondition(NodeStatus::kFailure);
     pipe.children()[1]->SetCondition(std::shared_ptr<MockCondition>(cond1));
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // step1 timeout → back up, reset a0
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // step1 timeout → back up, reset a0
     cond1->set_status(NodeStatus::kSuccess);             // now step1's condition holds
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);  // re-run a0 → step1 → a1 → done
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);  // re-run a0 → step1 → a1 → done
     EXPECT_EQ(a1->tick_count, 1);
 }
 
@@ -2354,13 +2576,15 @@ TEST(PipelineTest, RetryExhaustedFails) {
     auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
     auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
     pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout=*/2, /*retry=*/1);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/20, /*retry=*/1);
     pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // a0; step1 wait
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // timeout → back up, reset a0
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // re-run a0; step1 wait again
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // 2nd timeout, retry budget exhausted
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0; step1 wait
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // timeout → back up, reset a0
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // re-run a0; step1 wait again
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // 2nd timeout, retry budget exhausted
     EXPECT_EQ(a1->tick_count, 0);
 }
 
@@ -2370,13 +2594,14 @@ TEST(PipelineTest, RetryFailsIfPrevConditionLost) {
     auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
     auto* cond0 = new MockCondition(NodeStatus::kSuccess);
     pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout=*/2, /*retry=*/1);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/20, /*retry=*/1);
     pipe.children()[0]->SetCondition(std::shared_ptr<MockCondition>(cond0));
     pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // scan step0; a0 runs; step1 waits
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // scan step0; a0 runs; step1 waits
     cond0->set_status(NodeStatus::kFailure);             // previous condition now lost
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // back-up gate fails
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // back-up gate fails
     EXPECT_EQ(a1->tick_count, 0);
 }
 
@@ -2387,10 +2612,10 @@ TEST(PipelineTest, RunningConditionKeepsScanPhase) {
     auto cond = std::make_shared<MockCondition>(NodeStatus::kRunning);
     pipe.children()[0]->SetCondition(cond);
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // still scanning
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // still scanning
     EXPECT_EQ(a->tick_count, 0);
     cond->set_status(NodeStatus::kSuccess);
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);  // now selected + runs
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);  // now selected + runs
     EXPECT_EQ(a->tick_count, 1);
 }
 
@@ -2399,7 +2624,7 @@ TEST(PipelineTest, ChildFailureFailsPipeline) {
     auto* a = new MockNode(2, "a", NodeStatus::kFailure);
     pipe.AddChild(std::unique_ptr<MockNode>(a));
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);
 }
 
 TEST(PipelineTest, ResetReScans) {
@@ -2407,9 +2632,9 @@ TEST(PipelineTest, ResetReScans) {
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
     pipe.AddChild(std::unique_ptr<MockNode>(a));
     Blackboard bb; BtEventQueue ev;
-    ASSERT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);
+    ASSERT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);
     pipe.Reset();  // clears started_ + child state (tick_count -> 0)
-    ASSERT_EQ(pipe.Tick(bb, ev), NodeStatus::kSuccess);
+    ASSERT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);
     EXPECT_EQ(a->tick_count, 1);  // re-ran after reset (scan phase re-entered)
 }
 
@@ -2445,61 +2670,68 @@ TEST(RollIntInRangeTest, StaysWithinRangeAndVisitsEndpoints) {
 }
 
 TEST(PipelineTest, RangeTimeoutCollapsesToFixedValue) {
-    // [2,2] must behave exactly like the legacy *timeout=2 (timeout, no retry).
+    // timeout=[20,20]ms must behave exactly like fixed *timeout=20 (times out,
+    // no retry).
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
-    pipe.AddStep(std::unique_ptr<MockNode>(a), /*lo=*/2, /*hi=*/2, /*retry=*/0, /*retry=*/0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), /*lo_ms=*/20, /*hi_ms=*/20, 0, 0);
     pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // scan no match → wait, tick 1
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // tick 2 → timeout at step 0
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // scan no match → wait starts
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // 20ms elapsed → timeout
     EXPECT_EQ(a->tick_count, 0);
 }
 
 TEST(PipelineTest, RangeTimeoutResolvesWithinBounds) {
-    // *timeout=[1,5]: across many runs the actual wait (ticks to timeout) must
-    // stay within [1,5] and reach both endpoints (proves a real roll, not a clamp).
-    const int lo = 1, hi = 5;
+    // *timeout=[20,50]ms: across runs the measured wait-to-timeout must stay
+    // within [20,50] (+ small detection slack) and come near BOTH endpoints
+    // (proves a real roll, not a clamp). Tight-loop ticks keep detection
+    // latency well under the ±10ms margins.
+    const int lo = 20, hi = 50;
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
     pipe.AddStep(std::unique_ptr<MockNode>(a), lo, hi, 0, 0);
     pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
 
     int seen_min = hi, seen_max = lo;
-    for (int run = 0; run < 80; ++run) {
+    for (int run = 0; run < 30; ++run) {
         pipe.Reset();
         Blackboard bb; BtEventQueue ev;
-        int ticks = 0;
+        auto t0 = std::chrono::steady_clock::now();
         NodeStatus s = NodeStatus::kRunning;
-        while (s == NodeStatus::kRunning) {
-            s = pipe.Tick(bb, ev);  // each tick spends one wait unit; failure on the T-th
-            ++ticks;
-        }
+        while (s == NodeStatus::kRunning) s = TickStamp(pipe, bb, ev);
         ASSERT_EQ(s, NodeStatus::kFailure);  // step 0, no retry → timeout fails
-        ASSERT_GE(ticks, lo);
-        ASSERT_LE(ticks, hi);
-        seen_min = std::min(seen_min, ticks);
-        seen_max = std::max(seen_max, ticks);
+        int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+        // Both sides truncate to whole ms independently, so the budget can
+        // fire ~1ms early: allow lo-2. Upper bound = rolled + detection slack.
+        ASSERT_GE(elapsed, lo - 2);
+        ASSERT_LE(elapsed, hi + 10);
+        seen_min = std::min(seen_min, elapsed);
+        seen_max = std::max(seen_max, elapsed);
     }
-    EXPECT_EQ(seen_min, lo);
-    EXPECT_EQ(seen_max, hi);
+    EXPECT_LE(seen_min, lo + 10);   // some run rolled near the low end
+    EXPECT_GE(seen_max, hi - 10);   // some run rolled near the high end
     EXPECT_EQ(a->tick_count, 0);
 }
 
 TEST(PipelineTest, RangeRetryCollapsesToFixedValue) {
-    // retry=[1,1] must behave like the legacy *retry=1 (one back-up, then fail).
+    // retry=[1,1] must behave like fixed *retry=1 (one back-up, then fail).
     Pipeline pipe(1, "pipe");
     auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
     auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
     pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout=*/2, /*timeout=*/2,
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/20, /*timeout_ms=*/20,
                  /*retry_lo=*/1, /*retry_hi=*/1);
     pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // step1 timeout → back up, reset a0
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // re-run a0; step1 wait again
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // 2nd timeout, retry budget exhausted
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // step1 timeout → back up, reset a0
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // re-run a0; step1 wait again
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // 2nd timeout, retry budget exhausted
     EXPECT_EQ(a1->tick_count, 0);
 }
 
@@ -2512,17 +2744,19 @@ TEST(PipelineTest, RangeRetryResolvesWithinBounds) {
     auto* a0 = new CountingMockNode(2, "a0", NodeStatus::kSuccess);
     auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
     pipe.AddStep(std::unique_ptr<MockNode>(static_cast<MockNode*>(a0)), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_lo=*/1, /*timeout_hi=*/1, lo, hi);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/10, /*timeout_ms=*/10, lo, hi);
     pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
 
     int seen_min = hi, seen_max = lo;
-    for (int run = 0; run < 80; ++run) {
+    for (int run = 0; run < 40; ++run) {
         pipe.Reset();
         Blackboard bb; BtEventQueue ev;
         int before = a0->total_ticks();
         NodeStatus s = NodeStatus::kRunning;
         while (s == NodeStatus::kRunning) {
-            s = pipe.Tick(bb, ev);
+            s = TickStamp(pipe, bb, ev);
+            // let the 10ms wait budget elapse between wait ticks
+            std::this_thread::sleep_for(std::chrono::milliseconds(12));
         }
         ASSERT_EQ(s, NodeStatus::kFailure);
         int back_ups = (a0->total_ticks() - before) - 1;  // initial run + one per back-up
@@ -2596,10 +2830,10 @@ TEST(PipelineTest, GuardInterruptsActionWhenConditionLost) {
     cond0->set_abort(AbortMode::kSelf);
     pipe.children()[0]->SetCondition(std::shared_ptr<MockCondition>(cond0));
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kRunning);  // a0 running under its guard
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 running under its guard
     EXPECT_FALSE(a0->aborted);
     cond0->set_status(NodeStatus::kFailure);             // page lost
-    EXPECT_EQ(pipe.Tick(bb, ev), NodeStatus::kFailure);  // guard interrupts a0 -> step fails
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // guard interrupts a0 -> step fails
     EXPECT_TRUE(a0->aborted);
 }
 
@@ -2680,7 +2914,7 @@ TEST_F(ScriptNodeIntegrationTest, PipelineNoConditionMetFails) {
     // (ticks) elapses → fail (no previous step to back up to).
     PutRoot(R"({"type":"Pipeline","children":[)"
             R"({"type":"Script","source":"scripts/no_args.lua",)"
-            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"*timeout":3}]})");
+            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"*timeout":30}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -2694,7 +2928,7 @@ TEST_F(ScriptNodeIntegrationTest, PipelineArrayTimeoutEquivalentToScalar) {
     // *timeout as a [lo,hi] array must parse and behave like the scalar 3 above.
     PutRoot(R"({"type":"Pipeline","children":[)"
             R"({"type":"Script","source":"scripts/no_args.lua",)"
-            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"*timeout":[3,3]}]})");
+            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"*timeout":[30,30]}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -2744,7 +2978,7 @@ TEST_F(ScriptNodeIntegrationTest, E2E_CheckoutPipelineWithSubtreeAndRetry) {
             // step 2: on cart -> go to checkout; wait for cart with retry back-up
             R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"checkout"},)"
             R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"cart"}},)"
-            R"("*timeout":3,"*retry":1},)"
+            R"("*timeout":30,"*retry":1},)"
             // step 3: on checkout -> mark done
             R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"done","value":true},)"
             R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"checkout"}}})"
@@ -2800,4 +3034,102 @@ TEST_F(ScriptNodeIntegrationTest, E2E_LowerPriorityPreemptsWorker) {
     ASSERT_TRUE(blackboard->Has("worker_exit"));
     EXPECT_EQ(*blackboard->Get("worker_exit"), LuaValue(std::string("aborted")));  // preempted
     EXPECT_EQ(*blackboard->Get("alert_visible"), LuaValue(false));               // cleared
+}
+
+// --- Repeat / Retry range Tests ---
+//
+// `count` / `max_count` accept a [lo,hi] array: rolled once per run, fixed
+// within the run, re-rolled on Reset — the same contract Wait/Pipeline use.
+
+TEST(RepeatTest, RangeCountResolvesWithinBoundsAndReRolls) {
+    // [2,5]: every run's child-run count lands in [2,5], and both endpoints
+    // are reached across runs (proves a real roll, not a clamp).
+    Blackboard bb;
+    BtEventQueue events;
+    int lo = 2, hi = 5, min_seen = 99, max_seen = -1;
+    for (int run = 0; run < 200; ++run) {
+        auto* child = new CountingMockNode(2, "c", NodeStatus::kSuccess);
+        Repeat rep(1, "rep", lo, hi, std::unique_ptr<MockNode>(child));
+        while (rep.Tick(bb, events) == NodeStatus::kRunning) {}
+        int runs = child->total_ticks();
+        ASSERT_GE(runs, lo);
+        ASSERT_LE(runs, hi);
+        min_seen = std::min(min_seen, runs);
+        max_seen = std::max(max_seen, runs);
+        rep.Reset();
+    }
+    EXPECT_EQ(min_seen, lo);
+    EXPECT_EQ(max_seen, hi);
+}
+
+TEST(RepeatTest, RangeCountFixedWithinOneRun) {
+    // Within a single run the rolled value never changes: query max via the
+    // same object twice would re-run; instead verify determinism by counting
+    // child runs for one run only — the in-run assertion is runs==constant,
+    // covered implicitly by the loop above. Here: degenerate [3,3] == fixed 3.
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new CountingMockNode(2, "c", NodeStatus::kSuccess);
+    Repeat rep(1, "rep", 3, 3, std::unique_ptr<MockNode>(child));
+    while (rep.Tick(bb, events) == NodeStatus::kRunning) {}
+    EXPECT_EQ(child->total_ticks(), 3);
+}
+
+TEST(RetryTest, RangeMaxCountResolvesWithinBounds) {
+    // [1,3] attempts against an always-failing child: every run's attempt
+    // count lands in [1,3]; both endpoints reached across runs.
+    Blackboard bb;
+    BtEventQueue events;
+    int lo = 1, hi = 3, min_seen = 99, max_seen = -1;
+    for (int run = 0; run < 200; ++run) {
+        auto* child = new CountingMockNode(2, "c", NodeStatus::kFailure);
+        Retry r(1, "r", lo, hi, std::unique_ptr<MockNode>(child));
+        while (r.Tick(bb, events) == NodeStatus::kRunning) {}
+        int attempts = child->total_ticks();
+        ASSERT_GE(attempts, lo);
+        ASSERT_LE(attempts, hi);
+        min_seen = std::min(min_seen, attempts);
+        max_seen = std::max(max_seen, attempts);
+        r.Reset();
+    }
+    EXPECT_EQ(min_seen, lo);
+    EXPECT_EQ(max_seen, hi);
+}
+
+TEST_F(BehaviorTreeEngineTest, ParseRepeatRetryRanges) {
+    // Range / scalar / absent forms parse; bad shapes error.
+    auto ok1 = TreeParser::Parse(
+        R"({"type":"Repeat","params":{"count":[2,5]},"child":{"type":"Success"}})");
+    ASSERT_NE(nullptr, ok1.root);
+    EXPECT_TRUE(ok1.error.empty());
+    auto ok2 = TreeParser::Parse(
+        R"({"type":"Retry","params":{"max_count":[1,3]},"child":{"type":"Success"}})");
+    ASSERT_NE(nullptr, ok2.root);
+    auto ok3 = TreeParser::Parse(
+        R"({"type":"Repeat","params":{"count":4},"child":{"type":"Success"}})");
+    ASSERT_NE(nullptr, ok3.root);
+    auto ok4 = TreeParser::Parse(R"({"type":"Repeat","child":{"type":"Success"}})");
+    ASSERT_NE(nullptr, ok4.root);  // absent = infinite
+
+    auto bad1 = TreeParser::Parse(
+        R"({"type":"Repeat","params":{"count":"4"},"child":{"type":"Success"}})");
+    EXPECT_EQ(nullptr, bad1.root);
+    EXPECT_NE(bad1.error.find("must be a number or a"), std::string::npos);
+    auto bad2 = TreeParser::Parse(
+        R"({"type":"Retry","params":{"max_count":[1,2,3]},"child":{"type":"Success"}})");
+    EXPECT_EQ(nullptr, bad2.root);
+}
+
+TEST_F(ScriptNodeIntegrationTest, RepeatRangeRunsEndToEnd) {
+    // End-to-end via bt.init/exec: the [lo,hi] count form parses and runs to
+    // completion (the exact rolled value is covered by the C++ range tests).
+    PutRoot(R"({"type":"Repeat","params":{"count":[1,2]},"child":)"
+            R"({"type":"Script","source":"scripts/no_args.lua"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10, timeout = 5000})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
 }

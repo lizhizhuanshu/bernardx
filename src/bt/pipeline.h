@@ -7,18 +7,17 @@
 #include "composite.h"
 
 // Pipeline is the core composite for software-automation flows (judge page →
-// act → judge target page → act). It is a pure tick-driven state machine: no
-// internal sleeping, no wall-clock — it only records state and, on each Tick,
-// decides what to do based on that state.
+// act → judge target page → act). It is a tick-driven state machine with no
+// internal sleeping: each Tick it records state and decides what to do. The
+// only wall-clock use is the per-step wait budget below.
 //
 // Each child is one step: an action node that may carry a guard `condition`
 // (Node::SetCondition) plus two Pipeline edge params the node itself ignores:
-//   `$timeout` (int or [lo,hi] TICKS) — how many ticks to wait for this step's
-//                               condition before timing out (0 = wait forever);
-//   `$retry`   (int or [lo,hi])      — max times to back up and re-run the
+//   `*timeout` (int or [lo,hi] MS) — wall-clock milliseconds to wait for this
+//                               step's condition before timing out
+//                               (0 = wait forever);
+//   `*retry`   (int or [lo,hi])  — max times to back up and re-run the
 //                               previous step's action when this wait times out.
-// Real time per tick = bt.exec's `interval_ms`, so `$timeout` ticks × interval
-// is the wall-clock budget in production.
 //
 // Either edge param may be a single integer (fixed value) or a two-element
 // `[lo, hi]` array (uniformly random in the inclusive range). The Pipeline
@@ -34,8 +33,8 @@
 //      holds, it starts at step 0 and waits for condition[0].
 //   2. Once a step's condition holds, its action runs to completion.
 //   3. After action[i] completes, the Pipeline waits for condition[i+1],
-//      counting one tick per evaluation that doesn't succeed. After `$timeout`
-//      ticks: if `$retry` still has budget, back up one step — re-check
+//      stamping the wait's start; once `*timeout` ms elapsed: if `*retry`
+//      still has budget, back up one step — re-check
 //      condition[i]; if it holds, reset + re-run action[i], then resume waiting
 //      for condition[i+1] with a fresh tick budget. Up to `$retry` times. If
 //      condition[i] doesn't hold on retry, or the budget is exhausted, fail.
@@ -43,9 +42,10 @@ class Pipeline : public Composite {
 public:
     Pipeline(uint32_t id, std::string name);
 
-    // Register a step with $timeout/$retry each given as an inclusive [lo,hi]
-    // range. The values are resolved (rolled) lazily per run; lo==hi collapses
-    // to a fixed value, and 0 keeps the "wait forever" / "no retry" semantics.
+    // Register a step with *timeout/*retry each given as an inclusive [lo,hi]
+    // range (*timeout in ms). The values are resolved (rolled) lazily per run;
+    // lo==hi collapses to a fixed value, and 0 keeps the "wait forever" /
+    // "no retry" semantics.
     void AddStep(std::unique_ptr<Node> child, int timeout_lo, int timeout_hi,
                  int retry_lo, int retry_hi);
     // Convenience: fixed values for both params (lo==hi). Kept so existing
@@ -65,15 +65,15 @@ private:
     enum class Phase { kWait, kAct };
 
     // Called when the wait for the current step's condition exceeds its
-    // `$timeout` tick budget. Backs up to the previous step or fails.
+    // `*timeout` ms budget. Backs up to the previous step or fails.
     NodeStatus OnWaitTimeout(Blackboard& bb, BtEventQueue& events);
     // Lazily roll this step's timeout/retry for the current run on first entry
     // to its wait window; once rolled they stay fixed for the step until Reset.
     void ResolveStepBudgets(size_t i);
 
     struct Step {
-        int timeout_lo = 0;  // $timeout range lower (ticks, 0 = wait forever)
-        int timeout_hi = 0;  // $timeout range upper (inclusive)
+        int timeout_lo = 0;  // *timeout range lower (ms, 0 = wait forever)
+        int timeout_hi = 0;  // *timeout range upper (inclusive)
         int retry_lo = 0;    // $retry range lower
         int retry_hi = 0;    // $retry range upper (inclusive)
     };
@@ -82,8 +82,8 @@ private:
     std::vector<int> retries_used_;   // back-up retries used per step
     std::vector<int> cur_timeout_;    // resolved timeout per step (-1 = unrolled this run)
     std::vector<int> cur_retry_;      // resolved retry per step (-1 = unrolled this run)
-    std::mt19937 rng_;                // resolves $timeout/$retry ranges per run
-    int wait_ticks_ = 0;             // ticks spent waiting in the current window
+    std::mt19937 rng_;                // resolves *timeout/*retry ranges per run
+    int64_t wait_start_ms_ = 0;  // tick-time (cached) when the current wait window began
     bool started_ = false;           // scan phase complete
     Phase phase_ = Phase::kWait;
 };

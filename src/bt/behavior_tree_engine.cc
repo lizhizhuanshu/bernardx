@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "bt_event_queue.h"
 #include "composite.h"
 #include "lua_runtime.h"
 #include "node_condition.h"
@@ -21,7 +22,6 @@ BehaviorTreeEngine::~BehaviorTreeEngine() {
 
 void BehaviorTreeEngine::SetRoot(std::unique_ptr<Node> root) {
     root_ = std::move(root);
-    event_queue_.Drain();
     cond_state_.clear();
     last_status_ = NodeStatus::kRunning;
     tracer_.SnapshotTopology(root_.get());
@@ -30,16 +30,11 @@ void BehaviorTreeEngine::SetRoot(std::unique_ptr<Node> root) {
 
 void BehaviorTreeEngine::Stop() {
     root_.reset();
-    event_queue_.Drain();
     cond_state_.clear();
     last_status_ = NodeStatus::kRunning;
     // NOTE: tracer data is intentionally preserved across Stop() so callers
     // can still dump_paths() after a timeout/abort. The next SetRoot() rebuilds.
     generation_++;
-}
-
-void BehaviorTreeEngine::Notify(const std::string& event_name, LuaValue data) {
-    event_queue_.Push({event_name, std::move(data)});
 }
 
 std::string BehaviorTreeEngine::GetStatus() const {
@@ -146,15 +141,19 @@ NodeStatus BehaviorTreeEngine::TickOnce() {
 
     tracer_.BeginTick();
 
-    HandleEvents();
+    // Node::Tick takes a BtEventQueue& — the per-tick context. Stamp the
+    // cached tick time ONCE here; nodes (Wait, Pipeline budgets) read
+    // events.now_ms() instead of calling the clock mid-tick.
+    BtEventQueue events;
+    events.BeginTick(NowMs());
     EvaluateAborts();  // LowerPriority/Both preemption before ticking
 
-    auto status = root_->TickAndRecord(*blackboard_, event_queue_);
+    auto status = root_->TickAndRecord(*blackboard_, events);
 
     {
         std::vector<std::vector<Node*>> paths;
         CollectActivePaths(root_.get(), paths);
-        tracer_.OnTickDone(paths, status, NowMs(), nullptr);
+        tracer_.OnTickDone(paths, status, events.now_ms(), nullptr);
     }
 
     if (status != NodeStatus::kRunning) {
@@ -168,13 +167,6 @@ NodeStatus BehaviorTreeEngine::TickOnce() {
     return status;
 }
 
-void BehaviorTreeEngine::HandleEvents() {
-    auto events = event_queue_.Drain();
-    for (auto& evt : events) {
-        blackboard_->Set("_event_" + evt.name, std::move(evt.data));
-    }
-}
-
 void BehaviorTreeEngine::ResetTree() {
     if (root_) {
         root_->Reset();
@@ -183,15 +175,18 @@ void BehaviorTreeEngine::ResetTree() {
 }
 
 void BehaviorTreeEngine::EvaluateAborts() {
-    if (root_) EvaluateAbortsRecursive(root_.get());
+    if (!root_) return;
+    BtEventQueue events;  // per-tick context (incl. cached time) for guards
+    events.BeginTick(NowMs());
+    EvaluateAbortsRecursive(root_.get(), events);
 }
 
-void BehaviorTreeEngine::EvaluateAbortsRecursive(Node* node) {
+void BehaviorTreeEngine::EvaluateAbortsRecursive(Node* node, BtEventQueue& events) {
     if (!node) return;
     if (NodeCondition* c = node->condition()) {
         AbortMode am = c->abort();
         if (am == AbortMode::kLowerPriority || am == AbortMode::kBoth) {
-            NodeStatus raw = c->Eval(*blackboard_, event_queue_);
+            NodeStatus raw = c->Eval(*blackboard_, events);
             NodeStatus eff = (raw == NodeStatus::kRunning) ? c->last_terminal() : raw;
             auto it = cond_state_.find(node);
             bool has_prev = (it != cond_state_.end());
@@ -205,9 +200,9 @@ void BehaviorTreeEngine::EvaluateAbortsRecursive(Node* node) {
         }
     }
     if (auto* comp = dynamic_cast<Composite*>(node)) {
-        for (auto& child : comp->children()) EvaluateAbortsRecursive(child.get());
+        for (auto& child : comp->children()) EvaluateAbortsRecursive(child.get(), events);
     } else if (auto* single = dynamic_cast<SingleChildNode*>(node)) {
-        if (single->child()) EvaluateAbortsRecursive(single->child());
+        if (single->child()) EvaluateAbortsRecursive(single->child(), events);
     }
 }
 

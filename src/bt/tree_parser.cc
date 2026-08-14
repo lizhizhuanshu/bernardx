@@ -34,6 +34,7 @@
 #include "script_node.h"
 #include "selector.h"
 #include "sequence.h"
+#include "set_node.h"
 #include "subtree_node.h"
 #include "types.h"
 #include "wait_node.h"
@@ -455,6 +456,22 @@ std::pair<int, int> ParseIntRange(const json& v) {
     return {0, 0};
 }
 
+// A scalar-or-range param value: an integer → {v, v} (RAW, no clamp — the
+// caller decides what -1 means); a 1-2 element integer array → a normalized,
+// negatives-clamped-to-0 range. nullopt on any other shape. Used by Wait
+// `timeout`, Repeat `count` and Retry `max_count`.
+std::optional<std::pair<int, int>> ParseScalarOrRange(const json& v) {
+    if (v.is_number_integer()) {
+        int x = v.get<int>();
+        return std::make_pair(x, x);
+    }
+    if (v.is_array() && !v.empty() && v.size() <= 2 && v[0].is_number_integer() &&
+        (v.size() == 1 || v[1].is_number_integer())) {
+        return ParseIntRange(v);  // clamps to >=0, sorts
+    }
+    return std::nullopt;
+}
+
 // Pipeline: scan-to-start + wait/retry composite. Each child is a normal node
 // (built by ParseNode) and may carry its own `condition` guard (set via
 // ApplyCondition inside ParseNode's helpers) plus two Pipeline edge params:
@@ -612,10 +629,22 @@ ParseSingleChild(const json& j, ParseContext& ctx, const char* missing_msg) {
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRepeat(const json& j, ParseContext& ctx) {
     auto child = co_await ParseSingleChild(j, ctx, "Repeat node requires a child");
     if (!child) co_return nullptr;
-    int count = ParamsInt(j, "count", Repeat::kInfinite);
+    // `count`: a number (-1/absent = infinite) or a [lo,hi] range rolled
+    // once per run.
+    int lo = Repeat::kInfinite, hi = Repeat::kInfinite;
+    if (j.contains("params") && j["params"].is_object() && j["params"].contains("count")) {
+        auto r = ParseScalarOrRange(j["params"]["count"]);
+        if (!r) {
+            SetError(ctx, "Repeat 'count' must be a number or a [lo,hi] array");
+            co_return nullptr;
+        }
+        std::tie(lo, hi) = *r;
+    }
     std::string name = j.value("name", "Repeat");
     uint32_t id = ctx.next_id++;
-    auto node = std::make_unique<Repeat>(id, std::move(name), count, std::move(child));
+    std::unique_ptr<Node> node = (lo == hi)
+        ? std::make_unique<Repeat>(id, std::move(name), lo, std::move(child))
+        : std::make_unique<Repeat>(id, std::move(name), lo, hi, std::move(child));
     if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
     ReadDescription(j, node.get());
     co_return node;
@@ -624,25 +653,94 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRepeat(const json& j, Parse
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRetry(const json& j, ParseContext& ctx) {
     auto child = co_await ParseSingleChild(j, ctx, "Retry node requires a child");
     if (!child) co_return nullptr;
-    int max_count = ParamsInt(j, "max_count", Retry::kInfinite);
+    // `max_count`: a number (-1/absent = infinite) or a [lo,hi] range rolled
+    // once per run.
+    int lo = Retry::kInfinite, hi = Retry::kInfinite;
+    if (j.contains("params") && j["params"].is_object() && j["params"].contains("max_count")) {
+        auto r = ParseScalarOrRange(j["params"]["max_count"]);
+        if (!r) {
+            SetError(ctx, "Retry 'max_count' must be a number or a [lo,hi] array");
+            co_return nullptr;
+        }
+        std::tie(lo, hi) = *r;
+    }
     std::string name = j.value("name", "Retry");
     uint32_t id = ctx.next_id++;
-    auto node = std::make_unique<Retry>(id, std::move(name), max_count, std::move(child));
+    std::unique_ptr<Node> node = (lo == hi)
+        ? std::make_unique<Retry>(id, std::move(name), lo, std::move(child))
+        : std::make_unique<Retry>(id, std::move(name), lo, hi, std::move(child));
     if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
     ReadDescription(j, node.get());
     co_return node;
 }
 
+// Set: built-in blackboard-write action. {"type":"Set","params":{"key":k,
+// "value":v}} writes blackboard[k]=v at Tick. `value` must be a scalar; a
+// string starting with '$' is a blackboard reference ('$src' copies
+// blackboard[src] fresh at each Tick, '$$x' escapes to the literal "$x").
+// Absent value writes nil.
+async_simple::coro::Lazy<std::unique_ptr<Node>> ParseSet(const json& j, ParseContext& ctx) {
+    if (!j.contains("params") || !j["params"].is_object() ||
+        !j["params"].contains("key") || !j["params"]["key"].is_string()) {
+        SetError(ctx, "Set node requires params.key (string)");
+        co_return nullptr;
+    }
+    std::string key = j["params"]["key"].get<std::string>();
+    std::string name = j.value("name", "Set");
+    uint32_t id = ctx.next_id++;
+
+    json v = j["params"].contains("value") ? j["params"]["value"] : json(nullptr);
+    if (v.is_string()) {
+        auto cls = ResolveBbParamMarker(v.get_ref<const std::string&>());
+        if (auto* ref = std::get_if<BbParamRef>(&cls)) {
+            co_return std::make_unique<SetNode>(id, std::move(name), std::move(key),
+                                                std::move(*ref));
+        }
+        if (auto* lit = std::get_if<std::string>(&cls)) {
+            co_return std::make_unique<SetNode>(id, std::move(name), std::move(key),
+                                                LuaValue(*lit));
+        }
+    }
+    if (!(v.is_null() || v.is_boolean() || v.is_number() || v.is_string())) {
+        SetError(ctx, "Set node 'value' must be a scalar");
+        co_return nullptr;
+    }
+    // Scalars only (no lua_State needed at parse time).
+    LuaValue lv = LuaValue(nullptr);
+    if (v.is_boolean()) lv = LuaValue(v.get<bool>());
+    else if (v.is_number_integer() || v.is_number_unsigned())
+        lv = LuaValue(static_cast<int64_t>(v.get<int64_t>()));
+    else if (v.is_number_float()) lv = LuaValue(v.get<double>());
+    else if (v.is_string()) lv = LuaValue(v.get_ref<const std::string&>());
+    co_return std::make_unique<SetNode>(id, std::move(name), std::move(key),
+                                        std::move(lv));
+}
+
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseWait(const json& j, ParseContext& ctx) {
-    // `min_timeout` (ms, default 1000) is the lower bound. `max_timeout` (ms)
-    // is optional: when absent the wait is FIXED at min_timeout; when present
-    // the wait is a uniformly random value in [min_timeout, max_timeout],
-    // re-rolled per run. 0 succeeds immediately.
-    int min_ms = ParamsInt(j, "min_timeout", 1000);
-    int max_ms = ParamsInt(j, "max_timeout", min_ms);  // absent → fixed at min
+    // `timeout` (ms): a number (fixed wait) or a [lo, hi] array (uniformly
+    // random in the inclusive range, re-rolled per run). Absent = fixed 1000.
+    // 0 succeeds immediately. The legacy min_timeout/max_timeout pair was
+    // removed — its presence is a hard error so stale trees fail at parse.
+    const json* params = nullptr;
+    if (j.contains("params") && j["params"].is_object()) params = &j["params"];
+    if (params && (params->contains("min_timeout") || params->contains("max_timeout"))) {
+        SetError(ctx, "Wait uses 'timeout' (number or [lo,hi]); min_timeout/max_timeout were removed");
+        co_return nullptr;
+    }
+    int lo_ms = 1000, hi_ms = 1000;
+    if (params && params->contains("timeout")) {
+        auto r = ParseScalarOrRange((*params)["timeout"]);
+        if (!r) {
+            SetError(ctx, "Wait 'timeout' must be a number or a [lo,hi] array");
+            co_return nullptr;
+        }
+        std::tie(lo_ms, hi_ms) = *r;
+        if (lo_ms < 0) lo_ms = 0;  // scalar negatives clamp; -1 is not infinite here
+        if (hi_ms < lo_ms) hi_ms = lo_ms;
+    }
     std::string name = j.value("name", "Wait");
     uint32_t id = ctx.next_id++;
-    auto node = std::make_unique<WaitNode>(id, std::move(name), min_ms, max_ms);
+    auto node = std::make_unique<WaitNode>(id, std::move(name), lo_ms, hi_ms);
     if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
     ReadDescription(j, node.get());
     co_return node;
@@ -693,6 +791,7 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseNode(const json& j, ParseCo
     if (type == "Subtree") co_return co_await ParseSubtree(j, ctx);
     if (type == "Repeat") co_return co_await ParseRepeat(j, ctx);
     if (type == "Retry") co_return co_await ParseRetry(j, ctx);
+    if (type == "Set") co_return co_await ParseSet(j, ctx);
     if (type == "Wait") co_return co_await ParseWait(j, ctx);
     if (type == "Inverter") co_return co_await ParseInverter(j, ctx);
     if (type == "Success" || type == "Failure") co_return co_await ParseConstant(j, ctx);

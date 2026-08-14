@@ -125,6 +125,7 @@ add_library(bernardx_lib STATIC
     src/bt/retry.cc
     src/bt/random_selector.cc
     src/bt/random_sequence.cc
+    src/bt/set_node.cc
     src/bt/wait_node.cc
 )
 target_include_directories(bernardx_lib PUBLIC src/lua src/bt)
