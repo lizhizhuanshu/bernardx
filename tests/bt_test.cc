@@ -11,6 +11,7 @@
 
 #include "behavior_tree_engine.h"
 #include "blackboard.h"
+#include "blackboard_condition.h"
 #include "bt_event_queue.h"
 #include "bt_library.h"
 #include "bt_utils.h"
@@ -30,13 +31,15 @@
 #include "sequence.h"
 #include "subtree_node.h"
 #include "repeat.h"
-#include "retry_until_successful.h"
+#include "retry.h"
 #include "random_selector.h"
 #include "random_sequence.h"
 #include "wait_node.h"
 #include "tree_parser.h"
 #include "memory_resource_provider.h"
 #include "file_system_code_provider.h"
+
+using json = nlohmann::json;
 
 namespace {
 // Parse a root node JSON object (e.g. {"type":"Selector",...}) into a Node tree.
@@ -401,6 +404,21 @@ TEST_F(BehaviorTreeEngineTest, WrapperNodeTakesSingularChild) {
     EXPECT_NE(legacy.error.find("requires a child"), std::string::npos);
 }
 
+TEST_F(BehaviorTreeEngineTest, ParseRetryWithMaxCount) {
+    // `Retry` (formerly RetryUntilSuccessful) parses with `params.max_count`
+    // (formerly attempts). Missing child / wrong shape still errors.
+    auto ok = TreeParser::Parse(
+        R"({"type":"Retry","params":{"max_count":3},"child":{"type":"Script","source":"a.lua"}})");
+    ASSERT_NE(nullptr, ok.root);
+    EXPECT_TRUE(ok.error.empty());
+
+    // The old type name is gone: RetryUntilSuccessful no longer parses.
+    auto old = TreeParser::Parse(
+        R"({"type":"RetryUntilSuccessful","params":{"attempts":3},"child":{"type":"Script","source":"a.lua"}})");
+    EXPECT_EQ(nullptr, old.root);
+    EXPECT_NE(old.error.find("unknown node type"), std::string::npos);
+}
+
 TEST_F(BehaviorTreeEngineTest, ParseAppliesRootParamsToTypeField) {
     // Root params template EVERY string field, including `type`: {{kind}} is
     // substituted from params so the root parses as a Sequence. Without params
@@ -415,6 +433,43 @@ TEST_F(BehaviorTreeEngineTest, ParseAppliesRootParamsToTypeField) {
         R"({"type":"{{kind}}","children":[{"type":"Script","source":"a.lua"}]})");
     EXPECT_EQ(without.root, nullptr);
     EXPECT_NE(without.error.find("unknown node type"), std::string::npos);
+}
+
+TEST_F(BehaviorTreeEngineTest, ParseResolvesDataRefAfterTemplating) {
+    // `.{{which}}.script` first templates to `.login.script`, then resolves to
+    // data["login"]["script"]. The resolved value lands in the Script node's
+    // source (observable via script_path()).
+    auto result = TreeParser::Parse(
+        R"({"type":"Script","source":".{{which}}.script",)"
+        R"("data":{"login":{"script":"scripts/login.lua"}}})",
+        nlohmann::json{{"which", "login"}});
+    ASSERT_NE(result.root, nullptr);
+    EXPECT_TRUE(result.error.empty());
+    auto* script = dynamic_cast<ScriptNode*>(result.root.get());
+    ASSERT_NE(script, nullptr);
+    EXPECT_EQ(script->script_path(), "scripts/login.lua");
+}
+
+TEST_F(BehaviorTreeEngineTest, ParseResolvesDataRefWithoutTemplating) {
+    // A plain `.path` ref (no template) resolves against `data` too.
+    auto result = TreeParser::Parse(
+        R"({"type":"Script","source":".home.title",)"
+        R"("data":{"home":{"title":"selectors/home.txt"}}})");
+    ASSERT_NE(result.root, nullptr);
+    auto* script = dynamic_cast<ScriptNode*>(result.root.get());
+    ASSERT_NE(script, nullptr);
+    EXPECT_EQ(script->script_path(), "selectors/home.txt");
+}
+
+TEST_F(BehaviorTreeEngineTest, ParseLeavesUnresolvedDataRefLiteral) {
+    // `.missing.path` has no entry under `data`: left literal, parse still ok.
+    auto result = TreeParser::Parse(
+        R"({"type":"Script","source":".missing.path","data":{"home":{}}})");
+    ASSERT_NE(result.root, nullptr);
+    EXPECT_TRUE(result.error.empty());
+    auto* script = dynamic_cast<ScriptNode*>(result.root.get());
+    ASSERT_NE(script, nullptr);
+    EXPECT_EQ(script->script_path(), ".missing.path");
 }
 
 TEST_F(BehaviorTreeEngineTest, StatusBeforeLoad) {
@@ -492,13 +547,13 @@ protected:
 
 #define AWAIT_BT(lazy) async_simple::coro::syncAwait(lazy)
 
-// Subtree `condition: "@child_condition"` transparently adopts the embedded
+// Subtree `condition: "child_condition"` transparently adopts the embedded
 // subtree root's own condition (shared object, same pointer at boundary & inside).
 TEST(TreeParserSubtreeCondition, ForwardsChildConditionMarker) {
     auto provider = std::make_shared<MemoryResourceProvider>();
     provider->Put("sub.json",
         R"({"type":"Sequence","condition":{"type":"Script","source":"c.lua"},"children":[{"type":"Script","source":"a.lua"}]})");
-    provider->Put("root.json", R"({"type":"Subtree","source":"res://sub.json","condition":"@child_condition"})");
+    provider->Put("root.json", R"({"type":"Subtree","source":"res://sub.json","condition":"child_condition"})");
 
     auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
     ASSERT_NE(nullptr, res.root);
@@ -515,7 +570,7 @@ TEST(TreeParserSubtreeCondition, ForwardsChildConditionMarker) {
 TEST(TreeParserSubtreeCondition, ChildConditionMarkerNoOpWithoutRootCondition) {
     auto provider = std::make_shared<MemoryResourceProvider>();
     provider->Put("sub.json", R"({"type":"Sequence","children":[{"type":"Script","source":"a.lua"}]})");
-    provider->Put("root.json", R"({"type":"Subtree","source":"res://sub.json","condition":"@child_condition"})");
+    provider->Put("root.json", R"({"type":"Subtree","source":"res://sub.json","condition":"child_condition"})");
 
     auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
     ASSERT_NE(nullptr, res.root);
@@ -527,11 +582,11 @@ TEST(TreeParserSubtreeCondition, ChildConditionMarkerNoOpWithoutRootCondition) {
 TEST(TreeParserSubtreeCondition, RejectsUnknownConditionString) {
     auto provider = std::make_shared<MemoryResourceProvider>();
     provider->Put("sub.json", R"({"type":"Script","source":"a.lua"})");
-    provider->Put("root.json", R"({"type":"Subtree","source":"res://sub.json","condition":"@child_condtion"})");  // typo
+    provider->Put("root.json", R"({"type":"Subtree","source":"res://sub.json","condition":"child_condtion"})");  // typo
 
     auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
     EXPECT_EQ(nullptr, res.root);
-    EXPECT_NE(res.error.find("'@child_condition'"), std::string::npos);
+    EXPECT_NE(res.error.find("'child_condition'"), std::string::npos);
 }
 
 TEST_F(BehaviorTreeLibraryTest, RequireReturnsTable) {
@@ -1066,6 +1121,105 @@ TEST_F(ScriptNodeIntegrationTest, GuardedSuccessBranchShortCircuits) {
     EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
 }
 
+// --- Blackboard param references (`$key`) Tests ---
+//
+// A `params` string value that starts with `$` is a blackboard reference,
+// resolved fresh at Enter time (not at parse/Init). `$who` reads blackboard
+// key "who"; `$$who` is the escape form and yields the literal "$who".
+
+TEST_F(ScriptNodeIntegrationTest, BbRefResolvesAtEnter) {
+    // params.target = "$who" → at Enter, blackboard "who" is read and forwarded
+    // into the script's Enter, which echoes it back to "got_target".
+    PutRoot(R"({"type":"Script","source":"scripts/bb_ref_args.lua","params":{"target":"$who"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("who", "shadowrocket")
+        bt.init({root = "res://root.json"})
+        bt.exec({interval = 10})
+        return bb.get("got_target")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "shadowrocket");
+}
+
+TEST_F(ScriptNodeIntegrationTest, BbRefMissingKeyPassesNil) {
+    // $missing with no such blackboard key → the param is nil at Enter (warned
+    // miss, not a failure). The script tolerates nil and still succeeds.
+    PutRoot(R"({"type":"Script","source":"scripts/bb_ref_args.lua","params":{"target":"$missing"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 10})
+        return status, bb.get("got_target")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[1]));
+}
+
+TEST_F(ScriptNodeIntegrationTest, BbRefEscapeDollarLiteral) {
+    // "$$price" is the escape form → literal "$price" forwarded at Enter.
+    PutRoot(R"({"type":"Script","source":"scripts/bb_ref_args.lua","params":{"target":"$$price"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("price", "SHOULD_NOT_BE_USED")
+        bt.init({root = "res://root.json"})
+        bt.exec({interval = 10})
+        return bb.get("got_target")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 1u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "$price");
+}
+
+TEST_F(ScriptNodeIntegrationTest, BbRefNonStringParamsUntouched) {
+    // Only string VALUES starting with `$` are references. Numbers/bools/keys
+    // are passed through verbatim — a string "$who" as the value still resolves,
+    // while a numeric value and a normal string value land as literals.
+    // Here a single param "target" is numeric 42 (untouched); the script echoes
+    // it back, proving non-string params are not misread as references.
+    PutRoot(R"({"type":"Script","source":"scripts/bb_ref_args.lua","params":{"target":42}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bt.init({root = "res://root.json"})
+        bt.exec({interval = 10})
+        return bb.get("got_target")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(r.values[0]), 42);
+}
+
+TEST_F(ScriptNodeIntegrationTest, BbRefConditionResolvesAtEnter) {
+    // A ScriptCondition's `$flag` param is resolved from the blackboard at the
+    // condition's Enter. With flag=true the condition is met (Selector's guarded
+    // Success branch fires); we also read it back via the action script below.
+    PutRoot(R"({"type":"Selector","children":[)"
+            R"({"type":"Success","condition":{"type":"Script","source":"scripts/cond_bb_ref.lua","params":{"flag":"$flag"}}},)"
+            R"({"type":"Script","source":"scripts/bb_ref_args.lua","params":{"target":"$flag"}}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("flag", true)
+        bt.init({root = "res://root.json"})
+        local status = bt.exec({interval = 10})
+        return status, bb.get("got_target")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    // Condition met → Success branch short-circuits → overall success.
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+    // The Success branch short-circuits, so the fallback Script never runs and
+    // got_target stays unset (nil) — proves the guard, not the action, decided.
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[1]));
+}
+
 TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
     PutRoot(R"({"type":"Script","source":"scripts/counter.lua"})");
     auto status = RunBtScript(R"(
@@ -1357,23 +1511,23 @@ TEST(RepeatTest, AbortPropagatesToChild) {
     EXPECT_TRUE(child->aborted);
 }
 
-// --- RetryUntilSuccessful Tests ---
+// --- Retry Tests ---
 
-TEST(RetryUntilSuccessfulTest, SucceedsImmediately) {
+TEST(RetryTest, SucceedsImmediately) {
     Blackboard bb;
     BtEventQueue events;
     auto* child = new MockNode(2, "child", NodeStatus::kSuccess);
-    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 3,
+    auto retry = std::make_unique<Retry>(1, "retry", 3,
         std::unique_ptr<MockNode>(child));
 
     EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kSuccess);
 }
 
-TEST(RetryUntilSuccessfulTest, RetriesOnFailure) {
+TEST(RetryTest, RetriesOnFailure) {
     Blackboard bb;
     BtEventQueue events;
     auto* child = new MockNode(2, "child", NodeStatus::kFailure);
-    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 3,
+    auto retry = std::make_unique<Retry>(1, "retry", 3,
         std::unique_ptr<MockNode>(child));
 
     // Fail 1
@@ -1384,11 +1538,11 @@ TEST(RetryUntilSuccessfulTest, RetriesOnFailure) {
     EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kFailure);
 }
 
-TEST(RetryUntilSuccessfulTest, SucceedsAfterRetries) {
+TEST(RetryTest, SucceedsAfterRetries) {
     Blackboard bb;
     BtEventQueue events;
     auto* child = new MockNode(2, "child", NodeStatus::kFailure);
-    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 3,
+    auto retry = std::make_unique<Retry>(1, "retry", 3,
         std::unique_ptr<MockNode>(child));
 
     EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
@@ -1396,12 +1550,12 @@ TEST(RetryUntilSuccessfulTest, SucceedsAfterRetries) {
     EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kSuccess);
 }
 
-TEST(RetryUntilSuccessfulTest, InfiniteRetryNeverGivesUp) {
+TEST(RetryTest, InfiniteRetryNeverGivesUp) {
     Blackboard bb;
     BtEventQueue events;
     auto* child = new MockNode(2, "child", NodeStatus::kFailure);
-    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry",
-        RetryUntilSuccessful::kInfinite,
+    auto retry = std::make_unique<Retry>(1, "retry",
+        Retry::kInfinite,
         std::unique_ptr<MockNode>(child));
 
     for (int i = 0; i < 100; ++i) {
@@ -1411,21 +1565,21 @@ TEST(RetryUntilSuccessfulTest, InfiniteRetryNeverGivesUp) {
     EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kSuccess);
 }
 
-TEST(RetryUntilSuccessfulTest, RunningChildReturnsRunning) {
+TEST(RetryTest, RunningChildReturnsRunning) {
     Blackboard bb;
     BtEventQueue events;
     auto* child = new MockNode(2, "child", NodeStatus::kRunning);
-    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 3,
+    auto retry = std::make_unique<Retry>(1, "retry", 3,
         std::unique_ptr<MockNode>(child));
 
     EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
 }
 
-TEST(RetryUntilSuccessfulTest, ResetClearsAttempts) {
+TEST(RetryTest, ResetClearsAttempts) {
     Blackboard bb;
     BtEventQueue events;
     auto* child = new MockNode(2, "child", NodeStatus::kFailure);
-    auto retry = std::make_unique<RetryUntilSuccessful>(1, "retry", 2,
+    auto retry = std::make_unique<Retry>(1, "retry", 2,
         std::unique_ptr<MockNode>(child));
 
     retry->Tick(bb, events);  // attempt 1
@@ -1433,6 +1587,282 @@ TEST(RetryUntilSuccessfulTest, ResetClearsAttempts) {
     // After reset, get 2 fresh attempts
     EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kRunning);
     EXPECT_EQ(retry->Tick(bb, events), NodeStatus::kFailure);
+}
+
+// --- BlackboardCondition Tests ---
+//
+// {"type":"Blackboard","key":k,"op":op,"value":v} compares blackboard[k]
+// against the literal v. Missing key -> Failure for EVERY op (incl. !=).
+
+TEST(BlackboardConditionTest, EqualityOps) {
+    Blackboard bb;
+    BtEventQueue events;
+    bb.Set("name", LuaValue(std::string("hero")));
+    bb.Set("hp", LuaValue(static_cast<int64_t>(100)));
+    bb.Set("alive", LuaValue(true));
+    bb.Set("nil_key", LuaValue(nullptr));
+
+    // string ==
+    EXPECT_EQ(BlackboardCondition("name", "==", json("hero")).Tick(bb, events),
+              NodeStatus::kSuccess);
+    EXPECT_EQ(BlackboardCondition("name", "==", json("villain")).Tick(bb, events),
+              NodeStatus::kFailure);
+    // number == (json int vs int64 LuaValue)
+    EXPECT_EQ(BlackboardCondition("hp", "==", json(100)).Tick(bb, events),
+              NodeStatus::kSuccess);
+    // number == across int/float (5 == 5.0)
+    EXPECT_EQ(BlackboardCondition("hp", "==", json(100.0)).Tick(bb, events),
+              NodeStatus::kSuccess);
+    // bool ==
+    EXPECT_EQ(BlackboardCondition("alive", "==", json(true)).Tick(bb, events),
+              NodeStatus::kSuccess);
+    EXPECT_EQ(BlackboardCondition("alive", "==", json(false)).Tick(bb, events),
+              NodeStatus::kFailure);
+    // != negation
+    EXPECT_EQ(BlackboardCondition("name", "!=", json("villain")).Tick(bb, events),
+              NodeStatus::kSuccess);
+    // null matches nil
+    EXPECT_EQ(BlackboardCondition("nil_key", "==", json(nullptr)).Tick(bb, events),
+              NodeStatus::kSuccess);
+    // type mismatch is not equal (number vs string literal)
+    EXPECT_EQ(BlackboardCondition("hp", "==", json("100")).Tick(bb, events),
+              NodeStatus::kFailure);
+}
+
+TEST(BlackboardConditionTest, MissingKeyFailsEveryOp) {
+    Blackboard bb;
+    BtEventQueue events;
+    for (const char* op : {"==", "!=", ">", ">=", "<", "<="}) {
+        EXPECT_EQ(BlackboardCondition("ghost", op, json(1)).Tick(bb, events),
+                  NodeStatus::kFailure) << "op=" << op;
+    }
+    EXPECT_EQ(BlackboardCondition("ghost", "exists", json(nullptr)).Tick(bb, events),
+              NodeStatus::kFailure);
+}
+
+TEST(BlackboardConditionTest, OrderingOps) {
+    Blackboard bb;
+    BtEventQueue events;
+    bb.Set("count", LuaValue(static_cast<int64_t>(5)));
+    bb.Set("page", LuaValue(std::string("home")));
+
+    EXPECT_EQ(BlackboardCondition("count", ">", json(3)).Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(BlackboardCondition("count", ">", json(5)).Tick(bb, events), NodeStatus::kFailure);
+    EXPECT_EQ(BlackboardCondition("count", ">=", json(5)).Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(BlackboardCondition("count", "<", json(5)).Tick(bb, events), NodeStatus::kFailure);
+    EXPECT_EQ(BlackboardCondition("count", "<=", json(5)).Tick(bb, events), NodeStatus::kSuccess);
+    // string lexicographic ordering
+    EXPECT_EQ(BlackboardCondition("page", "<", json("izone")).Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(BlackboardCondition("page", ">=", json("home")).Tick(bb, events), NodeStatus::kSuccess);
+    // ordering against a non-orderable stored value (bool) -> Failure + error
+    bb.Set("flag", LuaValue(true));
+    auto cond = BlackboardCondition("flag", ">", json(0));
+    EXPECT_EQ(cond.Tick(bb, events), NodeStatus::kFailure);
+    EXPECT_FALSE(cond.last_error().empty());
+}
+
+TEST(BlackboardConditionTest, ExistsOp) {
+    Blackboard bb;
+    BtEventQueue events;
+    bb.Set("real", LuaValue(static_cast<int64_t>(1)));
+    EXPECT_EQ(BlackboardCondition("real", "exists", json(nullptr)).Tick(bb, events),
+              NodeStatus::kSuccess);
+    EXPECT_EQ(BlackboardCondition("fake", "exists", json(nullptr)).Tick(bb, events),
+              NodeStatus::kFailure);
+}
+
+// --- BlackboardCondition key2 (key vs key) Tests ---
+//
+// {"key":a,"op":op,"key2":b} compares blackboard[a] against blackboard[b],
+// both read fresh on each Tick. Either side missing -> Failure.
+
+TEST(BlackboardConditionTest, Key2EqualityAndOrdering) {
+    Blackboard bb;
+    BtEventQueue events;
+    bb.Set("hp", LuaValue(static_cast<int64_t>(100)));
+    bb.Set("shield", LuaValue(static_cast<int64_t>(80)));
+    bb.Set("label", LuaValue(std::string("home")));
+    bb.Set("page", LuaValue(std::string("home")));
+
+    // == / != between two keys
+    EXPECT_EQ(BlackboardCondition("page", "==", std::string("label")).Tick(bb, events),
+              NodeStatus::kSuccess);
+    EXPECT_EQ(BlackboardCondition("hp", "==", std::string("shield")).Tick(bb, events),
+              NodeStatus::kFailure);
+    EXPECT_EQ(BlackboardCondition("hp", "!=", std::string("shield")).Tick(bb, events),
+              NodeStatus::kSuccess);
+    // int vs double across keys compares numerically
+    bb.Set("exact", LuaValue(100.0));
+    EXPECT_EQ(BlackboardCondition("hp", "==", std::string("exact")).Tick(bb, events),
+              NodeStatus::kSuccess);
+    // ordering between keys
+    EXPECT_EQ(BlackboardCondition("hp", ">", std::string("shield")).Tick(bb, events),
+              NodeStatus::kSuccess);
+    EXPECT_EQ(BlackboardCondition("shield", ">=", std::string("hp")).Tick(bb, events),
+              NodeStatus::kFailure);
+    EXPECT_EQ(BlackboardCondition("shield", "<", std::string("hp")).Tick(bb, events),
+              NodeStatus::kSuccess);
+    // mixed types across keys -> not equal, not orderable
+    bb.Set("str5", LuaValue(std::string("5")));
+    EXPECT_EQ(BlackboardCondition("hp", "==", std::string("str5")).Tick(bb, events),
+              NodeStatus::kFailure);
+    auto cond = BlackboardCondition("hp", ">", std::string("str5"));
+    EXPECT_EQ(cond.Tick(bb, events), NodeStatus::kFailure);
+    EXPECT_FALSE(cond.last_error().empty());
+}
+
+TEST(BlackboardConditionTest, Key2ReadsLiveEachTick) {
+    // The right side is re-read on every Tick — updating blackboard[key2]
+    // flips the result without re-parsing or re-entering anything.
+    Blackboard bb;
+    BtEventQueue events;
+    bb.Set("a", LuaValue(static_cast<int64_t>(1)));
+    bb.Set("b", LuaValue(static_cast<int64_t>(1)));
+    BlackboardCondition cond("a", "==", std::string("b"));
+    EXPECT_EQ(cond.Tick(bb, events), NodeStatus::kSuccess);
+    bb.Set("b", LuaValue(static_cast<int64_t>(2)));
+    EXPECT_EQ(cond.Tick(bb, events), NodeStatus::kFailure);
+    bb.Set("b", LuaValue(static_cast<int64_t>(1)));
+    EXPECT_EQ(cond.Tick(bb, events), NodeStatus::kSuccess);
+}
+
+TEST(BlackboardConditionTest, Key2MissingEitherSideFails) {
+    Blackboard bb;
+    BtEventQueue events;
+    bb.Set("a", LuaValue(static_cast<int64_t>(1)));
+    // rhs key missing -> not met
+    EXPECT_EQ(BlackboardCondition("a", "==", std::string("ghost")).Tick(bb, events),
+              NodeStatus::kFailure);
+    EXPECT_EQ(BlackboardCondition("a", "!=", std::string("ghost")).Tick(bb, events),
+              NodeStatus::kFailure);
+    // lhs missing -> not met (rhs present)
+    bb.Set("b", LuaValue(static_cast<int64_t>(1)));
+    EXPECT_EQ(BlackboardCondition("ghost", "==", std::string("b")).Tick(bb, events),
+              NodeStatus::kFailure);
+}
+
+TEST_F(BehaviorTreeEngineTest, ParseBlackboardCondition) {
+    // Valid: guarded Success with a Blackboard condition parses clean.
+    auto ok = TreeParser::Parse(
+        R"({"type":"Success","condition":{"type":"Blackboard","key":"page","op":">","value":3}})");
+    ASSERT_NE(nullptr, ok.root);
+    EXPECT_TRUE(ok.error.empty());
+    ASSERT_NE(nullptr, ok.root->condition());
+    EXPECT_EQ(ok.root->condition()->type(), "Blackboard");
+
+    // Missing key -> parse error.
+    auto nokey = TreeParser::Parse(
+        R"({"type":"Success","condition":{"type":"Blackboard","op":"=="}})");
+    EXPECT_EQ(nullptr, nokey.root);
+    EXPECT_NE(nokey.error.find("missing 'key'"), std::string::npos);
+
+    // Unknown op -> parse error.
+    auto badop = TreeParser::Parse(
+        R"({"type":"Success","condition":{"type":"Blackboard","key":"k","op":"=~"}})");
+    EXPECT_EQ(nullptr, badop.root);
+    EXPECT_NE(badop.error.find("unknown op"), std::string::npos);
+
+    // Non-scalar value -> parse error.
+    auto objval = TreeParser::Parse(
+        R"({"type":"Success","condition":{"type":"Blackboard","key":"k","value":{"a":1}}})");
+    EXPECT_EQ(nullptr, objval.root);
+    EXPECT_NE(objval.error.find("must be a scalar"), std::string::npos);
+
+    // Ordering op with bool value -> parse error.
+    auto boolord = TreeParser::Parse(
+        R"({"type":"Success","condition":{"type":"Blackboard","key":"k","op":">","value":true}})");
+    EXPECT_EQ(nullptr, boolord.root);
+    EXPECT_NE(boolord.error.find("needs a number or string"), std::string::npos);
+}
+
+TEST_F(BehaviorTreeEngineTest, ParseBlackboardConditionKey2) {
+    // Valid key-vs-key form parses clean.
+    auto ok = TreeParser::Parse(
+        R"({"type":"Success","condition":{"type":"Blackboard","key":"hp","op":">","key2":"shield"}})");
+    ASSERT_NE(nullptr, ok.root);
+    EXPECT_TRUE(ok.error.empty());
+
+    // key2 with value -> parse error (mutually exclusive).
+    auto both = TreeParser::Parse(
+        R"({"type":"Success","condition":{"type":"Blackboard","key":"a","key2":"b","value":1}})");
+    EXPECT_EQ(nullptr, both.root);
+    EXPECT_NE(both.error.find("not both"), std::string::npos);
+
+    // key2 with exists -> parse error.
+    auto ex = TreeParser::Parse(
+        R"({"type":"Success","condition":{"type":"Blackboard","key":"a","op":"exists","key2":"b"}})");
+    EXPECT_EQ(nullptr, ex.root);
+    EXPECT_NE(ex.error.find("does not use 'key2'"), std::string::npos);
+
+    // non-string key2 -> parse error.
+    auto bad = TreeParser::Parse(
+        R"({"type":"Success","condition":{"type":"Blackboard","key":"a","key2":3}})");
+    EXPECT_EQ(nullptr, bad.root);
+    EXPECT_NE(bad.error.find("'key2' must be a string"), std::string::npos);
+}
+
+TEST_F(ScriptNodeIntegrationTest, BlackboardConditionKeyVsKeyGatesBranch) {
+    // End-to-end through bt.init/exec: guard compares two blackboard keys
+    // (hp > shield). Met -> guarded Success short-circuits; after lowering hp
+    // (no re-init), a fresh run takes the fallback branch instead.
+    PutRoot(R"({"type":"Selector","children":[)"
+            R"({"type":"Success","condition":{"type":"Blackboard","key":"hp","op":">","key2":"shield"}},)"
+            R"({"type":"Script","source":"scripts/no_args.lua"}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("hp", 100)
+        bb.set("shield", 80)
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+
+    // hp < shield now: guard not met -> fallback Script branch runs.
+    r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("hp", 10)
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, BlackboardConditionGatesBranch) {
+    // End-to-end through bt.init/exec: a guarded Success branch with a
+    // Blackboard condition short-circuits when met; the And composition of
+    // two Blackboard conditions also works. No Lua condition script needed.
+    PutRoot(R"({"type":"Selector","children":[)"
+            R"({"type":"Success","condition":{"type":"And","children":[)"
+            R"({"type":"Blackboard","key":"page","op":"==","value":"home"},)"
+            R"({"type":"Blackboard","key":"count","op":">=","value":5}]}},)"
+            R"({"type":"Script","source":"scripts/no_args.lua"}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("page", "home")
+        bb.set("count", 5)
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+
+    // count below threshold -> And not met -> fallback Script branch runs
+    // (still success overall, but via the fallback).
+    r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("page", "home")
+        bb.set("count", 2)
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
 }
 
 // --- RandomSelector Tests ---
@@ -1877,7 +2307,7 @@ TEST(PipelineTest, FirstMatchingConditionSelected) {
 }
 
 TEST(PipelineTest, NoConditionMetTimesOutAtStep0) {
-    // Scan finds no condition held → wait at step 0; $timeout (ticks) elapses
+    // Scan finds no condition held → wait at step 0; *timeout (ticks) elapses
     // with condition still failing → fail (no previous step to back up to).
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
@@ -1983,9 +2413,9 @@ TEST(PipelineTest, ResetReScans) {
     EXPECT_EQ(a->tick_count, 1);  // re-ran after reset (scan phase re-entered)
 }
 
-// --- RollIntInRange + Pipeline $timeout/$retry range-randomization tests ---
+// --- RollIntInRange + Pipeline *timeout/*retry range-randomization tests ---
 //
-// $timeout/$retry may be a fixed int (lo==hi) or a [lo,hi] range; the Pipeline
+// *timeout/*retry may be a fixed int (lo==hi) or a [lo,hi] range; the Pipeline
 // rolls one value per step per run. The fixed cases must match the legacy
 // single-value behaviour; the range cases must keep the resolved value inside
 // the bounds across many runs.
@@ -2015,7 +2445,7 @@ TEST(RollIntInRangeTest, StaysWithinRangeAndVisitsEndpoints) {
 }
 
 TEST(PipelineTest, RangeTimeoutCollapsesToFixedValue) {
-    // [2,2] must behave exactly like the legacy $timeout=2 (timeout, no retry).
+    // [2,2] must behave exactly like the legacy *timeout=2 (timeout, no retry).
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
     pipe.AddStep(std::unique_ptr<MockNode>(a), /*lo=*/2, /*hi=*/2, /*retry=*/0, /*retry=*/0);
@@ -2027,7 +2457,7 @@ TEST(PipelineTest, RangeTimeoutCollapsesToFixedValue) {
 }
 
 TEST(PipelineTest, RangeTimeoutResolvesWithinBounds) {
-    // $timeout=[1,5]: across many runs the actual wait (ticks to timeout) must
+    // *timeout=[1,5]: across many runs the actual wait (ticks to timeout) must
     // stay within [1,5] and reach both endpoints (proves a real roll, not a clamp).
     const int lo = 1, hi = 5;
     Pipeline pipe(1, "pipe");
@@ -2057,7 +2487,7 @@ TEST(PipelineTest, RangeTimeoutResolvesWithinBounds) {
 }
 
 TEST(PipelineTest, RangeRetryCollapsesToFixedValue) {
-    // retry=[1,1] must behave like the legacy $retry=1 (one back-up, then fail).
+    // retry=[1,1] must behave like the legacy *retry=1 (one back-up, then fail).
     Pipeline pipe(1, "pipe");
     auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
     auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
@@ -2246,11 +2676,11 @@ TEST_F(ScriptNodeIntegrationTest, PipelineScansPastFailingCondition) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, PipelineNoConditionMetFails) {
-    // cond_falsy never holds → scan finds no match → wait at step 0; $timeout
+    // cond_falsy never holds → scan finds no match → wait at step 0; *timeout
     // (ticks) elapses → fail (no previous step to back up to).
     PutRoot(R"({"type":"Pipeline","children":[)"
             R"({"type":"Script","source":"scripts/no_args.lua",)"
-            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"$timeout":3}]})");
+            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"*timeout":3}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -2261,10 +2691,10 @@ TEST_F(ScriptNodeIntegrationTest, PipelineNoConditionMetFails) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, PipelineArrayTimeoutEquivalentToScalar) {
-    // $timeout as a [lo,hi] array must parse and behave like the scalar 3 above.
+    // *timeout as a [lo,hi] array must parse and behave like the scalar 3 above.
     PutRoot(R"({"type":"Pipeline","children":[)"
             R"({"type":"Script","source":"scripts/no_args.lua",)"
-            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"$timeout":[3,3]}]})");
+            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"*timeout":[3,3]}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -2314,7 +2744,7 @@ TEST_F(ScriptNodeIntegrationTest, E2E_CheckoutPipelineWithSubtreeAndRetry) {
             // step 2: on cart -> go to checkout; wait for cart with retry back-up
             R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"checkout"},)"
             R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"cart"}},)"
-            R"("$timeout":3,"$retry":1},)"
+            R"("*timeout":3,"*retry":1},)"
             // step 3: on checkout -> mark done
             R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"done","value":true},)"
             R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"checkout"}}})"

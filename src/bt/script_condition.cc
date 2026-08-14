@@ -27,14 +27,41 @@ async_simple::coro::Lazy<bool> ScriptCondition::Init(lua_State* L, LuaRuntime* c
         set_last_error(host_.last_error_);
         co_return false;
     }
-    // Resolve params now that a lua_State is available (tables -> LuaRef).
+    // Resolve params now that a lua_State is available (tables -> LuaRef). A
+    // string value beginning with `$` is a blackboard reference (`$key`) or an
+    // escaped literal (`$$..`); refs are read fresh from the blackboard at Enter.
     if (params_json_.is_object()) {
         for (auto it = params_json_.begin(); it != params_json_.end(); ++it) {
+            if (it.value().is_string()) {
+                auto cls = ResolveBbParamMarker(it.value().get_ref<const std::string&>());
+                if (auto* ref = std::get_if<BbParamRef>(&cls)) {
+                    bb_refs_[it.key()] = std::move(*ref);
+                    continue;
+                }
+                if (auto* lit = std::get_if<std::string>(&cls)) {
+                    args_[it.key()] = LuaValue(*lit);
+                    continue;
+                }
+            }
             args_[it.key()] = JsonToLuaValue(host_.main_L_, ctx, it.value());
         }
         params_json_ = nlohmann::json::object();
     }
     co_return true;
+}
+
+ScriptCondition::ArgsMap ScriptCondition::ResolveArgsForEnter(Blackboard& bb) const {
+    ArgsMap enter_args = args_;
+    for (const auto& [param_name, ref] : bb_refs_) {
+        auto v = bb.Get(ref.key);
+        if (v.has_value()) {
+            enter_args[param_name] = std::move(*v);
+        } else {
+            spdlog::warn("ScriptCondition '{}': blackboard param '{}' key '{}' not set at Enter",
+                         name_, param_name, ref.key);
+        }
+    }
+    return enter_args;
 }
 
 NodeStatus ScriptCondition::ParseReturnValue(const LuaValue& v) {
@@ -72,7 +99,7 @@ void ScriptCondition::CallExit(const std::string& reason) {
     }
 }
 
-NodeStatus ScriptCondition::Tick(Blackboard& /*bb*/, BtEventQueue& /*events*/) {
+NodeStatus ScriptCondition::Tick(Blackboard& bb, BtEventQueue& /*events*/) {
     if (!is_loaded() || !host_.main_L_ || !host_.lua_context_) {
         set_last_error("'" + name_ + "' condition not loaded");
         return NodeStatus::kFailure;
@@ -106,7 +133,7 @@ NodeStatus ScriptCondition::Tick(Blackboard& /*bb*/, BtEventQueue& /*events*/) {
             lua_State* co = host_.lua_context_->AcquireCoroutine();
             lua_rawgeti(co, LUA_REGISTRYINDEX, host_.refs_.enter_ref);
             lua_rawgeti(co, LUA_REGISTRYINDEX, host_.refs_.table_ref);
-            PushArgsTable(co, args_);
+            PushArgsTable(co, ResolveArgsForEnter(bb));
 
             bool yielded = host_.lua_context_->CallWithCallback(co, 2,
                 [this](ScriptResult r) {

@@ -19,6 +19,7 @@
 #include "composite.h"
 #include "condition_composite.h"
 #include "constant_node.h"
+#include "blackboard_condition.h"
 #include "inverter.h"
 #include "lua_types.h"
 #include "node.h"
@@ -28,7 +29,7 @@
 #include "random_selector.h"
 #include "random_sequence.h"
 #include "repeat.h"
-#include "retry_until_successful.h"
+#include "retry.h"
 #include "script_condition.h"
 #include "script_node.h"
 #include "selector.h"
@@ -155,6 +156,67 @@ void SubstituteTemplates(json& target, const json& params) {
     target = SubstitutePartial(s, params);
 }
 
+// --- Data references (`.path`) ---
+//
+// A root JSON may carry a top-level `data` object: a lookup table of named
+// values (e.g. per-screen selectors). Any string value anywhere in the tree
+// that begins with '.' is treated as a data reference — the remainder is read
+// as a dot-separated path into `data` and the whole value is replaced by what
+// is found there (type preserved: a looked-up object stays an object). A miss
+// is left literal with a warning. This runs AFTER template substitution, so
+// `.{{target}}.title` first becomes `.Home.title` (templated), then resolves to
+// data["Home"]["title"]. `data` itself is stripped from the tree before
+// parsing: it is lookup state, not a node, and removing it prevents accidental
+// self-reference during the walk.
+
+// Resolve a dot-separated `path` (e.g. "Home.title") against `data`. Returns a
+// pointer to the value found, or nullptr on any miss / empty segment.
+const json* LookupDataPath(const json& data, const std::string& path) {
+    const json* cur = &data;
+    size_t start = 0;
+    while (true) {
+        size_t dot = path.find('.', start);
+        std::string seg = (dot == std::string::npos)
+                              ? path.substr(start)
+                              : path.substr(start, dot - start);
+        if (seg.empty()) return nullptr;
+        if (!cur->is_object() || !cur->contains(seg)) return nullptr;
+        cur = &(*cur)[seg];
+        if (dot == std::string::npos) break;
+        start = dot + 1;
+    }
+    return cur;
+}
+
+// Walk `target` and resolve every `.path` string against `data` (type
+// preserving on hit, left literal with a warning on miss).
+void ResolveDataRefs(json& target, const json& data) {
+    if (target.is_object() || target.is_array()) {
+        for (auto& el : target) ResolveDataRefs(el, data);
+        return;
+    }
+    if (!target.is_string()) return;
+    std::string s = target.get<std::string>();
+    if (s.empty() || s[0] != '.') return;
+    std::string path = TrimWs(s.substr(1));
+    if (path.empty()) return;  // lone '.' — leave literal
+    const json* found = LookupDataPath(data, path);
+    if (found) {
+        target = *found;
+    } else {
+        spdlog::warn("TreeParser: data reference '{}' not found under 'data'", path);
+    }
+}
+
+// Extract the root's `data` object (if any), strip it from the tree, then
+// resolve `.path` references across the whole tree against it.
+void ApplyDataResolution(json& root_j) {
+    if (!root_j.contains("data") || !root_j["data"].is_object()) return;
+    json data = root_j["data"];
+    root_j.erase("data");
+    if (!data.empty()) ResolveDataRefs(root_j, data);
+}
+
 // Read a scalar knob from the node's `params` object (e.g. Wait.ms,
 // Repeat.count, Parallel.success_policy). Returns `def` if absent/wrong type.
 std::string ParamsString(const json& j, const char* key, std::string def) {
@@ -226,6 +288,59 @@ ParseCondition(const json& j, ParseContext& ctx) {
         json params = j.value("params", json::object());
         co_return std::make_unique<ScriptCondition>(std::move(name), std::move(source),
                                                      std::move(params));
+    }
+
+    if (type == "Blackboard") {
+        // {"type":"Blackboard","key":"page","op":"==","value":"home"}   key vs literal
+        // {"type":"Blackboard","key":"hp","op":">","key2":"shield"}    key vs key (live)
+        // op ∈ {"==","!=",">",">=","<","<=","exists"} (default "=="); value
+        // must be a scalar; key2 (string) is mutually exclusive with value
+        // and invalid for "exists". Validated here so a bad tree fails at
+        // parse, not mid-run.
+        if (!j.contains("key") || !j["key"].is_string()) {
+            SetError(ctx, "Blackboard condition missing 'key'");
+            co_return nullptr;
+        }
+        static const std::set<std::string> kOps = {
+            "==", "!=", ">", ">=", "<", "<=", "exists"};
+        std::string op = j.value("op", "==");
+        if (!kOps.count(op)) {
+            SetError(ctx, "Blackboard condition unknown op '" + op + "'");
+            co_return nullptr;
+        }
+        std::string key2;
+        if (j.contains("key2")) {
+            if (!j["key2"].is_string()) {
+                SetError(ctx, "Blackboard condition 'key2' must be a string");
+                co_return nullptr;
+            }
+            if (j.contains("value")) {
+                SetError(ctx, "Blackboard condition: use 'value' or 'key2', not both");
+                co_return nullptr;
+            }
+            if (op == "exists") {
+                SetError(ctx, "Blackboard condition 'exists' does not use 'key2'");
+                co_return nullptr;
+            }
+            key2 = j["key2"].get<std::string>();
+            co_return std::make_unique<BlackboardCondition>(
+                j["key"].get<std::string>(), std::move(op), std::move(key2));
+        }
+        json value = j.contains("value") ? j["value"] : json(nullptr);
+        bool scalar = value.is_null() || value.is_boolean() ||
+                      value.is_number() || value.is_string();
+        if (!scalar) {
+            SetError(ctx, "Blackboard condition 'value' must be a scalar");
+            co_return nullptr;
+        }
+        if (op != "==" && op != "!=" && op != "exists" &&
+            !(value.is_number() || value.is_string())) {
+            SetError(ctx, "Blackboard condition op '" + op +
+                              "' needs a number or string 'value'");
+            co_return nullptr;
+        }
+        co_return std::make_unique<BlackboardCondition>(
+            j["key"].get<std::string>(), std::move(op), std::move(value));
     }
 
     if (type == "And" || type == "Or") {
@@ -318,7 +433,7 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseComposite(const json& j, Pa
     co_return node;
 }
 
-// Parses a $timeout/$retry edge param: an integer (→ fixed value) or a
+// Parses a *timeout/*retry edge param: an integer (→ fixed value) or a
 // [lo, hi] array (→ inclusive random range the Pipeline resolves per run).
 // Negative values clamp to 0. A scalar or single-element array yields {v, v};
 // out-of-order pairs are normalized to {min, max}. Returns {0, 0} for absent
@@ -343,12 +458,12 @@ std::pair<int, int> ParseIntRange(const json& v) {
 // Pipeline: scan-to-start + wait/retry composite. Each child is a normal node
 // (built by ParseNode) and may carry its own `condition` guard (set via
 // ApplyCondition inside ParseNode's helpers) plus two Pipeline edge params:
-//   `$timeout` (int or [lo,hi] TICKS) — ticks to wait for this step's
+//   `*timeout` (int or [lo,hi] TICKS) — ticks to wait for this step's
 //                                condition (0 / absent = wait forever);
-//   `$retry`   (int or [lo,hi])      — max back-up re-runs of the previous
+//   `*retry`   (int or [lo,hi])      — max back-up re-runs of the previous
 //                                step's action when this wait times out.
 // Each may be a scalar (fixed) or a two-element array (uniformly random in the
-// inclusive range; resolved per step per run). These `$`-prefixed keys are
+// inclusive range; resolved per step per run). These `*`-prefixed keys are
 // intentionally distinct from node-own fields (source/condition/params); the
 // node itself ignores them, the Pipeline reads them here. The Pipeline node
 // may also be guarded, so nested pipelines work.
@@ -369,12 +484,12 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParsePipeline(const json& j, Par
         auto child = co_await ParseNode(child_j, ctx);
         if (!child) co_return nullptr;
         int timeout_lo = 0, timeout_hi = 0;
-        if (child_j.contains("$timeout")) {
-            std::tie(timeout_lo, timeout_hi) = ParseIntRange(child_j["$timeout"]);
+        if (child_j.contains("*timeout")) {
+            std::tie(timeout_lo, timeout_hi) = ParseIntRange(child_j["*timeout"]);
         }
         int retry_lo = 0, retry_hi = 0;
-        if (child_j.contains("$retry")) {
-            std::tie(retry_lo, retry_hi) = ParseIntRange(child_j["$retry"]);
+        if (child_j.contains("*retry")) {
+            std::tie(retry_lo, retry_hi) = ParseIntRange(child_j["*retry"]);
         }
         node->AddStep(std::move(child), timeout_lo, timeout_hi, retry_lo, retry_hi);
     }
@@ -453,28 +568,28 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseSubtree(const json& j, Pars
     uint32_t id = ctx.next_id++;
     auto node = std::make_unique<SubtreeNode>(id, std::move(name), std::move(source), std::move(sub_root));
     // A Subtree `condition` is normally a guard object. The special string
-    // "@child_condition" instead transparently adopts the embedded subtree
+    // "child_condition" instead transparently adopts the embedded subtree
     // root's own condition (shared, not copied) — so a parent can gate entry
     // to the subtree on a condition defined inside the subtree file. If the
     // root has no condition, the marker is a no-op (warned).
     if (j.contains("condition")) {
         if (j["condition"].is_string()) {
-            if (j["condition"].get<std::string>() == "@child_condition") {
+            if (j["condition"].get<std::string>() == "child_condition") {
                 auto child_cond = node->child()->shared_condition();
                 if (child_cond) {
                     node->SetCondition(child_cond);
                 } else {
-                    spdlog::warn("TreeParser: Subtree '{}' marks condition '@child_condition' but its root has no condition",
+                    spdlog::warn("TreeParser: Subtree '{}' marks condition 'child_condition' but its root has no condition",
                                  node->subtree_name());
                 }
             } else {
-                SetError(ctx, "Subtree condition string must be '@child_condition'");
+                SetError(ctx, "Subtree condition string must be 'child_condition'");
                 co_return nullptr;
             }
         } else if (j["condition"].is_object()) {
             if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
         } else {
-            SetError(ctx, "Subtree condition must be an object or '@child_condition'");
+            SetError(ctx, "Subtree condition must be an object or 'child_condition'");
             co_return nullptr;
         }
     }
@@ -507,12 +622,12 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRepeat(const json& j, Parse
 }
 
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRetry(const json& j, ParseContext& ctx) {
-    auto child = co_await ParseSingleChild(j, ctx, "RetryUntilSuccessful node requires a child");
+    auto child = co_await ParseSingleChild(j, ctx, "Retry node requires a child");
     if (!child) co_return nullptr;
-    int attempts = ParamsInt(j, "attempts", RetryUntilSuccessful::kInfinite);
-    std::string name = j.value("name", "RetryUntilSuccessful");
+    int max_count = ParamsInt(j, "max_count", Retry::kInfinite);
+    std::string name = j.value("name", "Retry");
     uint32_t id = ctx.next_id++;
-    auto node = std::make_unique<RetryUntilSuccessful>(id, std::move(name), attempts, std::move(child));
+    auto node = std::make_unique<Retry>(id, std::move(name), max_count, std::move(child));
     if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
     ReadDescription(j, node.get());
     co_return node;
@@ -577,7 +692,7 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseNode(const json& j, ParseCo
     if (type == "Script") co_return co_await ParseScriptLeaf(j, ctx);
     if (type == "Subtree") co_return co_await ParseSubtree(j, ctx);
     if (type == "Repeat") co_return co_await ParseRepeat(j, ctx);
-    if (type == "RetryUntilSuccessful") co_return co_await ParseRetry(j, ctx);
+    if (type == "Retry") co_return co_await ParseRetry(j, ctx);
     if (type == "Wait") co_return co_await ParseWait(j, ctx);
     if (type == "Inverter") co_return co_await ParseInverter(j, ctx);
     if (type == "Success" || type == "Failure") co_return co_await ParseConstant(j, ctx);
@@ -620,6 +735,10 @@ TreeParser::LoadAndParse(const std::string& root_path,
         SubstituteTemplates(root_j, params);
     }
 
+    // Resolve `.path` data references against the root's optional `data`
+    // object (after templating, so `.{{key}}.field` resolves end-to-end).
+    ApplyDataResolution(root_j);
+
     ParseContext ctx;
     ctx.provider = provider;
 
@@ -652,6 +771,10 @@ ParseResult TreeParser::Parse(const std::string& root_json, nlohmann::json param
     if (params.is_object() && !params.empty()) {
         SubstituteTemplates(root_j, params);
     }
+
+    // Resolve `.path` data references against the root's optional `data`
+    // object (after templating, so `.{{key}}.field` resolves end-to-end).
+    ApplyDataResolution(root_j);
 
     ParseContext ctx;  // no provider -> Subtree nodes unsupported
     auto root = async_simple::coro::syncAwait(ParseNode(root_j, ctx));

@@ -4,6 +4,7 @@
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 extern "C" {
@@ -16,6 +17,44 @@ extern "C" {
 #include "lua_runtime.h"
 #include "lua_types.h"
 #include "time_utils.h"
+
+// --- Blackboard param references (`$key`) ---
+//
+// A Script node/condition `params` value that is a string starting with `$` is
+// NOT a literal: at the node's Enter time the `$`-prefixed value is read from
+// the blackboard and forwarded into Enter as that param's value. `$foo` reads
+// blackboard key "foo". `$$foo` is the escape form — it yields the literal
+// string "$foo" (a leading `$$` collapses to a single `$`). Only string VALUES
+// are inspected, and only when the first character is `$`; any other string is
+// passed through verbatim. Resolution happens at Enter (blackboard state is
+// dynamic), not at parse/Init time.
+struct BbParamRef {
+    std::string key;  // blackboard key to read at Enter (the `$`-suffix)
+};
+
+// Classify a param string value. Returns:
+//   - monostate      -> not a `$` value; caller keeps the original value.
+//   - std::string    -> an escaped literal (leading `$$` collapsed to `$`);
+//                       caller stores this literal string in place of the raw.
+//   - BbParamRef     -> a blackboard reference to resolve at Enter.
+//
+// Rules (examined only when the first char is `$`):
+//   "$foo"  -> BbParamRef{"foo"}
+//   "$$"    -> literal "$"        (degenerate escape)
+//   "$$foo" -> literal "$foo"
+//   "$"     -> literal "$"        (lone `$`, no key)
+//   "abc"   -> monostate (untouched)
+inline std::variant<std::monostate, std::string, BbParamRef>
+ResolveBbParamMarker(const std::string& s) {
+    if (s.empty() || s[0] != '$') return std::monostate{};
+    if (s.size() >= 2 && s[1] == '$') {
+        // Escape: drop the leading `$$`, prepend one literal `$`.
+        return std::string{"$" + s.substr(2)};
+    }
+    std::string key = s.substr(1);
+    if (key.empty()) return std::string{"$"};  // lone `$` -> literal
+    return BbParamRef{std::move(key)};
+}
 
 inline void ReleaseLuaRef(lua_State* L, int& ref) {
     if (ref != LUA_NOREF) {

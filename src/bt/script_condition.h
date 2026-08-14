@@ -12,6 +12,7 @@ extern "C" {
 
 #include <async_simple/coro/Lazy.h>
 
+#include "bt_utils.h"
 #include "lua_runtime.h"
 #include "lua_script_host.h"
 #include "lua_types.h"
@@ -53,10 +54,17 @@ private:
     NodeStatus HandleResult(const ScriptResult& result);
     void CallExit(const std::string& reason);
 
+    // Build the Enter params table: starts from `args_` and overlays any
+    // `$key` blackboard references (`bb_refs_`), read fresh at Enter time.
+    ArgsMap ResolveArgsForEnter(Blackboard& bb) const;
+
     std::string name_;
     std::string script_path_;
     nlohmann::json params_json_;
     ArgsMap args_;
+    // Param values that begin with `$` (a blackboard reference). Not in args_;
+    // resolved against the blackboard on each Enter. Keyed by the param name.
+    std::unordered_map<std::string, BbParamRef> bb_refs_;
     LuaScriptHost host_;
 
     bool active_ = false;

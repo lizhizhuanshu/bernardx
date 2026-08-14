@@ -1,12 +1,11 @@
-#include "retry_until_successful.h"
+#include "retry.h"
 
-RetryUntilSuccessful::RetryUntilSuccessful(uint32_t id, std::string name,
-                                           int max_attempts,
-                                           std::unique_ptr<Node> child)
-    : SingleChildNode(id, "RetryUntilSuccessful", std::move(name), std::move(child)),
-      max_attempts_(max_attempts) {}
+Retry::Retry(uint32_t id, std::string name, int max_count,
+             std::unique_ptr<Node> child)
+    : SingleChildNode(id, "Retry", std::move(name), std::move(child)),
+      max_count_(max_count) {}
 
-NodeStatus RetryUntilSuccessful::Tick(Blackboard& bb, BtEventQueue& events) {
+NodeStatus Retry::Tick(Blackboard& bb, BtEventQueue& events) {
     if (!child_) {
         set_last_error("no child node");
         return NodeStatus::kFailure;
@@ -21,7 +20,7 @@ NodeStatus RetryUntilSuccessful::Tick(Blackboard& bb, BtEventQueue& events) {
     }
 
     ++attempt_count_;
-    if (max_attempts_ != kInfinite && attempt_count_ >= max_attempts_) {
+    if (max_count_ != kInfinite && attempt_count_ >= max_count_) {
         set_last_error(child_->last_error());
         return NodeStatus::kFailure;
     }
@@ -30,7 +29,7 @@ NodeStatus RetryUntilSuccessful::Tick(Blackboard& bb, BtEventQueue& events) {
     return NodeStatus::kRunning;
 }
 
-void RetryUntilSuccessful::Reset() {
+void Retry::Reset() {
     attempt_count_ = 0;
     SingleChildNode::Reset();
 }

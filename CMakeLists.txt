@@ -112,6 +112,7 @@ add_library(bernardx_lib STATIC
     src/bt/lua_script_host.cc
     src/bt/script_node.cc
     src/bt/script_condition.cc
+    src/bt/blackboard_condition.cc
     src/bt/condition_composite.cc
     src/bt/node.cc
     src/bt/composite.cc
@@ -121,7 +122,7 @@ add_library(bernardx_lib STATIC
     src/bt/parallel.cc
     src/bt/inverter.cc
     src/bt/repeat.cc
-    src/bt/retry_until_successful.cc
+    src/bt/retry.cc
     src/bt/random_selector.cc
     src/bt/random_sequence.cc
     src/bt/wait_node.cc

@@ -43,9 +43,18 @@ private:
     NodeStatus HandleEnterResult(const ScriptResult& result);
     NodeStatus HandleScriptResult(const ScriptResult& result);
 
+    // Build the Enter params table: starts from `args_` (statically-resolved
+    // params) and overlays any `$key` blackboard references (`bb_refs_`), read
+    // fresh from `bb` at Enter time. A missing key yields nil (a warned miss,
+    // not inserted) — matching the `#path` data-reference miss behavior.
+    ArgsMap ResolveArgsForEnter(Blackboard& bb) const;
+
     std::string script_path_;
     nlohmann::json params_json_;
     ArgsMap args_;
+    // Param values that begin with `$` (a blackboard reference). Not in args_;
+    // resolved against the blackboard on each Enter. Keyed by the param name.
+    std::unordered_map<std::string, BbParamRef> bb_refs_;
     LuaScriptHost host_;
 
     bool active_ = false;
