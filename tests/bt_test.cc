@@ -1417,25 +1417,31 @@ TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamBlackboardRefProvider) {
     EXPECT_EQ(*st, "failure");  // 30ms timeout fired
 }
 
-TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamBlackboardRefMissingKeyFails) {
+TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamBlackboardRefMissingKey) {
+    // A $key ref resolves at RUN time now: parse succeeds, a missing key
+    // logs and degrades to 0 (wait forever) - the run ends at exec's own
+    // budget ("timeout"), not an init error.
     PutRoot(R"({"type":"Pipeline","children":[)"
             R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/cond_falsy.lua"},)"
             R"("*timeout":"$missing_key","*retry":0}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local ok, err = bt.init({root = "res://root.json"})
         if not ok then return false, err end
-        return true, "unexpected"
+        local status = bt.exec({interval = 10, max_step = 30})
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
-    ASSERT_TRUE(r.values[0] == LuaValue(false));  // init failed
-    auto* err = std::get_if<std::string>(&r.values[1]);
-    ASSERT_NE(err, nullptr);
-    EXPECT_NE(err->find("missing_key"), std::string::npos);
+    ASSERT_TRUE(r.values[0] == LuaValue(true));  // init ok (ref resolves lazily)
+    auto* st = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(*st, "timeout");  // budget degraded to 0 = wait forever
 }
 
-TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamBlackboardRefBadTypeFails) {
-    // A string value behind the ref is a parse error, not a silent 0.
+TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamBlackboardRefBadType) {
+    // A ref pointing at a string: run-time resolution fails, logs, degrades
+    // to 0 (wait forever) - init still succeeds.
     PutRoot(R"({"type":"Pipeline","children":[)"
             R"({"type":"Script","source":"scripts/no_args.lua",)"
             R"("*target":{"type":"Script","source":"scripts/cond_falsy.lua"},)"
@@ -1446,13 +1452,96 @@ TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamBlackboardRefBadTypeFails) {
         bb.set("str_val", "not a number")
         local ok, err = bt.init({root = "res://root.json"})
         if not ok then return false, err end
-        return true, "unexpected"
+        local status = bt.exec({interval = 10, max_step = 30})
+        return true, status
     )"));
     ASSERT_EQ(r.status, LUA_OK);
-    ASSERT_TRUE(r.values[0] == LuaValue(false));  // init failed
-    auto* err = std::get_if<std::string>(&r.values[1]);
-    ASSERT_NE(err, nullptr);
-    EXPECT_NE(err->find("must be an integer or a"), std::string::npos);
+    ASSERT_TRUE(r.values[0] == LuaValue(true));
+    auto* st = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(*st, "timeout");
+}
+
+// --- Pipeline-level default timeout/retry + per-run (Enter-time) resolution ---
+
+// params.timeout / params.retry supply the defaults for steps that don't
+// declare their own *timeout / *retry.
+TEST_F(ScriptNodeIntegrationTest, PipelineDefaultTimeoutAppliesToSteps) {
+    // The step declares no edge params; the pipeline default *retry=3 with
+    // *timeout=10ms applies: the target never holds, so the step burns its
+    // 3 re-runs then fails.
+    PutRoot(R"({"type":"Pipeline","params":{"retry":3,"timeout":10},"children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/cond_falsy.lua"}}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local ok, err = bt.init({root = "res://root.json"})
+        if not ok then return false, err end
+        local status = bt.exec({interval = 5, max_step = 200})
+        return true, status
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_TRUE(r.values[0] == LuaValue(true));
+    auto* st = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(*st, "failure");  // default budget exhausted the re-runs
+}
+
+// A step's OWN edge param wins over the pipeline default.
+TEST_F(ScriptNodeIntegrationTest, PipelineStepParamOverridesDefault) {
+    // Default *timeout = 10ms; the step declares its own *timeout = 80ms.
+    // The failure must arrive on the STEP's budget, i.e. >= ~80ms.
+    PutRoot(R"({"type":"Pipeline","params":{"timeout":10},"children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/cond_falsy.lua"},)"
+            R"("*timeout":80}]})");
+    auto t0 = std::chrono::steady_clock::now();
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local ok, err = bt.init({root = "res://root.json"})
+        if not ok then return false, err end
+        local status = bt.exec({interval = 5, max_step = 200})
+        return true, status
+    )"));
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    ASSERT_EQ(r.status, LUA_OK);
+    auto* st = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(*st, "failure");
+    EXPECT_GE(elapsed, 70);  // the step's 80ms budget, not the 10ms default
+}
+
+// Per-run resolution: a $key ref is read FRESH each run. Retry wraps the
+// Pipeline; after the step fails its 30ms wait, Retry Reset()s the pipeline
+// for attempt 2 - which must RE-RESOLVE "$tmo" (the provider now returns 0 =
+// wait forever). If the budget had been frozen at parse/first-run time,
+// attempt 2 would fail at another 30ms and Retry would give up ("failure");
+// with fresh resolution the run waits forever and ends at exec's own budget.
+TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamRereadsProviderPerRun) {
+    PutRoot(R"({"type":"Retry","params":{"max_count":2},"child":)"
+            R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/cond_falsy.lua"},)"
+            R"("*timeout":"$tmo","*retry":0}]}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        local calls = 0
+        bb.set_provider("tmo", function()
+            calls = calls + 1
+            return calls <= 1 and 30 or 0   -- run 1: 30ms budget; later: forever
+        end)
+        local ok, err = bt.init({root = "res://root.json"})
+        if not ok then return false, err end
+        local status = bt.exec({interval = 5, max_step = 80})
+        return true, status
+    )"));
+    ASSERT_EQ(r.status, LUA_OK) << "script errored";
+    ASSERT_TRUE(r.values[0] == LuaValue(true));
+    auto* st = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(*st, "timeout");  // attempt 2 re-resolved to 0 = wait forever
 }
 
 // --- Pipeline composite tests ---

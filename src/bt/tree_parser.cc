@@ -52,8 +52,6 @@ namespace {
 
 struct ParseContext {
     std::shared_ptr<ResourceProvider> provider;   // null in sync Parse -> Subtree unsupported
-    std::shared_ptr<Blackboard> blackboard;       // optional: resolves $key refs in edge params
-    lua_State* L = nullptr;                       // main state backing LuaRef values (tables)
     std::set<std::string> resolving;              // subtree path cycle guard
     uint32_t next_id = 1;
     std::string error;
@@ -465,81 +463,42 @@ std::pair<int, int> ParseIntRange(const json& v) {
     return {0, 0};
 }
 
-// LuaValue → int for a blackboard-resolved edge param. Accepts integer and
-// integral-double; nullopt otherwise.
-std::optional<int> LuaIntFromValue(const LuaValue& v) {
-    if (auto* i = std::get_if<int64_t>(&v)) {
-        return static_cast<int>(*i);
+// A Pipeline edge param (`*timeout` / `*retry`) as a LAZY spec: the literal
+// int (fixed), the [lo,hi] array (a per-run roll), or a "$key" blackboard
+// reference read FRESH when the step enters its wait window each run (so
+// between runs the value can change and ranges re-roll). Returns nullopt
+// only on a malformed shape (caller fails the parse): int / array / "$key" /
+// "$$x"-escape are all valid; anything else errors.
+std::optional<Pipeline::EdgeParam> ParseEdgeSpec(const json& v, const char* what) {
+    using EP = Pipeline::EdgeParam;
+    if (v.is_number_integer()) {
+        int x = v.get<int>();
+        return EP{EP::Kind::kFixed, x, x, {}};
     }
-    if (auto* d = std::get_if<double>(&v)) {
-        if (*d == std::floor(*d)) return static_cast<int>(*d);
+    if (v.is_string()) {
+        std::string s = v.get<std::string>();
+        auto cls = ResolveBbParamMarker(s);
+        if (auto* ref = std::get_if<BbParamRef>(&cls)) {
+            return EP{EP::Kind::kBbRef, 0, 0, ref->key};
+        }
+        // "$$x" escape / lone "$": not a ref. Fall through to the error below
+        // (a literal string is not a valid edge param).
     }
+    if (v.is_array() && !v.empty() && v.size() <= 2 && v[0].is_number_integer() &&
+        (v.size() == 1 || v[1].is_number_integer())) {
+        auto [lo0, hi0] = ParseIntRange(v);  // clamps to >=0, sorts
+        if (lo0 == hi0) return EP{EP::Kind::kFixed, lo0, hi0, {}};
+        return EP{EP::Kind::kRange, lo0, hi0, {}};
+    }
+    (void)what;  // caller adds context to the error
     return std::nullopt;
 }
 
-// A Pipeline edge param (`*timeout` / `*retry`): the literal int / [lo,hi]
-// forms, plus a "$key" blackboard reference read at parse time (providers
-// invoke fresh). The referenced value may itself be an integer or a two-
-// element {lo,hi} table (a Lua provider returning {3,5}). Returns nullopt
-// ONLY for a present-but-malformed `$key` ref (caller fails the parse);
-// absent / non-ref / non-numeric input keeps the legacy {0,0} default.
-std::optional<std::pair<int, int>> ParseEdgeParam(const json& v,
-                                                  const char* what,
-                                                  ParseContext& ctx) {
-    if (!v.is_string()) return ParseIntRange(v);  // literal forms (or default)
-    std::string s = v.get<std::string>();
-    auto cls = ResolveBbParamMarker(s);
-    auto* ref = std::get_if<BbParamRef>(&cls);
-    if (ref == nullptr) return ParseIntRange(v);  // "$$x"/lone "$"/plain: legacy path
-
-    std::string param_desc = std::string(what) + " '" + s + "'";
-    if (!ctx.blackboard) {
-        SetError(ctx, "Pipeline " + param_desc + ": no blackboard configured");
-        return std::nullopt;
-    }
-    auto val = ctx.blackboard->Get(ref->key);
-    if (!val.has_value()) {
-        SetError(ctx, "Pipeline " + param_desc + ": blackboard key '" + ref->key + "' not set");
-        return std::nullopt;
-    }
-    // Scalar integer.
-    if (auto i = LuaIntFromValue(*val)) {
-        return std::make_pair(*i < 0 ? 0 : *i, *i < 0 ? 0 : *i);
-    }
-    // [lo,hi] table (a provider returning {3,5}): the LuaRef is a registry
-    // ref on the runtime's main state — pull [1] and [2] out of it.
-    if (auto* r = std::get_if<LuaRef>(&*val)) {
-        lua_State* L = ctx.L;
-        if (L != nullptr && (*r)->ref != LUA_NOREF) {
-            lua_rawgeti(L, LUA_REGISTRYINDEX, (*r)->ref);
-            bool is_table = lua_istable(L, -1);
-            if (is_table) {
-                std::optional<int> nums[2];
-                for (int k = 1; k <= 2; ++k) {
-                    lua_rawgeti(L, -1, k);
-                    if (lua_isinteger(L, -1)) {
-                        nums[k - 1] = static_cast<int>(lua_tointeger(L, -1));
-                    } else if (lua_isnumber(L, -1)) {
-                        double d = lua_tonumber(L, -1);
-                        if (d == std::floor(d)) nums[k - 1] = static_cast<int>(d);
-                    }
-                    lua_pop(L, 1);
-                }
-                lua_pop(L, 1);  // the table
-                if (nums[0].has_value()) {
-                    int lo = *nums[0], hi = nums[1].value_or(lo);
-                    if (lo < 0) lo = 0;
-                    if (hi < 0) hi = 0;
-                    return lo <= hi ? std::make_pair(lo, hi) : std::make_pair(hi, lo);
-                }
-            } else {
-                lua_pop(L, 1);
-            }
-        }
-    }
-    SetError(ctx, "Pipeline " + param_desc + ": blackboard key '" + ref->key +
-                     "' must be an integer or a {lo,hi} table");
-    return std::nullopt;
+// The "unset" marker: the step carries no param of its own, so the
+// pipeline-level default (params.timeout/params.retry) applies.
+Pipeline::EdgeParam kUnsetEdgeParam() {
+    using EP = Pipeline::EdgeParam;
+    return EP{EP::Kind::kFixed, -1, -1, {}};
 }
 
 // A scalar-or-range param value: an integer → {v, v} (RAW, no clamp — the
@@ -601,20 +560,49 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParsePipeline(const json& j, Par
             }
             target = std::shared_ptr<NodeCondition>(cond.release());
         }
-        int timeout_lo = 0, timeout_hi = 0;
+        // Absent edge params stay "unset" so the pipeline-level defaults
+        // (params.timeout/params.retry) can supply them; each resolves
+        // lazily when the step enters its wait window, per run.
+        Pipeline::EdgeParam timeout = kUnsetEdgeParam();
         if (child_j.contains("*timeout")) {
-            auto r = ParseEdgeParam(child_j["*timeout"], "*timeout", ctx);
-            if (!r) co_return nullptr;
-            std::tie(timeout_lo, timeout_hi) = *r;
+            auto r = ParseEdgeSpec(child_j["*timeout"], "*timeout");
+            if (!r) {
+                SetError(ctx, "Pipeline step '*timeout' must be a number, a [lo,hi] array or a $key");
+                co_return nullptr;
+            }
+            timeout = std::move(*r);
         }
-        int retry_lo = 0, retry_hi = 0;
+        Pipeline::EdgeParam retry = kUnsetEdgeParam();
         if (child_j.contains("*retry")) {
-            auto r = ParseEdgeParam(child_j["*retry"], "*retry", ctx);
-            if (!r) co_return nullptr;
-            std::tie(retry_lo, retry_hi) = *r;
+            auto r = ParseEdgeSpec(child_j["*retry"], "*retry");
+            if (!r) {
+                SetError(ctx, "Pipeline step '*retry' must be a number, a [lo,hi] array or a $key");
+                co_return nullptr;
+            }
+            retry = std::move(*r);
         }
-        node->AddStep(std::move(child), std::move(target),
-                      timeout_lo, timeout_hi, retry_lo, retry_hi);
+        node->AddStep(std::move(child), std::move(target), std::move(timeout), std::move(retry));
+    }
+
+    // Pipeline-level defaults: params.timeout / params.retry apply to steps
+    // that don't declare their own. Same spec forms, same lazy resolution.
+    if (j.contains("params") && j["params"].is_object()) {
+        if (j["params"].contains("timeout")) {
+            auto r = ParseEdgeSpec(j["params"]["timeout"], "params.timeout");
+            if (!r) {
+                SetError(ctx, "Pipeline 'params.timeout' must be a number, a [lo,hi] array or a $key");
+                co_return nullptr;
+            }
+            node->SetDefaultTimeout(std::move(*r));
+        }
+        if (j["params"].contains("retry")) {
+            auto r = ParseEdgeSpec(j["params"]["retry"], "params.retry");
+            if (!r) {
+                SetError(ctx, "Pipeline 'params.retry' must be a number, a [lo,hi] array or a $key");
+                co_return nullptr;
+            }
+            node->SetDefaultRetry(std::move(*r));
+        }
     }
 
     if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
@@ -975,8 +963,6 @@ TreeParser::LoadAndParse(const std::string& root_path,
 
     ParseContext ctx;
     ctx.provider = provider;
-    ctx.blackboard = blackboard;
-    ctx.L = L;  // main state backing provider LuaRefs ({lo,hi} tables)
 
     auto root = co_await ParseNode(root_j, ctx);
     if (!root) {
@@ -1014,7 +1000,6 @@ ParseResult TreeParser::Parse(const std::string& root_json, nlohmann::json param
     ApplyDataResolution(root_j);
 
     ParseContext ctx;  // no provider -> Subtree nodes unsupported
-    ctx.blackboard = blackboard;
     auto root = async_simple::coro::syncAwait(ParseNode(root_j, ctx));
     if (!root) {
         result.error = ctx.error.empty() ? "failed to parse tree" : ctx.error;

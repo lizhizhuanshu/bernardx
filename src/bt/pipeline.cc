@@ -1,6 +1,8 @@
 #include "pipeline.h"
 
 #include <algorithm>
+#include <cmath>
+#include <optional>
 
 #include "bt_event_queue.h"
 #include "bt_utils.h"
@@ -14,13 +16,12 @@ Pipeline::Pipeline(uint32_t id, std::string name)
       rng_(std::random_device{}()) {}
 
 void Pipeline::AddStep(std::unique_ptr<Node> child,
-                             std::shared_ptr<NodeCondition> target,
-                             int timeout_lo, int timeout_hi,
-                             int retry_lo, int retry_hi) {
+                       std::shared_ptr<NodeCondition> target,
+                       EdgeParam timeout, EdgeParam retry) {
     Composite::AddChild(std::move(child));  // base: set parent + push children_
-    steps_.push_back({std::move(target), timeout_lo, timeout_hi, retry_lo, retry_hi});
+    steps_.push_back({std::move(target), std::move(timeout), std::move(retry)});
     retries_used_.push_back(0);
-    cur_timeout_.push_back(-1);  // rolled lazily on first wait this run
+    cur_timeout_.push_back(-1);  // resolved lazily on each run's first wait
     cur_retry_.push_back(-1);
     target_prev_.push_back(NodeStatus::kFailure);  // "not yet observed"
 }
@@ -28,6 +29,7 @@ void Pipeline::AddStep(std::unique_ptr<Node> child,
 async_simple::coro::Lazy<bool> Pipeline::Init(lua_State* L, LuaRuntime* ctx) {
     // Composite::Init inits the action children; the *target conditions are
     // owned by this pipeline (not set on the nodes), so init them here.
+    lua_state_ = L;  // backs $key-ref LuaRefs ({lo,hi} tables) at resolve time
     if (!co_await Composite::Init(L, ctx)) co_return false;
     for (auto& step : steps_) {
         if (step.target && !co_await step.target->Init(L, ctx)) {
@@ -39,12 +41,70 @@ async_simple::coro::Lazy<bool> Pipeline::Init(lua_State* L, LuaRuntime* ctx) {
     co_return true;
 }
 
-void Pipeline::ResolveStepBudgets(size_t i) {
+// Resolve one edge param to an int for THIS run. `def` supplies the
+// pipeline-level default when the step's own param is unset. A `$key` ref is
+// read from the blackboard fresh (providers invoke); an int value fixes it,
+// a {lo,hi} table rolls. Returns -1 with an error log when the ref can't
+// resolve (the caller treats -1 as 0 = wait forever / no retry).
+int Pipeline::ResolveEdgeParam(Blackboard& bb, const EdgeParam& e,
+                               const EdgeParam& def, const char* what) {
+    const EdgeParam& p = (e.kind == EdgeParam::Kind::kFixed && e.lo < 0) ? def : e;
+    if (p.kind == EdgeParam::Kind::kFixed) return p.lo < 0 ? 0 : p.lo;
+    if (p.kind == EdgeParam::Kind::kRange) return RollIntInRange(p.lo, p.hi, rng_);
+    // kBbRef: read the blackboard fresh for this run.
+    auto v = bb.Get(p.key);
+    if (!v.has_value()) {
+        spdlog::error("Pipeline '{}': {} blackboard key '{}' not set", name(), what, p.key);
+        return -1;
+    }
+    if (auto* i64 = std::get_if<int64_t>(&*v)) {
+        return static_cast<int>(*i64 < 0 ? 0 : *i64);
+    }
+    if (auto* d = std::get_if<double>(&*v)) {
+        if (*d == std::floor(*d)) return static_cast<int>(*d < 0 ? 0 : *d);
+    }
+    if (auto* r = std::get_if<LuaRef>(&*v)) {
+        lua_State* L = lua_state_;  // captured at Init (registry refs live there)
+        if (L != nullptr && (*r)->ref != LUA_NOREF) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, (*r)->ref);
+            if (lua_istable(L, -1)) {
+                std::optional<int> nums[2];
+                for (int k = 1; k <= 2; ++k) {
+                    lua_rawgeti(L, -1, k);
+                    if (lua_isinteger(L, -1)) {
+                        nums[k - 1] = static_cast<int>(lua_tointeger(L, -1));
+                    } else if (lua_isnumber(L, -1)) {
+                        double d = lua_tonumber(L, -1);
+                        if (d == std::floor(d)) nums[k - 1] = static_cast<int>(d);
+                    }
+                    lua_pop(L, 1);
+                }
+                lua_pop(L, 1);  // the table
+                if (nums[0].has_value()) {
+                    int lo = *nums[0], hi = nums[1].value_or(lo);
+                    if (lo < 0) lo = 0;
+                    if (hi < 0) hi = 0;
+                    return lo <= hi ? RollIntInRange(lo, hi, rng_)
+                                    : RollIntInRange(hi, lo, rng_);
+                }
+            } else {
+                lua_pop(L, 1);
+            }
+        }
+    }
+    spdlog::error("Pipeline '{}': {} blackboard key '{}' must be an integer or a {{lo,hi}} table",
+                  name(), what, p.key);
+    return -1;
+}
+
+void Pipeline::ResolveStepBudgets(Blackboard& bb, size_t i) {
     if (cur_timeout_[i] < 0) {
-        cur_timeout_[i] = RollIntInRange(steps_[i].timeout_lo, steps_[i].timeout_hi, rng_);
+        int t = ResolveEdgeParam(bb, steps_[i].timeout, def_timeout_, "*timeout");
+        cur_timeout_[i] = t < 0 ? 0 : t;
     }
     if (cur_retry_[i] < 0) {
-        cur_retry_[i] = RollIntInRange(steps_[i].retry_lo, steps_[i].retry_hi, rng_);
+        int r = ResolveEdgeParam(bb, steps_[i].retry, def_retry_, "*retry");
+        cur_retry_[i] = r < 0 ? 0 : r;
     }
 }
 
@@ -190,7 +250,7 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
                 children_[current_child_index_]->OnAborted();
                 phase_ = Phase::kWait;  // the wait below advances this tick
                 wait_start_ms_ = events.now_ms();
-                ResolveStepBudgets(current_child_index_);
+                ResolveStepBudgets(bb, current_child_index_);
                 continue;  // fall into the wait with the target already met
             }
 
@@ -205,7 +265,7 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
             // Action done → wait for this step's target (absent target: met).
             phase_ = Phase::kWait;
             wait_start_ms_ = events.now_ms();
-            ResolveStepBudgets(current_child_index_);
+            ResolveStepBudgets(bb, current_child_index_);
             // fall through to the wait this tick
         }
 
