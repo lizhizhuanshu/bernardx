@@ -68,7 +68,11 @@ static async_simple::coro::Lazy<void> InitAsync(
     std::shared_ptr<ResourceProvider> provider,
     bool trace_paths,
     uint64_t expected_generation) {
-    auto parse_result = co_await TreeParser::LoadAndParse(root_path, provider, std::move(root_params));
+    // The engine's blackboard + main Lua state let Pipeline edge params carry
+    // "$key" blackboard references (read at parse time).
+    auto parse_result = co_await TreeParser::LoadAndParse(
+        root_path, provider, std::move(root_params),
+        engine->shared_blackboard(), rt->main_state());
     if (engine->generation() != expected_generation) {
         // Stopped mid-load; unblock the awaiter so it doesn't hang.
         rt->PushResume(handle, {std::string("stopped")});

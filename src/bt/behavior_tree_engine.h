@@ -45,6 +45,7 @@ public:
     std::string GetStatus() const;
 
     Blackboard& blackboard() { return *blackboard_; }
+    const std::shared_ptr<Blackboard>& shared_blackboard() const { return blackboard_; }
 
     // Async-load all Script nodes (and subtrees thereof). Also inits every
     // node's guard `condition` via InitConditionsRecursive.

@@ -828,6 +828,17 @@ bool LuaRuntime::CallWithCallback(lua_State* co, int nargs, std::function<void(S
 
 void LuaRuntime::CancelCall(lua_State* co) {
     completions_.erase(co);
+    // Drop any pending async entry that references this coroutine. Otherwise a
+    // late completion (e.g. a WDA call that already fired) would DoResume a
+    // coroutine that has been released and possibly reused by another node,
+    // corrupting that node's Enter/Tick state.
+    for (auto it = pending_.begin(); it != pending_.end(); ) {
+        if (it->second.co == co) {
+            it = pending_.erase(it);
+        } else {
+            ++it;
+        }
+    }
     ReleaseCoroutine(co);
 }
 

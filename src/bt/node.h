@@ -81,9 +81,11 @@ public:
 
     NodeStatus last_tick_status() const { return last_tick_status_; }
 
-    // Optional guard condition. Today only `Pipeline` consumes it (first-tick
-    // scan picks the first child whose condition is met). Other composites
-    // ignore it — guarding is explicit, never implicit in `Tick`.
+    // Optional guard condition. Composites gate children on it before ticking
+    // (see composite.cc) and the engine monitors it reactively per its abort
+    // mode — guarding is explicit, never implicit in `Tick`. (Pipeline's
+    // `*target` is a separate mechanism: it lives on the pipeline's Step, not
+    // on the node.)
     void SetCondition(std::shared_ptr<NodeCondition> c) { condition_ = std::move(c); }
     NodeCondition* condition() const { return condition_.get(); }
     // Shared-ownership view of the guard condition. Used by Subtree's

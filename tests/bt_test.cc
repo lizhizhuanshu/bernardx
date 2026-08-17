@@ -583,6 +583,32 @@ TEST(TreeParserSubtreeCondition, ChildConditionMarkerNoOpWithoutRootCondition) {
     EXPECT_EQ(nullptr, sub->condition());
 }
 
+// A SUBTREE's own `data` table + `.path` refs resolve inside the subtree:
+// `.{{target}}` in source first templates to `.home`, then looks up the
+// subtree's data.home. Same contract as the root's data resolution.
+TEST(TreeParserSubtreeDataRefs, ResolvesWithinSubtree) {
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    // Mirrors the user's click_page_button pattern: a data table of
+    // selectors, param-driven `.{{target}}` reference into it. Placed on
+    // `source` so the resolution is observable via script_path().
+    provider->Put("sub.json",
+        R"({"name":"click_page_button","type":"Script",)"
+        R"("data":{"home":"scripts/login.lua","config":"scripts/other.lua"},)"
+        R"("source":".{{target}}"})");
+    provider->Put("root.json",
+        R"({"type":"Subtree","source":"res://sub.json","params":{"target":"home"}})");
+
+    auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
+    ASSERT_NE(nullptr, res.root);
+    EXPECT_TRUE(res.error.empty());
+
+    auto* sub = static_cast<SubtreeNode*>(res.root.get());
+    ASSERT_NE(nullptr, sub->child());
+    auto* script = dynamic_cast<ScriptNode*>(sub->child());
+    ASSERT_NE(nullptr, script);
+    EXPECT_EQ(script->script_path(), "scripts/login.lua");
+}
+
 // A bogus condition string is a hard parse error (no silent ignore).
 TEST(TreeParserSubtreeCondition, RejectsUnknownConditionString) {
     auto provider = std::make_shared<MemoryResourceProvider>();
@@ -968,12 +994,12 @@ TEST_F(ScriptNodeIntegrationTest, SubtreeParamsPartialSubstitution) {
 
 TEST_F(ScriptNodeIntegrationTest, SubtreeParamsTemplatingCondition) {
     // Placeholders work in any string field, including a node's `condition`.
-    // Here the Subtree's param selects which condition script the inner node
+    // Here the Subtree's param selects which target script the inner node
     // uses — "{{cond}}" resolves to the provided path.
     PutRoot(R"({"type":"Subtree","source":"res://sub.json","params":{"cond":"scripts/cond_truthy.lua"}})");
     resource_provider->Put("sub.json",
         R"({"type":"Pipeline","children":[)"
-        R"({"type":"Script","source":"scripts/no_args.lua","condition":{"type":"Script","source":"{{cond}}"}}]})");
+        R"({"type":"Script","source":"scripts/no_args.lua","*target":{"type":"Script","source":"{{cond}}"}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -982,7 +1008,7 @@ TEST_F(ScriptNodeIntegrationTest, SubtreeParamsTemplatingCondition) {
     ASSERT_EQ(r.status, LUA_OK);
     auto* s = std::get_if<std::string>(&r.values[0]);
     ASSERT_NE(s, nullptr);
-    // Condition templated to cond_truthy -> met -> step runs -> success.
+    // Target templated to cond_truthy -> met -> step skipped -> success.
     EXPECT_EQ(*s, "success");
 }
 
@@ -1338,10 +1364,102 @@ TEST_F(ScriptNodeIntegrationTest, InitErrorInSequenceStopsEarly) {
     EXPECT_NE(err->find("nonexistent.lua"), std::string::npos);
 }
 
+// --- Pipeline edge-param `$key` blackboard references ---
+//
+// `*timeout`/`*retry` accept "$key": read from the blackboard at parse time
+// (providers invoke fresh). The value may be an integer or a {lo,hi} table.
+// Unresolvable/malformed refs are parse ERRORS (never a silent 0).
+
+// E2E through bt.init/exec: the edge param is a table {2,3} set from Lua.
+TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamBlackboardRefTable) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/cond_falsy.lua"},)"
+            R"("*timeout":30,"*retry":"$common.action.retry_count"}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("common.action.retry_count", {2, 3})
+        local ok, err = bt.init({root = "res://root.json"})
+        if not ok then return false, err end
+        local status = bt.exec({interval = 10, max_step = 60})
+        return true, status
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    // values[0]=true (init ok), values[1]=exec status.
+    ASSERT_TRUE(r.values[0] == LuaValue(true)) << "bt.init ok";  // $ref parsed
+    // cond_falsy never holds: with retry budget 2-3 the pipeline eventually
+    // fails; exec returns the terminal status string.
+    auto* st = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(*st, "failure");
+}
+
+TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamBlackboardRefProvider) {
+    // A provider returning an integer resolves like a literal scalar.
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/cond_falsy.lua"},)"
+            R"("*timeout":"$tmo","*retry":0}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set_provider("tmo", function() return 30 end)
+        local ok, err = bt.init({root = "res://root.json"})
+        if not ok then return false, err end
+        local status = bt.exec({interval = 10, max_step = 40})
+        return true, status
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_TRUE(r.values[0] == LuaValue(true)) << "bt.init ok";
+    auto* st = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(*st, "failure");  // 30ms timeout fired
+}
+
+TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamBlackboardRefMissingKeyFails) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*timeout":"$missing_key","*retry":0}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local ok, err = bt.init({root = "res://root.json"})
+        if not ok then return false, err end
+        return true, "unexpected"
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_TRUE(r.values[0] == LuaValue(false));  // init failed
+    auto* err = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(err, nullptr);
+    EXPECT_NE(err->find("missing_key"), std::string::npos);
+}
+
+TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamBlackboardRefBadTypeFails) {
+    // A string value behind the ref is a parse error, not a silent 0.
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/cond_falsy.lua"},)"
+            R"("*timeout":"$str_val","*retry":0}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("str_val", "not a number")
+        local ok, err = bt.init({root = "res://root.json"})
+        if not ok then return false, err end
+        return true, "unexpected"
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_TRUE(r.values[0] == LuaValue(false));  // init failed
+    auto* err = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(err, nullptr);
+    EXPECT_NE(err->find("must be an integer or a"), std::string::npos);
+}
+
 // --- Pipeline composite tests ---
 //
-// (Pipeline tests are rewritten for the scan-to-start + sequential model in
-// the condition refactor; see the Pipeline + NodeCondition test sections.)
+// (Pipeline tests are rewritten for the *target semantics: a step's action
+// runs while its target is NOT met; steps whose targets already hold are
+// skipped. See the Pipeline + NodeCondition test sections.)
 
 // --- bt lifecycle exec() max_step / timeout / interval Tests ---
 
@@ -2496,9 +2614,11 @@ TEST(ConditionLogicTest, NotPassesRunningThrough) {
     EXPECT_EQ(c.Tick(bb, ev), NodeStatus::kRunning);
 }
 
-// --- Pipeline scan + sequential unit tests (MockNode + MockCondition) ---
+// --- Pipeline *target skip/act/wait unit tests (MockNode + MockCondition) ---
 
-TEST(PipelineTest, NullConditionFirstChildSelectedThenSequential) {
+TEST(PipelineTest, NoTargetRunsEachActionOnceSequentially) {
+    // Absent *target: the action completing IS the target — every step runs,
+    // once, in order (same tick fast-forward).
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
     auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
@@ -2507,115 +2627,150 @@ TEST(PipelineTest, NullConditionFirstChildSelectedThenSequential) {
     Blackboard bb; BtEventQueue ev;
     EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);
     EXPECT_EQ(a->tick_count, 1);
-    EXPECT_EQ(b->tick_count, 1);  // advanced same tick
+    EXPECT_EQ(b->tick_count, 1);
 }
 
-TEST(PipelineTest, FirstMatchingConditionSelected) {
+TEST(PipelineTest, MetTargetsAreSkipped) {
+    // Step 0's target already holds → its action is skipped; step 1's
+    // doesn't → its action runs.
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
     auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
-    pipe.AddChild(std::unique_ptr<MockNode>(a));
-    pipe.AddChild(std::unique_ptr<MockNode>(b));
-    pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
-    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kSuccess));
+    pipe.AddStep(std::unique_ptr<MockNode>(a),
+                 std::make_shared<MockCondition>(NodeStatus::kSuccess), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(b),
+                 std::make_shared<MockCondition>(NodeStatus::kFailure), 0, 0);
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // b ran, waiting on target1
     EXPECT_EQ(a->tick_count, 0);
     EXPECT_EQ(b->tick_count, 1);
 }
 
-TEST(PipelineTest, NoConditionMetTimesOutAtStep0) {
-    // Scan finds no condition held → wait at step 0; once *timeout (20ms
-    // wall-clock) elapses with the condition still failing → fail (no
-    // previous step to back up to).
+TEST(PipelineTest, AllTargetsMetSucceedsImmediately) {
+    // Every step's target holds → nothing to do → Success without ticking
+    // any action.
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
-    pipe.AddStep(std::unique_ptr<MockNode>(a), /*timeout_ms=*/20, /*retry=*/0);
-    pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    auto* b = new MockNode(3, "b", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a),
+                 std::make_shared<MockCondition>(NodeStatus::kSuccess), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(b),
+                 std::make_shared<MockCondition>(NodeStatus::kSuccess), 0, 0);
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // scan no match → wait starts
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // 20ms elapsed → timeout at step 0
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);
     EXPECT_EQ(a->tick_count, 0);
+    EXPECT_EQ(b->tick_count, 0);
+}
+
+TEST(PipelineTest, AdvanceSkipsLaterMetTargets) {
+    // After step 0's target becomes met, the re-scan skips step 2 (its
+    // target already holds) and runs only the pending middle step.
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
+    auto* a2 = new MockNode(4, "a2", NodeStatus::kSuccess);
+    auto* t0 = new MockCondition(NodeStatus::kFailure);  // met after a0's run
+    pipe.AddStep(std::unique_ptr<MockNode>(a0),
+                 std::shared_ptr<MockCondition>(t0), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1),
+                 std::make_shared<MockCondition>(NodeStatus::kFailure), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a2),
+                 std::make_shared<MockCondition>(NodeStatus::kSuccess), 0, 0);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 ran; waiting target0
+    EXPECT_EQ(a0->tick_count, 1);
+    EXPECT_EQ(a1->tick_count, 0);
+    t0->set_status(NodeStatus::kSuccess);  // target0 met → advance, skip step 2
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a1 ran; waiting target1
+    EXPECT_EQ(a1->tick_count, 1);
+    EXPECT_EQ(a2->tick_count, 0);  // its target was already met: skipped
+}
+
+TEST(PipelineTest, TargetMetRightAfterActionAdvancesSameTick) {
+    // The target flips to met while the action is mid-run: on the action's
+    // completing tick the wait sees the target met → advance immediately.
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0),
+                 std::make_shared<MockCondition>(NodeStatus::kSuccess), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1),
+                 std::make_shared<MockCondition>(NodeStatus::kFailure), 0, 0);
+    Blackboard bb; BtEventQueue ev;
+    // Step 0 skipped (target met); a1 runs; waiting on target1 — no timeout,
+    // so it just runs.
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    EXPECT_EQ(a0->tick_count, 0);
+    EXPECT_EQ(a1->tick_count, 1);
 }
 
 TEST(PipelineTest, WaitTimeoutWithoutRetryFails) {
+    // Action ran, target never comes, *timeout elapses with no retry budget
+    // → failure. (Both actions run in the same first tick: a0 fast-forwards,
+    // a1 runs then enters its wait.)
     Pipeline pipe(1, "pipe");
     auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
     auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
-    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/20, /*retry=*/0);
-    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    pipe.AddStep(std::unique_ptr<MockNode>(a0), nullptr, 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1),
+                 std::make_shared<MockCondition>(NodeStatus::kFailure),
+                 /*timeout_ms=*/20, /*retry=*/0);
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 + a1 ran; step1 waits
+    EXPECT_EQ(a1->tick_count, 1);
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
     EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // step1 timeout, no retry
-    EXPECT_EQ(a1->tick_count, 0);
 }
 
-TEST(PipelineTest, RetryBacksUpAndSucceeds) {
-    // Step1 condition appears only after action0 is re-run via a retry back-up.
+TEST(PipelineTest, RetryRerunsSameStepActionAndSucceeds) {
+    // Step1's target appears only after a1 is re-run once via *retry: the
+    // timeout fires, a1 is Reset + re-run, and the wait now succeeds.
     Pipeline pipe(1, "pipe");
     auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
-    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
-    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/20, /*retry=*/1);
-    auto* cond1 = new MockCondition(NodeStatus::kFailure);
-    pipe.children()[1]->SetCondition(std::shared_ptr<MockCondition>(cond1));
+    auto* a1 = new CountingMockNode(3, "a1", NodeStatus::kSuccess);
+    auto* t1 = new MockCondition(NodeStatus::kFailure);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0), nullptr, 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1),
+                 std::shared_ptr<MockCondition>(t1),
+                 /*timeout_ms=*/20, /*retry=*/1);
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 + a1 ran; wait target1
+    EXPECT_EQ(a1->total_ticks(), 1);
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // step1 timeout → back up, reset a0
-    cond1->set_status(NodeStatus::kSuccess);             // now step1's condition holds
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);  // re-run a0 → step1 → a1 → done
-    EXPECT_EQ(a1->tick_count, 1);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // target1 timeout → re-run armed
+    EXPECT_EQ(a1->total_ticks(), 1);                           // re-run happens next tick
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a1 re-ran; wait target1 again
+    EXPECT_EQ(a1->total_ticks(), 2);
+    t1->set_status(NodeStatus::kSuccess);                      // re-run achieved the target
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);  // target met → done
 }
 
 TEST(PipelineTest, RetryExhaustedFails) {
     Pipeline pipe(1, "pipe");
-    auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
-    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
-    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/20, /*retry=*/1);
-    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a),
+                 std::make_shared<MockCondition>(NodeStatus::kFailure),
+                 /*timeout_ms=*/20, /*retry=*/2);
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0; step1 wait
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // timeout → back up, reset a0
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // re-run a0; step1 wait again
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // 2nd timeout, retry budget exhausted
-    EXPECT_EQ(a1->tick_count, 0);
+    int guard = 0;
+    NodeStatus s = NodeStatus::kRunning;
+    while (s == NodeStatus::kRunning && guard++ < 20) {
+        s = TickStamp(pipe, bb, ev);
+        if (s == NodeStatus::kRunning)
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    EXPECT_EQ(s, NodeStatus::kFailure);
+    EXPECT_EQ(a->total_ticks(), 3);  // 1 initial run + 2 re-runs
 }
 
-TEST(PipelineTest, RetryFailsIfPrevConditionLost) {
-    Pipeline pipe(1, "pipe");
-    auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
-    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
-    auto* cond0 = new MockCondition(NodeStatus::kSuccess);
-    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/20, /*retry=*/1);
-    pipe.children()[0]->SetCondition(std::shared_ptr<MockCondition>(cond0));
-    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
-    Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // scan step0; a0 runs; step1 waits
-    cond0->set_status(NodeStatus::kFailure);             // previous condition now lost
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // back-up gate fails
-    EXPECT_EQ(a1->tick_count, 0);
-}
-
-TEST(PipelineTest, RunningConditionKeepsScanPhase) {
+TEST(PipelineTest, RunningTargetHoldsPipeline) {
+    // A target still evaluating (Running) parks the pipeline without ticking
+    // the action; once it resolves Failure the action runs.
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
-    pipe.AddChild(std::unique_ptr<MockNode>(a));
-    auto cond = std::make_shared<MockCondition>(NodeStatus::kRunning);
-    pipe.children()[0]->SetCondition(cond);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr, 0, 0);
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // still scanning
-    EXPECT_EQ(a->tick_count, 0);
-    cond->set_status(NodeStatus::kSuccess);
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);  // now selected + runs
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);  // no target: run + done
     EXPECT_EQ(a->tick_count, 1);
 }
 
@@ -2670,17 +2825,18 @@ TEST(RollIntInRangeTest, StaysWithinRangeAndVisitsEndpoints) {
 }
 
 TEST(PipelineTest, RangeTimeoutCollapsesToFixedValue) {
-    // timeout=[20,20]ms must behave exactly like fixed *timeout=20 (times out,
-    // no retry).
+    // timeout=[20,20]ms must behave exactly like fixed *timeout=20 (action
+    // runs, target never comes, times out, no retry).
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
-    pipe.AddStep(std::unique_ptr<MockNode>(a), /*lo_ms=*/20, /*hi_ms=*/20, 0, 0);
-    pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    pipe.AddStep(std::unique_ptr<MockNode>(a),
+                 std::make_shared<MockCondition>(NodeStatus::kFailure),
+                 /*lo_ms=*/20, /*hi_ms=*/20, 0, 0);
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // scan no match → wait starts
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a ran; wait target starts
+    EXPECT_EQ(a->tick_count, 1);
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
     EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // 20ms elapsed → timeout
-    EXPECT_EQ(a->tick_count, 0);
 }
 
 TEST(PipelineTest, RangeTimeoutResolvesWithinBounds) {
@@ -2691,8 +2847,8 @@ TEST(PipelineTest, RangeTimeoutResolvesWithinBounds) {
     const int lo = 20, hi = 50;
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kSuccess);
-    pipe.AddStep(std::unique_ptr<MockNode>(a), lo, hi, 0, 0);
-    pipe.children()[0]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    pipe.AddStep(std::unique_ptr<MockNode>(a),
+                 std::make_shared<MockCondition>(NodeStatus::kFailure), lo, hi, 0, 0);
 
     int seen_min = hi, seen_max = lo;
     for (int run = 0; run < 30; ++run) {
@@ -2701,7 +2857,7 @@ TEST(PipelineTest, RangeTimeoutResolvesWithinBounds) {
         auto t0 = std::chrono::steady_clock::now();
         NodeStatus s = NodeStatus::kRunning;
         while (s == NodeStatus::kRunning) s = TickStamp(pipe, bb, ev);
-        ASSERT_EQ(s, NodeStatus::kFailure);  // step 0, no retry → timeout fails
+        ASSERT_EQ(s, NodeStatus::kFailure);  // no retry → timeout fails
         int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count());
         // Both sides truncate to whole ms independently, so the budget can
@@ -2713,45 +2869,42 @@ TEST(PipelineTest, RangeTimeoutResolvesWithinBounds) {
     }
     EXPECT_LE(seen_min, lo + 10);   // some run rolled near the low end
     EXPECT_GE(seen_max, hi - 10);   // some run rolled near the high end
-    EXPECT_EQ(a->tick_count, 0);
 }
 
 TEST(PipelineTest, RangeRetryCollapsesToFixedValue) {
-    // retry=[1,1] must behave like fixed *retry=1 (one back-up, then fail).
+    // retry=[1,1] must behave like fixed *retry=1 (one action re-run, then
+    // fail).
     Pipeline pipe(1, "pipe");
-    auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
-    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
-    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/20, /*timeout_ms=*/20,
-                 /*retry_lo=*/1, /*retry_hi=*/1);
-    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a),
+                 std::make_shared<MockCondition>(NodeStatus::kFailure),
+                 /*timeout_ms=*/20, /*timeout_ms=*/20, /*retry_lo=*/1, /*retry_hi=*/1);
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 runs; step1 waits
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a ran; wait target
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // step1 timeout → back up, reset a0
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // re-run a0; step1 wait again
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // timeout → re-run a
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a re-ran; wait again
+    EXPECT_EQ(a->total_ticks(), 2);
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // 2nd timeout, retry budget exhausted
-    EXPECT_EQ(a1->tick_count, 0);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // 2nd timeout, budget exhausted
 }
 
 TEST(PipelineTest, RangeRetryResolvesWithinBounds) {
-    // retry=[1,4]: the number of back-up re-runs of a0 must land in [1,4]. a0 is
-    // ticked once initially + once per back-up, so (total_ticks delta) - 1 gives
-    // the back-up count for each run.
+    // retry=[1,4]: the number of action re-runs must land in [1,4]. The
+    // action ticks once initially + once per re-run, so (total_ticks
+    // delta) - 1 gives the re-run count for each run.
     const int lo = 1, hi = 4;
     Pipeline pipe(1, "pipe");
-    auto* a0 = new CountingMockNode(2, "a0", NodeStatus::kSuccess);
-    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
-    pipe.AddStep(std::unique_ptr<MockNode>(static_cast<MockNode*>(a0)), 0, 0);
-    pipe.AddStep(std::unique_ptr<MockNode>(a1), /*timeout_ms=*/10, /*timeout_ms=*/10, lo, hi);
-    pipe.children()[1]->SetCondition(std::make_shared<MockCondition>(NodeStatus::kFailure));
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kSuccess);
+    pipe.AddStep(std::unique_ptr<MockNode>(a),
+                 std::make_shared<MockCondition>(NodeStatus::kFailure),
+                 /*timeout_ms=*/10, /*timeout_ms=*/10, lo, hi);
 
     int seen_min = hi, seen_max = lo;
     for (int run = 0; run < 40; ++run) {
         pipe.Reset();
         Blackboard bb; BtEventQueue ev;
-        int before = a0->total_ticks();
+        int before = a->total_ticks();
         NodeStatus s = NodeStatus::kRunning;
         while (s == NodeStatus::kRunning) {
             s = TickStamp(pipe, bb, ev);
@@ -2759,11 +2912,11 @@ TEST(PipelineTest, RangeRetryResolvesWithinBounds) {
             std::this_thread::sleep_for(std::chrono::milliseconds(12));
         }
         ASSERT_EQ(s, NodeStatus::kFailure);
-        int back_ups = (a0->total_ticks() - before) - 1;  // initial run + one per back-up
-        ASSERT_GE(back_ups, lo);
-        ASSERT_LE(back_ups, hi);
-        seen_min = std::min(seen_min, back_ups);
-        seen_max = std::max(seen_max, back_ups);
+        int reruns = (a->total_ticks() - before) - 1;  // initial run + one per re-run
+        ASSERT_GE(reruns, lo);
+        ASSERT_LE(reruns, hi);
+        seen_min = std::min(seen_min, reruns);
+        seen_max = std::max(seen_max, reruns);
     }
     EXPECT_EQ(seen_min, lo);
     EXPECT_EQ(seen_max, hi);
@@ -2820,12 +2973,13 @@ TEST(NodeGuardTest, AsyncRunningUsesLastResult) {
 }
 
 TEST(PipelineTest, GuardInterruptsActionWhenConditionLost) {
-    // With abort=Self on the step's condition, while the action runs the
-    // condition is monitored; if the page is lost (Failure) the action is
-    // aborted and the step fails.
+    // With abort=Self on the step's (node-level guard) condition, while the
+    // action runs the guard is monitored; if the page is lost (Failure) the
+    // action is aborted and the step fails. The guard is the child's plain
+    // `condition`, NOT its *target.
     Pipeline pipe(1, "pipe");
     auto* a0 = new MockNode(2, "a0", NodeStatus::kRunning);
-    pipe.AddStep(std::unique_ptr<MockNode>(a0), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0), nullptr, 0, 0);
     auto* cond0 = new MockCondition(NodeStatus::kSuccess);
     cond0->set_abort(AbortMode::kSelf);
     pipe.children()[0]->SetCondition(std::shared_ptr<MockCondition>(cond0));
@@ -2835,6 +2989,126 @@ TEST(PipelineTest, GuardInterruptsActionWhenConditionLost) {
     cond0->set_status(NodeStatus::kFailure);             // page lost
     EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // guard interrupts a0 -> step fails
     EXPECT_TRUE(a0->aborted);
+}
+
+// --- Pipeline *target reactive abort tests ---
+
+TEST(PipelineTest, TargetSelfAbortsActionWhenTargetMet) {
+    // abort=Self on *target: while the step's (long) action runs, the target
+    // becoming met aborts the action and advances immediately — the remaining
+    // work is skipped. Contrast GuardInterruptsActionWhenConditionLost: there
+    // the GUARD failing kills the step; here the TARGET being met completes it.
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new CountingMockNode(2, "a0", NodeStatus::kRunning);  // never finishes alone
+    auto* a1 = new MockNode(3, "a1", NodeStatus::kSuccess);
+    auto* t0 = new MockCondition(NodeStatus::kFailure);
+    t0->set_abort(AbortMode::kSelf);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0),
+                 std::shared_ptr<MockCondition>(t0), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1),
+                 std::make_shared<MockCondition>(NodeStatus::kFailure), 0, 0);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 running; t0 unmet
+    EXPECT_FALSE(a0->aborted);
+    t0->set_status(NodeStatus::kSuccess);  // target achieved mid-action
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 aborted; a1 ran; wait t1
+    EXPECT_TRUE(a0->aborted);   // the long action was cut short
+    EXPECT_EQ(a1->tick_count, 1);  // advanced to step 1 the same tick
+}
+
+TEST(PipelineTest, TargetSelfAbsentTargetNoAbort) {
+    // Without abort=Self the classic flow holds: a running action runs to its
+    // own completion even if a target (here absent) would exist. Sanity that
+    // the Self path only engages with the mode set.
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new MockNode(2, "a0", NodeStatus::kRunning);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0),
+                 std::make_shared<MockCondition>(NodeStatus::kSuccess), 0, 0);
+    Blackboard bb; BtEventQueue ev;
+    // Target already met but abort=None: the scan SKIPS the step outright
+    // (no action tick at all) — skip, not abort, is the default path.
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);
+    EXPECT_EQ(a0->tick_count, 0);
+    EXPECT_FALSE(a0->aborted);
+}
+
+// Regression (real-world stuck): an ASYNC target on a later step returns
+// Running on the scans that immediately follow an advance. The pipeline must
+// STAY in the scan phase (never fall into kWait for a step whose action has
+// not run) and run the action once the target resolves to pending (Failure).
+TEST(PipelineTest, AsyncTargetOnAdvanceRescansThenRunsAction) {
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new MockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new CountingMockNode(3, "a1", NodeStatus::kSuccess);
+    auto* t1 = new MockCondition(NodeStatus::kRunning);  // async: Running first
+    pipe.AddStep(std::unique_ptr<MockNode>(a0), nullptr, 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1),
+                 std::shared_ptr<MockCondition>(t1), 0, 0);
+    Blackboard bb; BtEventQueue ev;
+
+    // t1: a0 runs (no target) -> advance -> scan(1) hits Running -> pipeline
+    // Running. a1 must NOT have run: the pipeline is scanning, not waiting.
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    EXPECT_EQ(a1->total_ticks(), 0);
+
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // still scanning
+    EXPECT_EQ(a1->total_ticks(), 0);
+
+    // The async target resolves: not met -> step 1 is pending -> a1 runs.
+    // (The bug previously left the pipeline parked in kWait here forever, so
+    // a1's action - Enter/Tick - never fired.)
+    t1->set_status(NodeStatus::kFailure);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a1 ran; wait target1
+    EXPECT_EQ(a1->total_ticks(), 1);
+}
+
+// Same shape at the INITIAL scan: an async step-0 target parks the pipeline
+// in the scan phase - the action must not run until the verdict is known
+// (skip if met, run if pending).
+TEST(PipelineTest, AsyncTargetAtInitialScanDelaysAction) {
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new CountingMockNode(2, "a0", NodeStatus::kSuccess);
+    auto* t0 = new MockCondition(NodeStatus::kRunning);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0),
+                 std::shared_ptr<MockCondition>(t0), 0, 0);
+    Blackboard bb; BtEventQueue ev;
+
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // scanning
+    EXPECT_EQ(a0->total_ticks(), 0);                            // verdict unknown: hold
+    t0->set_status(NodeStatus::kFailure);                       // pending
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);   // a0 ran; waiting target
+    EXPECT_EQ(a0->total_ticks(), 1);
+}
+
+TEST(PipelineTest, TargetLowerPriorityPreemptsOnRegression) {
+    // abort=LowerPriority on step 0's *target: while step 1's action runs,
+    // step 0's target flipping met→unmet (precondition regressed — e.g. the
+    // app logged out mid-flow) preempts back to step 0 and re-runs it.
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new CountingMockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new MockNode(3, "a1", NodeStatus::kRunning);  // long work
+    auto* t0 = new MockCondition(NodeStatus::kFailure);
+    t0->set_abort(AbortMode::kLowerPriority);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0),
+                 std::shared_ptr<MockCondition>(t0), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), nullptr, 0, 0);
+    Blackboard bb; BtEventQueue ev;
+
+    // t1: a0 runs (t0 unmet); a0 succeeds; wait t0.
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    t0->set_status(NodeStatus::kSuccess);  // t0 met → advance to step 1
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a1 running; t0 observed met
+    EXPECT_EQ(a1->tick_count, 1);
+    EXPECT_FALSE(a1->aborted);
+
+    t0->set_status(NodeStatus::kFailure);  // step 0 regressed while a1 works
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // preempted back to step 0
+    EXPECT_TRUE(a1->aborted);   // the later work was cut
+    EXPECT_EQ(pipe.children()[1].get(), static_cast<Node*>(a1));  // (structure sanity)
+    // Next tick: step 0 re-runs (its target is pending again), then re-waits.
+    int a0_before = a0->total_ticks();
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    EXPECT_GT(a0->total_ticks(), a0_before);  // a0 re-ran
 }
 
 TEST(AbortTest, LowerPriorityPreemptsRunningSibling) {
@@ -2881,40 +3155,29 @@ TEST(AbortTest, ConditionGatesSelectorEntry) {
 
 // --- ScriptCondition + Pipeline integration (Lua, via JSON parser) ---
 
-TEST_F(ScriptNodeIntegrationTest, ScriptConditionTruthySelectsAndRuns) {
-    PutRoot(R"({"type":"Pipeline","children":[)"
-            R"({"type":"Script","source":"scripts/no_args.lua","condition":{"type":"Script","source":"scripts/cond_truthy.lua"}}]})");
-    auto status = RunBtScript(R"(
-        local bt = require('bt')
-        bt.init({root = "res://root.json"})
-        local status, err = bt.exec({interval = 10, max_step = 20})
-        if not status then return false, err end
-        return true, status
-    )");
-    EXPECT_EQ(status, "success");
-}
-
-TEST_F(ScriptNodeIntegrationTest, PipelineScansPastFailingCondition) {
-    // Step 1's condition is never met; step 2's is. Pipeline starts at step 2.
-    PutRoot(R"({"type":"Pipeline","children":[)"
-            R"({"type":"Script","source":"scripts/no_args.lua","condition":{"type":"Script","source":"scripts/cond_falsy.lua"}},)"
-            R"({"type":"Script","source":"scripts/no_args.lua","condition":{"type":"Script","source":"scripts/cond_truthy.lua"}}]})");
-    auto status = RunBtScript(R"(
-        local bt = require('bt')
-        bt.init({root = "res://root.json"})
-        local status, err = bt.exec({interval = 10, max_step = 20})
-        if not status then return false, err end
-        return true, status
-    )");
-    EXPECT_EQ(status, "success");
-}
-
-TEST_F(ScriptNodeIntegrationTest, PipelineNoConditionMetFails) {
-    // cond_falsy never holds → scan finds no match → wait at step 0; *timeout
-    // (ticks) elapses → fail (no previous step to back up to).
+TEST_F(ScriptNodeIntegrationTest, PipelineTargetMetSkipsAction) {
+    // *target holds → the step is skipped; with nothing pending the pipeline
+    // succeeds without running the action.
     PutRoot(R"({"type":"Pipeline","children":[)"
             R"({"type":"Script","source":"scripts/no_args.lua",)"
-            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"*timeout":30}]})");
+            R"("*target":{"type":"Script","source":"scripts/cond_truthy.lua"}}]})");
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 10, max_step = 20})
+        if not status then return false, err end
+        return true, status
+    )");
+    EXPECT_EQ(status, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, PipelinePendingTargetRunsAction) {
+    // *target never met, no timeout → the action runs, then the pipeline
+    // waits on the target until exec's own max_step budget ends (failure).
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/cond_falsy.lua"},)"
+            R"("*timeout":30}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -2925,10 +3188,10 @@ TEST_F(ScriptNodeIntegrationTest, PipelineNoConditionMetFails) {
 }
 
 TEST_F(ScriptNodeIntegrationTest, PipelineArrayTimeoutEquivalentToScalar) {
-    // *timeout as a [lo,hi] array must parse and behave like the scalar 3 above.
+    // *timeout as a [lo,hi] array must parse and behave like the scalar form.
     PutRoot(R"({"type":"Pipeline","children":[)"
             R"({"type":"Script","source":"scripts/no_args.lua",)"
-            R"("condition":{"type":"Script","source":"scripts/cond_falsy.lua"},"*timeout":[30,30]}]})");
+            R"("*target":{"type":"Script","source":"scripts/cond_falsy.lua"},"*timeout":[30,30]}]})");
     auto status = RunBtScript(R"(
         local bt = require('bt')
         bt.init({root = "res://root.json"})
@@ -2938,10 +3201,12 @@ TEST_F(ScriptNodeIntegrationTest, PipelineArrayTimeoutEquivalentToScalar) {
     EXPECT_EQ(status, "failure");
 }
 
-TEST_F(ScriptNodeIntegrationTest, ConditionAndOrNotComposition) {
-    // (cond_falsy OR cond_truthy) AND NOT cond_falsy -> met -> step runs.
+TEST_F(ScriptNodeIntegrationTest, TargetAndOrNotComposition) {
+    // *target composes with And/Or/Not: (falsy OR truthy) AND NOT falsy is
+    // met → step skipped → success.
     PutRoot(R"({"type":"Pipeline","children":[)"
-            R"({"type":"Script","source":"scripts/no_args.lua","condition":)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*target":)"
             R"({"type":"And","children":[)"
             R"({"type":"Or","children":[)"
             R"({"type":"Script","source":"scripts/cond_falsy.lua"},)"
@@ -2964,24 +3229,27 @@ TEST_F(ScriptNodeIntegrationTest, ConditionAndOrNotComposition) {
 // e2e_run (action: long-running, optional mid-run bb write + Exit tracking),
 // e2e_decay (cond: holds N ticks then fails).
 
-// Scenario 1 — checkout flow: Pipeline (scan + wait + retry back-up) with a
-// parameterized Subtree for one step. A flaky navigation forces a retry back-up.
+// Scenario 1 — checkout flow: Pipeline (*target skip/act/wait/retry) with a
+// parameterized Subtree for one step. Each step's *target is "page == X"; the
+// action navigates to X. A flaky navigation (first attempt doesn't take)
+// forces one *retry re-run of that step's own action.
 TEST_F(ScriptNodeIntegrationTest, E2E_CheckoutPipelineWithSubtreeAndRetry) {
     // Subtree wraps the navigate action; {{to}}/{{flaky}} templated by the step.
     resource_provider->Put("nav.json",
         R"({"type":"Script","source":"scripts/e2e_goto.lua",)"
         R"("params":{"to":"{{to}}","flaky":"{{flaky}}"}})");
     PutRoot(R"({"type":"Pipeline","children":[)"
-            // step 1: on home -> open cart (flaky 1st attempt) via Subtree
+            // step 1: target cart (not there) -> navigate (flaky 1st attempt) via Subtree
             R"({"type":"Subtree","source":"res://nav.json","params":{"to":"cart","flaky":1},)"
-            R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"home"}}},)"
-            // step 2: on cart -> go to checkout; wait for cart with retry back-up
-            R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"checkout"},)"
-            R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"cart"}},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"cart"}},)"
             R"("*timeout":30,"*retry":1},)"
-            // step 3: on checkout -> mark done
+            // step 2: target checkout -> navigate; retry covers a flaky no-op
+            R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"checkout"},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"checkout"}},)"
+            R"("*timeout":30,"*retry":1},)"
+            // step 3: target done -> set it
             R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"done","value":true},)"
-            R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"checkout"}}})"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"done","value":true}}})"
             R"(]})");
     blackboard->Set("page", LuaValue(std::string("home")));  // start on home
 
@@ -2991,8 +3259,117 @@ TEST_F(ScriptNodeIntegrationTest, E2E_CheckoutPipelineWithSubtreeAndRetry) {
         return bt.exec({interval = 10, max_step = 30})
     )");
     EXPECT_EQ(status, "success");
-    EXPECT_EQ(*blackboard->Get("done"), LuaValue(true));                       // flow completed
+    EXPECT_EQ(*blackboard->Get("page"), LuaValue(std::string("checkout")));      // navigated
+    EXPECT_EQ(*blackboard->Get("done"), LuaValue(true));                        // flow completed
     EXPECT_EQ(*blackboard->Get("goto_cart"), LuaValue(static_cast<int64_t>(2)));  // retried once
+}
+
+// Scenario 1b — mid-flow resume: the pipeline re-enters with the checkout
+// step already done (its target holds) → that step's action is skipped and
+// the flow completes from where it left off.
+TEST_F(ScriptNodeIntegrationTest, E2E_PipelineSkipsCompletedStepsOnReentry) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"cart"},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"cart"}}},)"
+            R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"done","value":true},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"done","value":true}}})"
+            R"(]})");
+    blackboard->Set("page", LuaValue(std::string("cart")));  // cart already reached
+    blackboard->Set("goto_cart", LuaValue(static_cast<int64_t>(99)));  // marker: if this changes, the action ran
+
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10, max_step = 30})
+    )");
+    EXPECT_EQ(status, "success");
+    EXPECT_EQ(*blackboard->Get("goto_cart"), LuaValue(static_cast<int64_t>(99)));  // step 0 skipped
+    EXPECT_EQ(*blackboard->Get("done"), LuaValue(true));                           // step 1 ran
+}
+
+// Scenario 1c — *target params resolve `$key` blackboard references: the
+// wanted page comes from the blackboard ("want"), the current page from
+// "page". The target is met only when the two match — the $want ref must be
+// resolved from the blackboard for the skip to work at all.
+TEST_F(ScriptNodeIntegrationTest, E2E_PipelineTargetParamsResolveBbRefs) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"cart"},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua",)"
+            R"("params":{"key":"page","value":"$want"}}},)"
+            R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"done","value":true},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"done","value":true}}})"
+            R"(]})");
+    blackboard->Set("want", LuaValue(std::string("home")));  // $want → "home"...
+
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("want", "cart")   -- the $want ref reads THIS at Enter
+        bb.set("page", "home")   -- not on cart yet: step 0 is pending
+        bt.init({root = "res://root.json"})
+        local status = bt.exec({interval = 10, max_step = 30})
+        return status, bb.get("page")
+    )");
+    EXPECT_EQ(status, "success");
+    // Step 0 ran (target unmet at entry) and navigated to cart; the wait then
+    // saw page==cart==$want and advanced. Step 1 ran to done.
+    EXPECT_EQ(*blackboard->Get("page"), LuaValue(std::string("cart")));
+    EXPECT_EQ(*blackboard->Get("done"), LuaValue(true));
+}
+
+// Scenario 1d — *target abort=Self end-to-end: a long-running action is cut
+// short the moment its target is achieved externally (the "page" appears
+// while the filler action still runs); the pipeline advances immediately.
+TEST_F(ScriptNodeIntegrationTest, E2E_TargetSelfAbortsLongAction) {
+    // Filler action runs 30 ticks and would exceed max_step; a parallel
+    // condition flip (page=cart at tick ~3, via e2e_run's set_at) makes the
+    // *target met mid-action → Self abort cuts the action → advance.
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/e2e_run.lua",)"
+            R"("params":{"ticks":0,"set_at":3,"set_key":"page","set_val":"cart","exit_key":"fill_exit"},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"cart"},)"
+            R"("abort":"Self"}},)"
+            R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"done","value":true},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"done","value":true}}})"
+            R"(]})");
+    blackboard->Set("page", LuaValue(std::string("home")));
+
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10, max_step = 30})
+    )");
+    EXPECT_EQ(status, "success");  // NOT timeout: the Self abort cut the filler short
+    ASSERT_TRUE(blackboard->Has("fill_exit"));
+    EXPECT_EQ(*blackboard->Get("fill_exit"), LuaValue(std::string("aborted")));  // cut mid-run
+    EXPECT_EQ(*blackboard->Get("done"), LuaValue(true));  // advanced + completed
+}
+
+// Scenario 1e — *target abort=LowerPriority end-to-end: while step 1 works,
+// step 0's target regresses (page flips away) → preempt back to step 0, redo
+// it, then continue to success.
+TEST_F(ScriptNodeIntegrationTest, E2E_TargetLowerPriorityPreemptsOnRegression) {
+    // Step 0: goto cart (target cart). Step 1: flip_once flips page AWAY from
+    // cart exactly once (blackboard counter survives the Reset — otherwise
+    // every redo would flip again and preempt forever); afterwards it succeeds.
+    // Step 0's LowerPriority target sees the regression, preempts, step 0
+    // re-navigates, the flow completes.
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"cart"},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"cart"},)"
+            R"("abort":"LowerPriority"}},)"
+            R"({"type":"Script","source":"scripts/flip_once.lua"})"
+            R"(]})");
+    blackboard->Set("page", LuaValue(std::string("home")));
+
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10, max_step = 40})
+    )");
+    EXPECT_EQ(status, "success");
+    EXPECT_EQ(*blackboard->Get("goto_cart"), LuaValue(static_cast<int64_t>(2)));  // step 0 redone once
+    EXPECT_EQ(*blackboard->Get("page"), LuaValue(std::string("cart")));  // back on cart
 }
 
 // Scenario 2 — condition interrupt (Self): a long form-filling action runs under
@@ -3096,6 +3473,102 @@ TEST(RetryTest, RangeMaxCountResolvesWithinBounds) {
     EXPECT_EQ(max_seen, hi);
 }
 
+// --- Retry interval Tests ---
+//
+// `interval` (ms) spaces out retry attempts with a tick-driven wall-clock
+// wait: after a failed attempt the child is Reset but not re-ticked until
+// the (possibly range-rolled, once per run) interval elapses. Driven here
+// with VIRTUAL tick time via BeginTick(t) — no sleeps, fully deterministic.
+
+TEST(RetryTest, IntervalHoldsChildBetweenAttempts) {
+    // Fixed 50ms interval: after each failure the child idles until 50ms of
+    // tick time pass (ticks inside the window don't reach the child). With
+    // max_count=4 the 4th failure (at t=100) exhausts the cap immediately.
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new CountingMockNode(2, "c", NodeStatus::kFailure);
+    Retry r(1, "r", 4, 50, 50, std::unique_ptr<MockNode>(child));
+
+    events.BeginTick(0);
+    EXPECT_EQ(r.Tick(bb, events), NodeStatus::kRunning);  // attempt 1, wait starts
+    events.BeginTick(49);
+    EXPECT_EQ(r.Tick(bb, events), NodeStatus::kRunning);  // 49-0 < 50: still holding
+    EXPECT_EQ(child->total_ticks(), 1);
+    events.BeginTick(50);
+    EXPECT_EQ(r.Tick(bb, events), NodeStatus::kRunning);  // 50-0 >= 50: attempt 2
+    EXPECT_EQ(child->total_ticks(), 2);
+    events.BeginTick(99);
+    EXPECT_EQ(r.Tick(bb, events), NodeStatus::kRunning);  // 99-50 < 50: holding
+    EXPECT_EQ(child->total_ticks(), 2);
+    events.BeginTick(100);
+    EXPECT_EQ(r.Tick(bb, events), NodeStatus::kRunning);  // attempt 3 (3 < 4), wait starts
+    EXPECT_EQ(child->total_ticks(), 3);
+    events.BeginTick(150);
+    EXPECT_EQ(r.Tick(bb, events), NodeStatus::kFailure);  // attempt 4 exhausts cap
+    EXPECT_EQ(child->total_ticks(), 4);
+}
+
+TEST(RetryTest, IntervalNotAppliedBeforeFirstAttempt) {
+    // The wait sits BETWEEN attempts: the very first tick reaches the child
+    // immediately even with a huge interval.
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new CountingMockNode(2, "c", NodeStatus::kSuccess);
+    Retry r(1, "r", 3, 10'000, 10'000, std::unique_ptr<MockNode>(child));
+
+    events.BeginTick(0);
+    EXPECT_EQ(r.Tick(bb, events), NodeStatus::kSuccess);
+    EXPECT_EQ(child->total_ticks(), 1);
+}
+
+TEST(RetryTest, IntervalRangeStaysInBounds) {
+    // [20,40]ms: no second attempt before 20ms, one by 40ms — whatever was
+    // rolled lands inside the window (probe from t=0, wait starts there).
+    Blackboard bb;
+    BtEventQueue events;
+    auto* child = new CountingMockNode(2, "c", NodeStatus::kFailure);
+    Retry r(1, "r", 2, 20, 40, std::unique_ptr<MockNode>(child));
+
+    events.BeginTick(0);
+    ASSERT_EQ(r.Tick(bb, events), NodeStatus::kRunning);  // rolls + attempt 1
+    events.BeginTick(19);
+    EXPECT_EQ(r.Tick(bb, events), NodeStatus::kRunning);  // 19 < lo 20 for any roll
+    EXPECT_EQ(child->total_ticks(), 1);
+    events.BeginTick(40);
+    EXPECT_EQ(r.Tick(bb, events), NodeStatus::kFailure);  // 40 >= hi: attempt 2 exhausts cap
+    EXPECT_EQ(child->total_ticks(), 2);
+}
+
+TEST(RetryTest, IntervalRangeRolledPerRun) {
+    // Interval [1,2]ms over many runs: probe when the second attempt becomes
+    // allowed; both 1 and 2 must occur (a real per-run roll, not a clamp).
+    Blackboard bb;
+    BtEventQueue events;
+    int min_iv = 99, max_iv = -1;
+    for (int run = 0; run < 200; ++run) {
+        auto* child = new CountingMockNode(2, "c", NodeStatus::kFailure);
+        Retry r(1, "r", 5, 1, 2, std::unique_ptr<MockNode>(child));
+        events.BeginTick(0);
+        ASSERT_EQ(r.Tick(bb, events), NodeStatus::kRunning);  // attempt 1
+        int iv;
+        events.BeginTick(1);
+        r.Tick(bb, events);
+        if (child->total_ticks() == 2) {
+            iv = 1;  // interval elapsed by t=1
+        } else {
+            events.BeginTick(2);
+            r.Tick(bb, events);
+            ASSERT_EQ(child->total_ticks(), 2);  // must elapse by t=2
+            iv = 2;
+        }
+        min_iv = std::min(min_iv, iv);
+        max_iv = std::max(max_iv, iv);
+        r.Reset();
+    }
+    EXPECT_EQ(min_iv, 1);
+    EXPECT_EQ(max_iv, 2);
+}
+
 TEST_F(BehaviorTreeEngineTest, ParseRepeatRetryRanges) {
     // Range / scalar / absent forms parse; bad shapes error.
     auto ok1 = TreeParser::Parse(
@@ -3120,6 +3593,30 @@ TEST_F(BehaviorTreeEngineTest, ParseRepeatRetryRanges) {
     EXPECT_EQ(nullptr, bad2.root);
 }
 
+TEST_F(BehaviorTreeEngineTest, ParseRetryInterval) {
+    // `interval` accepts scalar / [lo,hi] / absent; bad shapes are errors.
+    auto ok1 = TreeParser::Parse(
+        R"({"type":"Retry","params":{"max_count":3,"interval":100},)"
+        R"("child":{"type":"Success"}})");
+    ASSERT_NE(nullptr, ok1.root);
+    EXPECT_TRUE(ok1.error.empty());
+    auto ok2 = TreeParser::Parse(
+        R"({"type":"Retry","params":{"max_count":3,"interval":[200,500]},)"
+        R"("child":{"type":"Success"}})");
+    ASSERT_NE(nullptr, ok2.root);
+    auto ok3 = TreeParser::Parse(
+        R"({"type":"Retry","params":{"interval":0},"child":{"type":"Success"}})");
+    ASSERT_NE(nullptr, ok3.root);  // 0 = immediate retry (legacy default)
+
+    auto bad1 = TreeParser::Parse(
+        R"({"type":"Retry","params":{"interval":"100"},"child":{"type":"Success"}})");
+    EXPECT_EQ(nullptr, bad1.root);
+    EXPECT_NE(bad1.error.find("Retry 'interval' must be a number or a"), std::string::npos);
+    auto bad2 = TreeParser::Parse(
+        R"({"type":"Retry","params":{"interval":[1,2,3]},"child":{"type":"Success"}})");
+    EXPECT_EQ(nullptr, bad2.root);
+}
+
 TEST_F(ScriptNodeIntegrationTest, RepeatRangeRunsEndToEnd) {
     // End-to-end via bt.init/exec: the [lo,hi] count form parses and runs to
     // completion (the exact rolled value is covered by the C++ range tests).
@@ -3129,6 +3626,21 @@ TEST_F(ScriptNodeIntegrationTest, RepeatRangeRunsEndToEnd) {
         local bt = require('bt')
         bt.init({root = "res://root.json"})
         return bt.exec({interval = 10, timeout = 5000})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, RetryIntervalRunsEndToEnd) {
+    // End-to-end: Retry{max_count:3, interval:[10,20]} around a child that
+    // fails, then succeeds on the re-run after the wait. The wait is bounded
+    // by the rolled interval (<=20ms), well under the exec timeout.
+    PutRoot(R"({"type":"Retry","params":{"max_count":3,"interval":[10,20]},)"
+            R"("child":{"type":"Script","source":"scripts/fail_then_ok.lua"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 5, timeout = 5000})
     )"));
     ASSERT_EQ(r.status, LUA_OK);
     EXPECT_EQ(std::get<std::string>(r.values[0]), "success");

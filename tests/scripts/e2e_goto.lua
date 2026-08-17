@@ -1,6 +1,6 @@
 -- Action: simulate navigating to a page. Sets blackboard["page"] = `to`.
 -- With `flaky` = N, the first N attempts "don't take" (leave the page
--- unchanged) so a Pipeline retry-back-up has something to recover from.
+-- unchanged) so a Pipeline step *retry re-run has something to recover from.
 -- Attempt count is kept on the blackboard (per target) so it survives Reset.
 local M = {}
 function M:Enter(p)

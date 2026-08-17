@@ -7,8 +7,10 @@
 
 #include <async_simple/coro/Lazy.h>
 
+class Blackboard;
 class Node;
 class ResourceProvider;
+struct lua_State;
 
 // Result of building a behavior-tree Node tree from JSON definitions.
 struct ParseResult {
@@ -27,20 +29,33 @@ struct ParseResult {
 //
 //   params — optional object of template values. When non-empty, every {{key}}
 //            placeholder in ANY string field of the root JSON is substituted
-//            (same rules as Subtree param forwarding): a whole-value
-//            "{{key}}" keeps the param's original type, an embedded placeholder
+//            (same rules as Subtree param forwarding): a whole-value "{{key}}"
+//            keeps the param's original type, an embedded placeholder
 //            interpolates as text, an unknown key is left literal + warned.
+//
+//   blackboard — optional; when present, Pipeline edge params (`*timeout`,
+//            `*retry`) accept a "$key" blackboard reference: the value is read
+//            from the blackboard AT PARSE TIME (providers invoke fresh) and
+//            must be an integer or a [lo,hi] pair, then behaves exactly like
+//            the literal forms. An unresolvable reference is a parse ERROR
+//            (fail fast), not a silent 0.
 class TreeParser {
 public:
     // bt.init entry: load root file, recursively load subtrees by path.
+    // `blackboard`/`L` (optional) enable "$key" blackboard references in
+    // Pipeline edge params (`*timeout`/`*retry`) — read at parse time; L is
+    // the runtime's main state, needed when a referenced value is a table.
     static async_simple::coro::Lazy<ParseResult> LoadAndParse(
         const std::string& root_path,
         std::shared_ptr<ResourceProvider> provider,
-        nlohmann::json params = nlohmann::json::object());
+        nlohmann::json params = nlohmann::json::object(),
+        std::shared_ptr<Blackboard> blackboard = nullptr,
+        lua_State* L = nullptr);
 
     // Sync entry (unit tests): parse a root node JSON object directly. No file
     // loading — Subtree nodes are unsupported here (no loader) and will error.
     // `params` templating is applied exactly like LoadAndParse's.
     static ParseResult Parse(const std::string& root_json,
-                             nlohmann::json params = nlohmann::json::object());
+                             nlohmann::json params = nlohmann::json::object(),
+                             std::shared_ptr<Blackboard> blackboard = nullptr);
 };

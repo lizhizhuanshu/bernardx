@@ -4,3 +4,6 @@ build
 .cache
 .devcontainer
 .vscode
+build_test/
+
+# local test build
