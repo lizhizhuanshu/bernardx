@@ -107,7 +107,7 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | `Script` | 叶子 | `source`, `params` | 执行 Lua 脚本 |
 | `Set` | 叶子 | `params` | **内置黑板写 Action**（零脚本）：`params.key`（必填）写入目标键；`params.value`（标量，缺省写 nil）写入值。字符串值以 `$` 开头为黑板引用——`"$src"` 在**每次 Tick** 实时读 `blackboard[src]` 拷入（缺键写 nil 并告警），`"$$x"` 转义为字面 `"$x"`。写入后立即 Success，常与 `Blackboard` 条件配合组成纯声明式树 |
 | `Subtree` | 叶子 | `source`, `params` | 加载 `source` 指向的子树 JSON（递归）；`params` 透传给子树内节点（见[子树参数透传](#子树参数透传)）；`condition` 支持 `"child_condition"` 透传子树根的条件（见上[节点结构](#节点结构)） |
-| `Template` | —（解析期展开） | `source`, `params` | **模板内联展开**：与 Subtree 完全相同的加载/`{{}}` 参数替换/`data` 引用解析，但**不产生运行时节点**——解析时把目标节点直接替换到 Template 的位置（树里不存在包装层）。Template 自身声明的 `condition` 转挂到展开后的根节点上。适合把参数化片段内联进 Pipeline 步骤等"包装纯属噪音"的场合 |
+| `Template` | —（解析期展开） | `source`, `params` | **模板内联展开**：与 Subtree 完全相同的加载/`{{}}` 参数替换/`data` 引用解析，但**不产生运行时节点**——解析时把目标节点直接替换到 Template 的位置（树里不存在包装层）。Template 自身声明的 `condition` 转挂到展开后的根节点上。**参数即契约**：模板 JSON 需要而上层 `params` 未提供的 `{{key}}` 是**解析期硬错误**（报错列出全部缺失键与模板名），不会留字面量拖到运行期。适合把参数化片段内联进 Pipeline 步骤等"包装纯属噪音"的场合 |
 | `Wait` | 叶子 | `params` | 等待若干毫秒后 Success：`params.timeout` 为**数值**（固定等待，默认 1000）或**两元素数组 `[lo, hi]`**（闭区间均匀随机，每次运行重摇；`[v]` 等价固定 v）。`0` 立即 Success。旧 `min_timeout`/`max_timeout` 已移除，出现即解析报错 |
 | `Success` | 叶子 | — | 恒 Success（常用于挂 `condition` 的"已达成→成功"分支，如 Selector 第一支：条件成立即短路） |
 | `Failure` | 叶子 | — | 恒 Failure |

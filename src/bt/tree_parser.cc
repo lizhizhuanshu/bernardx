@@ -164,6 +164,34 @@ void SubstituteTemplates(json& target, const json& params) {
     target = SubstitutePartial(s, params);
 }
 
+// Collect every {{key}} placeholder still present in `target` (whole-value
+// and embedded forms; empty/whitespace keys ignored). Used by Template to
+// enforce its param contract: whatever remains after substitution was
+// REQUIRED by the template JSON but not provided by the upper layer.
+void CollectPlaceholders(const json& target, std::set<std::string>& out) {
+    if (target.is_object() || target.is_array()) {
+        for (const auto& el : target) CollectPlaceholders(el, out);
+        return;
+    }
+    if (!target.is_string()) return;
+    std::string s = target.get<std::string>();
+    std::string key;
+    if (MatchWholePlaceholder(s, key)) {
+        if (!key.empty()) out.insert(key);
+        return;
+    }
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t open = s.find("{{", pos);
+        if (open == std::string::npos) break;
+        size_t close = s.find("}}", open + 2);
+        if (close == std::string::npos) break;
+        std::string k = TrimWs(s.substr(open + 2, close - (open + 2)));
+        if (!k.empty()) out.insert(k);
+        pos = close + 2;
+    }
+}
+
 // --- Data references (`.path`) ---
 //
 // A root JSON may carry a top-level `data` object: a lookup table of named
@@ -753,6 +781,28 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseTemplate(const json& j, Par
     if (j.contains("params") && j["params"].is_object() && !j["params"].empty()) {
         SubstituteTemplates(sub_j, j["params"]);
     }
+
+    // A Template's params are its CONTRACT: any {{key}} the loaded JSON needs
+    // that this Template's params don't supply is a hard parse error naming
+    // the missing keys - instead of silently leaving the literal placeholder
+    // to blow up later as a bogus script path / selector. (A residual key
+    // that a DEEPER Template would supply still counts as missing here: each
+    // level provides its own, so pass it down via this level's params.)
+    {
+        std::set<std::string> missing;
+        CollectPlaceholders(sub_j, missing);
+        if (!missing.empty()) {
+            std::string keys;
+            for (const auto& k : missing) {
+                if (!keys.empty()) keys += ", ";
+                keys += "{{" + k + "}}";
+            }
+            SetError(ctx, "Template '" + source + "' missing required params: " + keys +
+                          " (provide them via the Template node's 'params')");
+            co_return nullptr;
+        }
+    }
+
     ApplyDataResolution(sub_j);
 
     ctx.resolving.insert(source);

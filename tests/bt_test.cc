@@ -1427,6 +1427,49 @@ TEST(TreeParserTemplate, DetectsCircularReference) {
     EXPECT_NE(res.error.find("circular"), std::string::npos);
 }
 
+// A Template's params are its contract: required-but-missing {{key}}s are a
+// hard parse error naming each key (not a silent literal left to fail later).
+TEST(TreeParserTemplate, MissingParamsFailParseWithKeyNames) {
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    provider->Put("tpl.json",
+        R"({"type":"Script","source":"scripts/{{dir}}/{{name}}.lua","params":{"sel":"{{sel}}"}})");
+    provider->Put("root.json", R"({"type":"Template","source":"res://tpl.json"})");
+
+    auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
+    EXPECT_EQ(nullptr, res.root);
+    EXPECT_NE(res.error.find("missing required params"), std::string::npos);
+    EXPECT_NE(res.error.find("{{dir}}"), std::string::npos);
+    EXPECT_NE(res.error.find("{{name}}"), std::string::npos);
+    EXPECT_NE(res.error.find("{{sel}}"), std::string::npos);
+    EXPECT_NE(res.error.find("tpl.json"), std::string::npos);  // names the template
+}
+
+// Supplying one of several required keys still errors on the rest - partial
+// coverage is partial failure.
+TEST(TreeParserTemplate, PartialParamsStillErrorOnMissing) {
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    provider->Put("tpl.json", R"({"type":"Script","source":"scripts/{{a}}_{{b}}.lua"})");
+    provider->Put("root.json",
+        R"({"type":"Template","source":"res://tpl.json","params":{"a":"x"}})");
+
+    auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
+    EXPECT_EQ(nullptr, res.root);
+    EXPECT_NE(res.error.find("{{b}}"), std::string::npos);
+    EXPECT_EQ(std::string::npos, res.error.find("{{a}}"));  // supplied one is gone
+}
+
+// All required keys supplied -> parses fine (sanity against over-eager errors).
+TEST(TreeParserTemplate, AllParamsSuppliedParses) {
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    provider->Put("tpl.json", R"({"type":"Script","source":"scripts/{{a}}_{{b}}.lua"})");
+    provider->Put("root.json",
+        R"({"type":"Template","source":"res://tpl.json","params":{"a":"x","b":"y"}})");
+
+    auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
+    ASSERT_NE(nullptr, res.root);
+    EXPECT_TRUE(res.error.empty());
+}
+
 // E2E: a Template used inline inside a Pipeline expands to a plain step -
 // path_report / execution see the expanded Script, not a wrapper.
 TEST_F(ScriptNodeIntegrationTest, TemplateInsidePipelineRunsExpanded) {
