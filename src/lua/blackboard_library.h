@@ -5,6 +5,7 @@
 #include "lua_library.h"
 
 class Blackboard;
+class lua_State;
 
 class BlackboardLibrary : public LuaLibrary {
 public:

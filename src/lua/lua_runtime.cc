@@ -389,6 +389,10 @@ struct LuaRefImpl : public LuaRefBase {
             rt->PushRelease({ref});
         }
     }
+    lua_State* state() const override {
+        auto rt = rt_.lock();
+        return rt ? rt->main_state() : nullptr;
+    }
 private:
     std::weak_ptr<LuaRuntime> rt_;
     LuaRefImpl(int r, int t, std::weak_ptr<LuaRuntime> rt)

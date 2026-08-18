@@ -6,12 +6,21 @@
 #include <variant>
 #include <vector>
 
+extern "C" {
+#include "lua.h"
+}
+
 using AsyncHandle = int64_t;
+
+struct lua_State;
 
 struct LuaRefBase {
     const int ref;
     const int type;
     virtual ~LuaRefBase() = default;
+    // The state owning this registry ref (nullptr for refs created outside a
+    // runtime). Lets holders index a table ref without carrying a lua_State.
+    virtual lua_State* state() const { return nullptr; }
 protected:
     LuaRefBase(int r, int t) : ref(r), type(t) {}
 };

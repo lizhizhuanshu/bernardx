@@ -1277,6 +1277,147 @@ TEST_F(ScriptNodeIntegrationTest, BbRefConditionResolvesAtEnter) {
     EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[1]));
 }
 
+// --- Dotted-key blackboard reads (`proxy.ip` = field of a table value) ---
+//
+// Get("a.b") descends into the table stored under "a". Literal keys win over
+// descent. Applies uniformly to bb.get, `$key` params, Blackboard conditions
+// and Set-node references — all funnel through Blackboard::Get.
+
+TEST_F(ScriptNodeIntegrationTest, DottedKeyGetDescendsIntoTable) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        bb.set("proxy", {ip = "10.0.0.1", port = 8100, net = {mtu = 1500}})
+        return bb.get("proxy.ip"),
+               bb.get("proxy.port"),
+               bb.get("proxy.net.mtu"),
+               bb.get("proxy.host"),
+               bb.get("ghost.ip")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 5u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "10.0.0.1");
+    EXPECT_EQ(std::get<int64_t>(r.values[1]), 8100);
+    EXPECT_EQ(std::get<int64_t>(r.values[2]), 1500);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[3]));  // absent field
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[4]));  // missing root
+}
+
+TEST_F(ScriptNodeIntegrationTest, DottedKeyLiteralShadowsTable) {
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        bb.set("proxy", {ip = "from-table"})
+        bb.set("proxy.ip", "literal-wins")   -- literal key shadows descent
+        return bb.get("proxy.ip")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(std::get<std::string>(r.values[0]), "literal-wins");
+}
+
+TEST_F(ScriptNodeIntegrationTest, DottedKeyThroughProviderRoot) {
+    // A dotted read on a provider root PASSES the remaining segments to the
+    // provider as string args; its return value IS the result (no descent).
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        bb.set("cfg", {host = "h0", net = {ip = "1.1.1.1"}})
+        bb.set_provider("live", function(...)
+            local path = {...}
+            local cur = bb.get("cfg")
+            for _, seg in ipairs(path) do
+                if type(cur) ~= "table" then return nil end
+                cur = cur[seg]
+            end
+            return cur
+        end)
+        return bb.get("live.host"),      -- fn("host")      -> "h0"
+               bb.get("live.net.ip"),     -- fn("net","ip")  -> "1.1.1.1"
+               bb.get("live.net.mtu")     -- fn("net","mtu") -> nil
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 3u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "h0");
+    EXPECT_EQ(std::get<std::string>(r.values[1]), "1.1.1.1");
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[2]));
+}
+
+
+TEST_F(ScriptNodeIntegrationTest, DottedKeyProviderSeesExactArgs) {
+    // The provider receives the path segments verbatim (varargs), so it can
+    // branch on them - here building a joined key string.
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        bb.set_provider("env", function(...)
+            return table.concat({...}, ":")
+        end)
+        return bb.get("env"),        -- no args    -> ""
+               bb.get("env.a.b")     -- "a","b"    -> "a:b"
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "");
+    EXPECT_EQ(std::get<std::string>(r.values[1]), "a:b");
+}
+
+TEST_F(ScriptNodeIntegrationTest, DottedKeyTableRefValue) {
+    // A mid-path table resolves to a live table value (descended refs are
+    // usable: index them again from Lua).
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        bb.set("cfg", {net = {ip = "1.2.3.4"}})
+        local net = bb.get("cfg.net")
+        return type(net), net.ip
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "table");
+    EXPECT_EQ(std::get<std::string>(r.values[1]), "1.2.3.4");
+}
+
+TEST_F(ScriptNodeIntegrationTest, DottedKeyBbRefParamAtEnter) {
+    // params.target = "$proxy.ip" → at Enter the dotted key descends into the
+    // proxy table; the script echoes the resolved value back.
+    PutRoot(R"({"type":"Script","source":"scripts/bb_ref_args.lua","params":{"target":"$proxy.ip"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("proxy", {ip = "10.0.0.9"})
+        bt.init({root = "res://root.json"})
+        bt.exec({interval = 10})
+        return bb.get("got_target")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(std::get<std::string>(r.values[0]), "10.0.0.9");
+}
+
+TEST_F(ScriptNodeIntegrationTest, DottedKeyBlackboardCondition) {
+    // A Blackboard condition's key may be dotted: guard on proxy.port.
+    PutRoot(R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"proxy.port","op":"<=","value":9000}}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("proxy", {port = 8100})
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, DottedKeySetNodeReference) {
+    // Set's "$cfg.src" reference form reads the dotted path fresh each Tick.
+    PutRoot(R"({"type":"Sequence","children":[)"
+            R"({"type":"Set","params":{"key":"target","value":"$cfg.net.ip"}},)"
+            R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"target","op":"==","value":"1.1.1.1"}}}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set("cfg", {net = {ip = "1.1.1.1"}})
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+}
+
 TEST_F(ScriptNodeIntegrationTest, SelfPersistsAcrossTicks) {
     PutRoot(R"({"type":"Script","source":"scripts/counter.lua"})");
     auto status = RunBtScript(R"(
@@ -1408,7 +1549,7 @@ TEST(TreeParserTemplate, ConditionReattachesToExpandedRoot) {
     provider->Put("tpl.json", R"({"type":"Script","source":"a.lua"})");
     provider->Put("root.json",
         R"({"type":"Template","source":"res://tpl.json",)"
-        R"("condition":{"type":"Blackboard","key":"flag","op":"=="}})");
+        R"("condition":{"type":"Blackboard","params":{"key":"flag","op":"=="}}})");
 
     auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
     ASSERT_NE(nullptr, res.root);
@@ -1957,7 +2098,7 @@ TEST(RetryTest, ResetClearsAttempts) {
 
 // --- BlackboardCondition Tests ---
 //
-// {"type":"Blackboard","key":k,"op":op,"value":v} compares blackboard[k]
+// {"type":"Blackboard","params":{"key":k,"op":op,"value":v}} compares blackboard[k]
 // against the literal v. Missing key -> Failure for EVERY op (incl. !=).
 
 TEST(BlackboardConditionTest, EqualityOps) {
@@ -2110,7 +2251,7 @@ TEST(BlackboardConditionTest, Key2MissingEitherSideFails) {
 TEST_F(BehaviorTreeEngineTest, ParseBlackboardCondition) {
     // Valid: guarded Success with a Blackboard condition parses clean.
     auto ok = TreeParser::Parse(
-        R"({"type":"Success","condition":{"type":"Blackboard","key":"page","op":">","value":3}})");
+        R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"page","op":">","value":3}}})");
     ASSERT_NE(nullptr, ok.root);
     EXPECT_TRUE(ok.error.empty());
     ASSERT_NE(nullptr, ok.root->condition());
@@ -2118,25 +2259,31 @@ TEST_F(BehaviorTreeEngineTest, ParseBlackboardCondition) {
 
     // Missing key -> parse error.
     auto nokey = TreeParser::Parse(
-        R"({"type":"Success","condition":{"type":"Blackboard","op":"=="}})");
+        R"({"type":"Success","condition":{"type":"Blackboard","params":{"op":"=="}}})");
     EXPECT_EQ(nullptr, nokey.root);
-    EXPECT_NE(nokey.error.find("missing 'key'"), std::string::npos);
+    EXPECT_NE(nokey.error.find("missing 'params.key'"), std::string::npos);
+
+    // Legacy flat form (fields beside "type") -> parse error pointing at params.
+    auto flat = TreeParser::Parse(
+        R"({"type":"Success","condition":{"type":"Blackboard","key":"page","op":"==","value":"home"}})");
+    EXPECT_EQ(nullptr, flat.root);
+    EXPECT_NE(flat.error.find("inside 'params'"), std::string::npos);
 
     // Unknown op -> parse error.
     auto badop = TreeParser::Parse(
-        R"({"type":"Success","condition":{"type":"Blackboard","key":"k","op":"=~"}})");
+        R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"k","op":"=~"}}})");
     EXPECT_EQ(nullptr, badop.root);
     EXPECT_NE(badop.error.find("unknown op"), std::string::npos);
 
     // Non-scalar value -> parse error.
     auto objval = TreeParser::Parse(
-        R"({"type":"Success","condition":{"type":"Blackboard","key":"k","value":{"a":1}}})");
+        R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"k","value":{"a":1}}}})");
     EXPECT_EQ(nullptr, objval.root);
     EXPECT_NE(objval.error.find("must be a scalar"), std::string::npos);
 
     // Ordering op with bool value -> parse error.
     auto boolord = TreeParser::Parse(
-        R"({"type":"Success","condition":{"type":"Blackboard","key":"k","op":">","value":true}})");
+        R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"k","op":">","value":true}}})");
     EXPECT_EQ(nullptr, boolord.root);
     EXPECT_NE(boolord.error.find("needs a number or string"), std::string::npos);
 }
@@ -2144,25 +2291,25 @@ TEST_F(BehaviorTreeEngineTest, ParseBlackboardCondition) {
 TEST_F(BehaviorTreeEngineTest, ParseBlackboardConditionKey2) {
     // Valid key-vs-key form parses clean.
     auto ok = TreeParser::Parse(
-        R"({"type":"Success","condition":{"type":"Blackboard","key":"hp","op":">","key2":"shield"}})");
+        R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"hp","op":">","key2":"shield"}}})");
     ASSERT_NE(nullptr, ok.root);
     EXPECT_TRUE(ok.error.empty());
 
     // key2 with value -> parse error (mutually exclusive).
     auto both = TreeParser::Parse(
-        R"({"type":"Success","condition":{"type":"Blackboard","key":"a","key2":"b","value":1}})");
+        R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"a","key2":"b","value":1}}})");
     EXPECT_EQ(nullptr, both.root);
     EXPECT_NE(both.error.find("not both"), std::string::npos);
 
     // key2 with exists -> parse error.
     auto ex = TreeParser::Parse(
-        R"({"type":"Success","condition":{"type":"Blackboard","key":"a","op":"exists","key2":"b"}})");
+        R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"a","op":"exists","key2":"b"}}})");
     EXPECT_EQ(nullptr, ex.root);
     EXPECT_NE(ex.error.find("does not use 'key2'"), std::string::npos);
 
     // non-string key2 -> parse error.
     auto bad = TreeParser::Parse(
-        R"({"type":"Success","condition":{"type":"Blackboard","key":"a","key2":3}})");
+        R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"a","key2":3}}})");
     EXPECT_EQ(nullptr, bad.root);
     EXPECT_NE(bad.error.find("'key2' must be a string"), std::string::npos);
 }
@@ -2172,7 +2319,7 @@ TEST_F(ScriptNodeIntegrationTest, BlackboardConditionKeyVsKeyGatesBranch) {
     // (hp > shield). Met -> guarded Success short-circuits; after lowering hp
     // (no re-init), a fresh run takes the fallback branch instead.
     PutRoot(R"({"type":"Selector","children":[)"
-            R"({"type":"Success","condition":{"type":"Blackboard","key":"hp","op":">","key2":"shield"}},)"
+            R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"hp","op":">","key2":"shield"}}},)"
             R"({"type":"Script","source":"scripts/no_args.lua"}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
@@ -2266,7 +2413,7 @@ TEST_F(ScriptNodeIntegrationTest, BlackboardConditionSeesProviderValue) {
     // Success short-circuits); once the provider's output changes, the
     // fallback runs and records it.
     PutRoot(R"({"type":"Selector","children":[)"
-            R"({"type":"Success","condition":{"type":"Blackboard","key":"mode","op":"==","value":"fast"}},)"
+            R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"mode","op":"==","value":"fast"}}},)"
             R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"fell_back","value":true}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
@@ -2360,7 +2507,7 @@ TEST_F(BehaviorTreeEngineTest, SetNodeFeedsBlackboardConditionScriptless) {
     engine->SetRoot(ParseJsonTree(
         R"({"type":"Sequence","children":[)"
         R"({"type":"Set","params":{"key":"page","value":"home"}},)"
-        R"({"type":"Success","condition":{"type":"Blackboard","key":"page","op":"==","value":"home"}}]})"));
+        R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"page","op":"==","value":"home"}}}]})"));
     EXPECT_EQ(engine->TickOnce(), NodeStatus::kSuccess);
     EXPECT_EQ(std::get<std::string>(*engine->blackboard().Get("page")), "home");
 }
@@ -2371,7 +2518,7 @@ TEST_F(ScriptNodeIntegrationTest, SetNodeReferenceReadsProvider) {
     // downstream sees the copied value.
     PutRoot(R"({"type":"Sequence","children":[)"
             R"({"type":"Set","params":{"key":"attempt","value":"$pv"}},)"
-            R"({"type":"Success","condition":{"type":"Blackboard","key":"attempt","op":"==","value":1}}]})");
+            R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"attempt","op":"==","value":1}}}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local bb = require('blackboard')
@@ -2390,8 +2537,8 @@ TEST_F(ScriptNodeIntegrationTest, BlackboardConditionGatesBranch) {
     // two Blackboard conditions also works. No Lua condition script needed.
     PutRoot(R"({"type":"Selector","children":[)"
             R"({"type":"Success","condition":{"type":"And","children":[)"
-            R"({"type":"Blackboard","key":"page","op":"==","value":"home"},)"
-            R"({"type":"Blackboard","key":"count","op":">=","value":5}]}},)"
+            R"({"type":"Blackboard","params":{"key":"page","op":"==","value":"home"}},)"
+            R"({"type":"Blackboard","params":{"key":"count","op":">=","value":5}}]}},)"
             R"({"type":"Script","source":"scripts/no_args.lua"}]})");
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')

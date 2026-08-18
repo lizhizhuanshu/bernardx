@@ -12,17 +12,18 @@ class BtEventQueue;
 
 // A built-in condition that compares a blackboard value against either a
 // literal or another blackboard value — no Lua script needed. JSON shape
-// (inside a node's `condition` object):
-//   {"type":"Blackboard","key":"page","op":"==","value":"home"}     key vs literal
-//   {"type":"Blackboard","key":"hp","op":">","key2":"shield"}       key vs key
-//   key    (string, required)  blackboard key to read (left side)
-//   key2   (string, optional)  blackboard key for the right side — mutually
-//                              exclusive with `value`; both sides are read
-//                              fresh on EVERY Tick (live comparison)
-//   op     (string, optional)  one of "==", "!=", ">", ">=", "<", "<=",
-//                              "exists" (default "=="; "exists" uses only
-//                              `key` and ignores the right side)
-//   value  (scalar, optional)  expected literal — string/number/bool/null
+// (inside a node's `condition` object; fields live under "params"):
+//   {"type":"Blackboard","params":{"key":"page","op":"==","value":"home"}}  key vs literal
+//   {"type":"Blackboard","params":{"key":"hp","op":">","key2":"shield"}}    key vs key
+//   params.key   (string, required)  blackboard key to read (left side);
+//                                    supports dotted paths ("proxy.port")
+//   params.key2  (string, optional)  blackboard key for the right side — mutually
+//                                    exclusive with `value`; both sides are read
+//                                    fresh on EVERY Tick (live comparison)
+//   params.op    (string, optional)  one of "==", "!=", ">", ">=", "<", "<=",
+//                                    "exists" (default "=="; "exists" uses only
+//                                    `key` and ignores the right side)
+//   params.value (scalar, optional)  expected literal — string/number/bool/null
 //
 // Semantics:
 //   - Synchronous: Tick compares immediately, never returns Running.

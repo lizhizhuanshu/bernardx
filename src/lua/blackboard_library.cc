@@ -1,5 +1,7 @@
 #include "blackboard_library.h"
 
+#include <vector>
+
 extern "C" {
 #include "lauxlib.h"
 #include "lua.h"
@@ -25,12 +27,15 @@ int bb_set(lua_State* L) {
 }
 
 // bb.set_provider(key, fn): install `fn` as the computed-value source for
-// `key`. Every later bb.get(key) — and every engine-side read ($key param
-// resolution at Enter, Blackboard condition comparisons) — invokes fn fresh
-// and uses its return value. fn must be synchronous (no yield/await); a nil
-// return is a present nil; a runtime error logs and yields nil. The provider
-// replaces any static value (and bb.set replaces a provider); bb.remove /
-// bb.clear drop it. Replacing or removing releases the function ref.
+// `key`. Every later bb.get(key) - and every engine-side read ($key param
+// resolution at Enter, Blackboard condition comparisons) - invokes fn fresh
+// and uses its return value. On a DOTTED read the remaining path segments
+// are passed to fn as string arguments: bb.get("cfg.net.ip") calls
+// fn("net","ip"); a flat bb.get("cfg") calls fn() with no args. fn must
+// be synchronous (no yield/sleep/await); a nil return is a present nil; a
+// runtime error logs and yields nil. The provider replaces any static value
+// (and bb.set replaces a provider); bb.remove / bb.clear drop it. Replacing
+// or removing releases the function ref.
 int bb_set_provider(lua_State* L) {
     auto* bb = GetBB(L);
     const char* key = luaL_checkstring(L, 1);
@@ -43,10 +48,14 @@ int bb_set_provider(lua_State* L) {
     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
     LuaRef fn = rt->CreateRef(ref, LUA_TFUNCTION);
     lua_State* main_L = rt->main_state();
-    int fn_ref = fn->ref;  // LuaRefBase::ref — stable while `fn` is alive
-    bb->SetProvider(key, [fn = std::move(fn), main_L, fn_ref]() -> LuaValue {
+    int fn_ref = fn->ref;  // stable while `fn` is alive
+    bb->SetProvider(key, [fn = std::move(fn), main_L, fn_ref](
+                             const std::vector<std::string>& path) -> LuaValue {
         lua_rawgeti(main_L, LUA_REGISTRYINDEX, fn_ref);
-        if (lua_pcall(main_L, 0, 1, 0) != LUA_OK) {
+        for (const auto& seg : path) {
+            lua_pushlstring(main_L, seg.data(), seg.size());
+        }
+        if (lua_pcall(main_L, static_cast<int>(path.size()), 1, 0) != LUA_OK) {
             const char* err = lua_tostring(main_L, -1);
             spdlog::error("blackboard provider error: {}", err ? err : "unknown error");
             lua_pop(main_L, 1);

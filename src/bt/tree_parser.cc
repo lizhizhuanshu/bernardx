@@ -327,30 +327,42 @@ ParseCondition(const json& j, ParseContext& ctx) {
     }
 
     if (type == "Blackboard") {
-        // {"type":"Blackboard","key":"page","op":"==","value":"home"}   key vs literal
-        // {"type":"Blackboard","key":"hp","op":">","key2":"shield"}    key vs key (live)
+        // {"type":"Blackboard","params":{"key":"page","op":"==","value":"home"}}  key vs literal
+        // {"type":"Blackboard","params":{"key":"hp","op":">","key2":"shield"}}   key vs key (live)
         // op ∈ {"==","!=",">",">=","<","<=","exists"} (default "=="); value
         // must be a scalar; key2 (string) is mutually exclusive with value
         // and invalid for "exists". Validated here so a bad tree fails at
-        // parse, not mid-run.
-        if (!j.contains("key") || !j["key"].is_string()) {
-            SetError(ctx, "Blackboard condition missing 'key'");
+        // parse, not mid-run. Type-specific config lives under "params" like
+        // every other node; the legacy flat form (fields beside "type") is
+        // rejected with an error.
+        if (j.contains("key") || j.contains("op") || j.contains("value") ||
+            j.contains("key2")) {
+            SetError(ctx,
+                     "Blackboard condition fields must be inside 'params' "
+                     "(e.g. {\"params\":{\"key\":...}})");
+            co_return nullptr;
+        }
+        json p = j.contains("params") && j["params"].is_object()
+                     ? j["params"]
+                     : json::object();
+        if (!p.contains("key") || !p["key"].is_string()) {
+            SetError(ctx, "Blackboard condition missing 'params.key'");
             co_return nullptr;
         }
         static const std::set<std::string> kOps = {
             "==", "!=", ">", ">=", "<", "<=", "exists"};
-        std::string op = j.value("op", "==");
+        std::string op = p.value("op", "==");
         if (!kOps.count(op)) {
             SetError(ctx, "Blackboard condition unknown op '" + op + "'");
             co_return nullptr;
         }
         std::string key2;
-        if (j.contains("key2")) {
-            if (!j["key2"].is_string()) {
+        if (p.contains("key2")) {
+            if (!p["key2"].is_string()) {
                 SetError(ctx, "Blackboard condition 'key2' must be a string");
                 co_return nullptr;
             }
-            if (j.contains("value")) {
+            if (p.contains("value")) {
                 SetError(ctx, "Blackboard condition: use 'value' or 'key2', not both");
                 co_return nullptr;
             }
@@ -358,11 +370,11 @@ ParseCondition(const json& j, ParseContext& ctx) {
                 SetError(ctx, "Blackboard condition 'exists' does not use 'key2'");
                 co_return nullptr;
             }
-            key2 = j["key2"].get<std::string>();
+            key2 = p["key2"].get<std::string>();
             co_return std::make_unique<BlackboardCondition>(
-                j["key"].get<std::string>(), std::move(op), std::move(key2));
+                p["key"].get<std::string>(), std::move(op), std::move(key2));
         }
-        json value = j.contains("value") ? j["value"] : json(nullptr);
+        json value = p.contains("value") ? p["value"] : json(nullptr);
         bool scalar = value.is_null() || value.is_boolean() ||
                       value.is_number() || value.is_string();
         if (!scalar) {
@@ -376,7 +388,7 @@ ParseCondition(const json& j, ParseContext& ctx) {
             co_return nullptr;
         }
         co_return std::make_unique<BlackboardCondition>(
-            j["key"].get<std::string>(), std::move(op), std::move(value));
+            p["key"].get<std::string>(), std::move(op), std::move(value));
     }
 
     if (type == "And" || type == "Or") {

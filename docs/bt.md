@@ -105,7 +105,7 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | `Parallel` | 复合 | `params` | 并行所有子节点，策略控制结果 |
 | `RandomSelector` / `RandomSequence` | 复合 | — | 同 Selector/Sequence，每次 Reset 后随机排列子节点顺序 |
 | `Script` | 叶子 | `source`, `params` | 执行 Lua 脚本 |
-| `Set` | 叶子 | `params` | **内置黑板写 Action**（零脚本）：`params.key`（必填）写入目标键；`params.value`（标量，缺省写 nil）写入值。字符串值以 `$` 开头为黑板引用——`"$src"` 在**每次 Tick** 实时读 `blackboard[src]` 拷入（缺键写 nil 并告警），`"$$x"` 转义为字面 `"$x"`。写入后立即 Success，常与 `Blackboard` 条件配合组成纯声明式树 |
+| `Set` | 叶子 | `params` | **内置黑板写 Action**（零脚本）：`params.key`（必填）写入目标键；`params.value`（标量，缺省写 nil）写入值。字符串值以 `$` 开头为黑板引用——`"$src"` 在**每次 Tick** 实时读 `blackboard[src]` 拷入（缺键写 nil 并告警；`src` 支持[点号路径](../api/blackboard.md#点号路径取表内字段)，如 `"$cfg.net.ip"`），`"$$x"` 转义为字面 `"$x"`。写入后立即 Success，常与 `Blackboard` 条件配合组成纯声明式树 |
 | `Subtree` | 叶子 | `source`, `params` | 加载 `source` 指向的子树 JSON（递归）；`params` 透传给子树内节点（见[子树参数透传](#子树参数透传)）；`condition` 支持 `"child_condition"` 透传子树根的条件（见上[节点结构](#节点结构)） |
 | `Template` | —（解析期展开） | `source`, `params` | **模板内联展开**：与 Subtree 完全相同的加载/`{{}}` 参数替换/`data` 引用解析，但**不产生运行时节点**——解析时把目标节点直接替换到 Template 的位置（树里不存在包装层）。Template 自身声明的 `condition` 转挂到展开后的根节点上。**参数即契约**：模板 JSON 需要而上层 `params` 未提供的 `{{key}}` 是**解析期硬错误**（报错列出全部缺失键与模板名），不会留字面量拖到运行期。适合把参数化片段内联进 Pipeline 步骤等"包装纯属噪音"的场合 |
 | `Wait` | 叶子 | `params` | 等待若干毫秒后 Success：`params.timeout` 为**数值**（固定等待，默认 1000）或**两元素数组 `[lo, hi]`**（闭区间均匀随机，每次运行重摇；`[v]` 等价固定 v）。`0` 立即 Success。旧 `min_timeout`/`max_timeout` 已移除，出现即解析报错 |
@@ -179,24 +179,24 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | 类型 | 字段 | 说明 |
 |------|------|------|
 | `Script` | `source`, `params` | Lua 脚本判断（见下） |
-| `Blackboard` | `key`, `op`, `value` | 内置黑板值比较，无需脚本（见下） |
+| `Blackboard` | `params` | 内置黑板值比较，无需脚本（见下） |
 | `And` | `children` | 全部成立才成立，短路到首个 Failure/Running |
 | `Or` | `children` | 任一成立即成立，短路到首个 Success/Running |
 | `Not` | `child` | 反转 Success/Failure，Running 透传 |
 
-**Blackboard 条件**直接比较黑板值与一个字面量或另一个黑板 key 的值，同步、零脚本，适合简单的状态门控：
+**Blackboard 条件**直接比较黑板值与一个字面量或另一个黑板 key 的值，同步、零脚本，适合简单的状态门控。与节点一致，类型专属配置全部放在 `params` 里：
 
 ```json
-"condition": { "type":"Blackboard", "key":"page", "op":"==", "value":"home" }   // key 对字面量
-"condition": { "type":"Blackboard", "key":"hp",   "op":">",  "key2":"shield" } // key 对 key（实时）
+"condition": { "type":"Blackboard", "params":{ "key":"page", "op":"==", "value":"home" } }  // key 对字面量
+"condition": { "type":"Blackboard", "params":{ "key":"hp",   "op":">",  "key2":"shield" } } // key 对 key（实时）
 ```
 
-| 字段 | 类型 | 说明 |
+| `params` 字段 | 类型 | 说明 |
 |------|------|------|
-| `key` | string | **必填**，要读取的黑板 key（比较左值） |
+| `key` | string | **必填**，要读取的黑板 key（比较左值）；支持[点号路径](../api/blackboard.md#点号路径取表内字段)（如 `"proxy.port"` 取 `proxy` 表的 `port` 字段） |
 | `op` | string | 可选，默认 `"=="`；取值 `==`、`!=`、`>`、`>=`、`<`、`<=`、`exists` |
 | `value` | 标量 | 期望字面量（string/number/bool/null）；与 `key2` 互斥 |
-| `key2` | string | 右值改为读黑板 `key2` 的值；**每次求值都实时重读**；与 `value` 互斥，`exists` 不可用 |
+| `key2` | string | 右值改为读黑板 `key2` 的值；**每次求值都实时重读**（同样支持点号路径）；与 `value` 互斥，`exists` 不可用 |
 
 语义要点：
 
@@ -204,7 +204,7 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 - `==`/`!=` 按类型感知比较：数值跨 int/float 互通，string/bool 同型比较，`null` 匹配 nil；类型不匹配（如数字 vs 字符串）视为不相等。
 - `>`/`>=`/`<`/`<=` 要求两侧同为数值或同为字符串（字典序）；否则不成立并记录 last_error。
 - `key2` 是**活比较**：守卫每次轮询都重读两侧黑板值，适合"当 hp > shield 时…"这类随运行变化的门控；与 params 的 `$key`（Enter 时快照注入）语义不同，按需选用。
-- 解析期即校验：缺 `key`、未知 `op`、`value` 非标量、排序 op 配 bool 值、`value` 与 `key2` 同给、`exists` 配 `key2` 都会直接报解析错误。
+- 解析期即校验：字段写在 `params` 外（旧平铺形态）、缺 `key`、未知 `op`、`value` 非标量、排序 op 配 bool 值、`value` 与 `key2` 同给、`exists` 配 `key2` 都会直接报解析错误。
 
 **Script 条件**的脚本格式与 Script 节点相同（return table + 冒号回调），`Tick` 返回值双模解析：
 
@@ -263,9 +263,11 @@ return M
 | `Exit(reason)` | 否 | 否 | 离开活跃 |
 | `Abort()` | 否 | 否 | 被中止时（Exit 之前） |
 
-`Tick` 内可用所有异步 API（`sleep`/`await`/`http.request` 等），异步期间节点挂起 Running、完成后自动恢复。黑板访问：`require('blackboard')` 后 `bb.get(key)` / `bb.set(key, value)`，值支持 `nil`/`bool`/`int64`/`double`/`string`。
+`Tick` 内可用所有异步 API（`sleep`/`await`/`http.request` 等），异步期间节点挂起 Running、完成后自动恢复。黑板访问：`require('blackboard')` 后 `bb.get(key)` / `bb.set(key, value)`，值支持 `nil`/`bool`/`int64`/`double`/`string`/table；`bb.get` 的 key 支持[点号路径](../api/blackboard.md#点号路径取表内字段)（如 `bb.get("proxy.ip")`）。
 
 **`params` 支持标量和 table**：`params` 的值除 `nil`/`bool`/`int`/`double`/`string` 外，也可是 object 或 array——在 `Enter(params)` 里收到的是**真正的 Lua table**，可嵌套访问（`params.config.hp`）；数组按 Lua 惯例从 1 开始。table 在 `bt.init` 阶段于 `lua_State` 上构建并以 `LuaRef` 持有，生命周期随节点。
+
+**`$key` 黑板引用**：`params` 的字符串值以 `$` 开头（如 `"$proxy.ip"`）表示黑板引用，在该节点/条件 Enter 时实时读入（`$$` 转义为字面 `$`）。引用的 key 支持[点号路径](../api/blackboard.md#点号路径取表内字段)——`"$proxy.ip"` 取 `blackboard[proxy]` 表的 `ip` 字段（根键装了[提供器](../api/blackboard.md#value-提供器-computed-value)时，后续段作为参数传给提供器函数）；缺键时该参数为 `nil` 并告警。
 
 ## 子树参数透传
 
