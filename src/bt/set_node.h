@@ -6,16 +6,24 @@
 #include "leaf.h"
 #include "lua_types.h"
 
+struct lua_State;
+class LuaRuntime;
+struct ScriptResult;
+
 // A built-in action that writes the blackboard — no Lua script needed.
 // JSON shape: {"type":"Set","params":{"key":"page","value":"home"}}
-//   key    (string, required)  blackboard key to write
+//   key    (string, required)  blackboard key to write (may be dotted —
+//                              see Blackboard::Store routing)
 //   value  (scalar, optional)  string/number/bool; absent writes nil. A
 //                              string starting with '$' is a blackboard
 //                              reference ('$src' copies blackboard[src] at
 //                              each Tick; '$$x' escapes to the literal "$x").
-// Tick writes the value and returns Success immediately. '$src' with a
-// missing/nil source writes nil with a warning (consistent with `$key`
-// params resolution).
+// Writes through a PROVIDER (a `$src` read from a provider key, or a
+// dotted write into a provider root) run the provider's get/set as a
+// coroutine: the node returns Running while that is in flight and Success
+// once it completes. All provider-free paths stay fully synchronous
+// (Success in one Tick). '$src' with a missing/nil source writes nil with
+// a warning (consistent with `$key` params resolution).
 class SetNode : public Leaf {
 public:
     // Literal form: writes `value` every Tick.
@@ -24,10 +32,30 @@ public:
     // Reference form: writes blackboard[ref_key] (read fresh) every Tick.
     SetNode(uint32_t id, std::string name, std::string key, BbParamRef ref);
 
+    async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx) override;
     NodeStatus Tick(Blackboard& bb, BtEventQueue& events) override;
+    void Reset() override;
+    void OnAborted() override;
 
 private:
+    // One possibly-suspended provider call (mirrors the ScriptNode
+    // yielded_co_/has_result_/result_ pattern).
+    struct PendingCall {
+        lua_State* co = nullptr;  // outstanding coroutine (null = not pending)
+        bool done = false;
+        ScriptResult result;
+    };
+
+    // Stage `value` into key_: direct store, or a provider set that may
+    // suspend (Running until its callback fires).
+    NodeStatus DoWrite(Blackboard& bb, const LuaValue& value);
+    void CancelPending();
+
     std::string key_;
     LuaValue value_ = LuaValue(nullptr);  // literal (ref form ignores)
-    std::string ref_key_;                 // non-empty -> write bb.Get(ref_key_)
+    std::string ref_key_;                 // non-empty -> read bb[ref_key_] fresh
+
+    LuaRuntime* lua_ctx_ = nullptr;  // captured at Init (provider calls)
+    PendingCall src_;                // pending $src provider read
+    PendingCall write_;              // pending provider write
 };

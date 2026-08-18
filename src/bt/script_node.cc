@@ -1,12 +1,15 @@
 #include "script_node.h"
 
 #include <filesystem>
+#include <utility>
+
 #include <spdlog/spdlog.h>
 
 #include "blackboard.h"
 #include "bt_event_queue.h"
 #include "bt_utils.h"
 #include "json_lua.h"
+#include "provider_call.h"
 #include "types.h"
 
 namespace {
@@ -45,6 +48,7 @@ ScriptNode::ScriptNode(uint32_t id, std::string name, std::string script_path,
       params_json_(std::move(params)) {}
 
 ScriptNode::~ScriptNode() {
+    CancelParamResolution();
     if (yielded_co_ != nullptr && host_.lua_context_) {
         host_.lua_context_->CancelCall(yielded_co_);
         yielded_co_ = nullptr;
@@ -81,16 +85,79 @@ async_simple::coro::Lazy<bool> ScriptNode::Init(lua_State* L, LuaRuntime* ctx) {
     co_return true;
 }
 
-ScriptNode::ArgsMap ScriptNode::ResolveArgsForEnter(Blackboard& bb) const {
-    ArgsMap enter_args = args_;
+void ScriptNode::StartParamResolution(Blackboard& bb) {
+    resolved_.clear();
+    pending_params_.clear();
+    pending_names_.clear();
     for (const auto& [param_name, ref] : bb_refs_) {
-        auto v = bb.Get(ref.key);
-        if (v.has_value()) {
-            enter_args[param_name] = std::move(*v);
-        } else {
+        auto look = bb.Lookup(ref.key);
+        switch (look.kind) {
+        case BbReadResult::Kind::kValue:
+            resolved_[param_name] = std::move(look.value);
+            break;
+        case BbReadResult::Kind::kMissing:
             spdlog::warn("ScriptNode '{}': blackboard param '{}' key '{}' not set at Enter",
                          name_, param_name, ref.key);
+            break;
+        case BbReadResult::Kind::kProvider: {
+            if (!host_.lua_context_) {
+                spdlog::warn("ScriptNode '{}': blackboard param '{}' key '{}' has no LuaRuntime",
+                             name_, param_name, ref.key);
+                break;
+            }
+            // Slot first, launch second: the callback indexes the slot, so
+            // a synchronous completion lands in the already-pushed element.
+            pending_names_.push_back(param_name);
+            pending_params_.push_back({});
+            size_t idx = pending_params_.size() - 1;
+            auto out = provider_call::InvokeProviderGet(
+                host_.lua_context_, look.provider, look.path,
+                [this, idx](ScriptResult r) {
+                    pending_params_[idx].done = true;
+                    pending_params_[idx].result = std::move(r);
+                });
+            if (out.yielded) {
+                pending_params_[idx].co = out.co;
+            }
+            break;
         }
+        }
+    }
+}
+
+void ScriptNode::CollectResolved() {
+    for (size_t k = 0; k < pending_params_.size(); ++k) {
+        const auto& p = pending_params_[k];
+        if (!p.result.values.empty()) {
+            resolved_[pending_names_[k]] = std::move(p.result.values[0]);
+        } else {
+            // A provider error or nil return: a warned miss, not inserted.
+            const auto it = bb_refs_.find(pending_names_[k]);
+            spdlog::warn("ScriptNode '{}': blackboard param '{}' key '{}' not set at Enter",
+                         name_, pending_names_[k],
+                         it != bb_refs_.end() ? it->second.key : "?");
+        }
+    }
+    pending_params_.clear();
+    pending_names_.clear();
+}
+
+void ScriptNode::CancelParamResolution() {
+    if (host_.lua_context_) {
+        for (auto& p : pending_params_) {
+            if (p.co != nullptr) host_.lua_context_->CancelCall(p.co);
+        }
+    }
+    pending_params_.clear();
+    pending_names_.clear();
+    resolved_.clear();
+    enter_stage_ = EnterStage::kIdle;
+}
+
+ScriptNode::ArgsMap ScriptNode::EnterArgs() const {
+    ArgsMap enter_args = args_;
+    for (const auto& [name, value] : resolved_) {
+        enter_args[name] = value;
     }
     return enter_args;
 }
@@ -187,14 +254,29 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
         }
     }
 
-    // Enter on first tick
+    // Enter on first tick — after the `$key` params fully resolve.
     if (!active_) {
+        if (enter_stage_ == EnterStage::kIdle) {
+            enter_stage_ = EnterStage::kResolving;
+            if (host_.refs_.enter_ref != LUA_NOREF && !bb_refs_.empty()) {
+                StartParamResolution(bb);
+            }
+        }
+        if (enter_stage_ == EnterStage::kResolving) {
+            if (!pending_params_.empty()) {
+                for (const auto& p : pending_params_) {
+                    if (!p.done) return NodeStatus::kRunning;
+                }
+                CollectResolved();
+            }
+            enter_stage_ = EnterStage::kReady;
+        }
         active_ = true;
         if (host_.refs_.enter_ref != LUA_NOREF) {
             lua_State* co = host_.lua_context_->AcquireCoroutine();
             lua_rawgeti(co, LUA_REGISTRYINDEX, host_.refs_.enter_ref);
             lua_rawgeti(co, LUA_REGISTRYINDEX, host_.refs_.table_ref);
-            PushArgsTable(co, ResolveArgsForEnter(bb));
+            PushArgsTable(co, EnterArgs());
 
             bool yielded = host_.lua_context_->CallWithCallback(co, 2,
                 [this](ScriptResult r) {
@@ -243,6 +325,7 @@ void ScriptNode::Reset() {
         has_result_ = false;
         entering_ = false;
     }
+    CancelParamResolution();  // also resets enter_stage_ to kIdle
 
     if (active_ && host_.refs_.exit_ref != LUA_NOREF && host_.main_L_) {
         lua_pushstring(host_.main_L_, "reset");
@@ -259,6 +342,7 @@ void ScriptNode::OnAborted() {
         has_result_ = false;
         entering_ = false;
     }
+    CancelParamResolution();  // also resets enter_stage_ to kIdle
 
     if (active_ && host_.main_L_) {
         if (host_.refs_.abort_ref != LUA_NOREF) {

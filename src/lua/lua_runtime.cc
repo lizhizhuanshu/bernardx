@@ -838,6 +838,10 @@ void LuaRuntime::CancelCall(lua_State* co) {
     // corrupting that node's Enter/Tick state.
     for (auto it = pending_.begin(); it != pending_.end(); ) {
         if (it->second.co == co) {
+            // Also cancel a pending sleep timer owned by this coroutine:
+            // otherwise the stale timer fires later, misses in pending_,
+            // and logs a misleading "invalid handle" error.
+            timer_mgr_->CancelTimer(it->first);
             it = pending_.erase(it);
         } else {
             ++it;

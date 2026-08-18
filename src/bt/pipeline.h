@@ -133,7 +133,7 @@ public:
     async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx) override;
 
 private:
-    enum class Phase { kScan, kAct, kWait };
+    enum class Phase { kScan, kAct, kResolve, kWait };
 
     // Evaluate step i's target: absent target counts as met.
     NodeStatus EvalTarget(Blackboard& bb, BtEventQueue& events, size_t i);
@@ -141,13 +141,18 @@ private:
     // `*timeout` ms budget. Re-runs the action or fails.
     NodeStatus OnWaitTimeout();
     // Resolve this step's timeout/retry for the CURRENT run when it enters
-    // its wait window: pick the step's own edge param or the pipeline
-    // default, roll a range, read a `$key` blackboard ref fresh. Stays fixed
-    // for the step until Reset (a later run re-resolves).
-    void ResolveStepBudgets(Blackboard& bb, size_t i);
-    // One edge param -> int for this run (see EdgeParam). -1 = failed ref.
-    int ResolveEdgeParam(Blackboard& bb, const EdgeParam& e,
-                         const EdgeParam& def, const char* what);
+    // its wait window. Fixed/range params resolve inline; a `$key` ref
+    // reads the blackboard — a PROVIDER-served read launches the
+    // provider's get as a coroutine and the pipeline parks in kResolve
+    // (Running) until both sides complete. Returns false while a resolve
+    // is in flight (phase already set); true when cur_*_[i] are final.
+    bool ResolveStepBudgets(Blackboard& bb, size_t i);
+    // One resolved edge value -> int for this run: an integer, or a
+    // {lo,hi} table -> a roll. -1 (logged) = unresolvable value.
+    int FinishEdgeParam(const std::optional<LuaValue>& v, const EdgeParam& p,
+                        const char* what);
+    // Cancel any in-flight edge-param provider resolves.
+    void CancelPendingResolves();
     // Skip steps whose targets are already met. Returns false when the scan
     // hit a Running target (out=Running: re-scan next tick) or every target
     // is met (out=Success); true when parked on a pending step (kAct).
@@ -172,6 +177,16 @@ private:
         EdgeParam retry;    // *retry (0 = no re-run)
     };
 
+    // One possibly-suspended `$key` provider read for an edge param
+    // (mirrors the ScriptNode yielded_co_/has_result_/result_ pattern).
+    struct PendingValue {
+        lua_State* co = nullptr;  // outstanding coroutine (null = not pending)
+        bool done = false;
+        std::optional<LuaValue> value;  // finished read (nullopt = miss/error)
+        EdgeParam src;                  // the ref being resolved (for logs)
+        const char* what = "";          // "*timeout" / "*retry" (for logs)
+    };
+
     std::vector<Step> steps_;        // parallel to children_
     std::vector<int> retries_used_;  // action re-runs used per step
     std::vector<int> cur_timeout_;   // resolved timeout per step (-1 = unresolved this run)
@@ -183,6 +198,9 @@ private:
     std::vector<NodeStatus> target_prev_;
     std::mt19937 rng_;               // resolves *timeout/*retry ranges per run
     lua_State* lua_state_ = nullptr; // main state (captured at Init) backing $ref tables
+    LuaRuntime* lua_ctx_ = nullptr;  // captured at Init; backs provider resolves
+    PendingValue resolve_timeout_;   // kResolve in-flight *timeout read
+    PendingValue resolve_retry_;     // kResolve in-flight *retry read
     int64_t wait_start_ms_ = 0;  // tick-time (cached) when the current wait window began
     bool started_ = false;           // initial scan phase complete
     Phase phase_ = Phase::kScan;

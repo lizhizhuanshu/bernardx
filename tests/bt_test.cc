@@ -1319,7 +1319,7 @@ TEST_F(ScriptNodeIntegrationTest, DottedKeyThroughProviderRoot) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bb = require('blackboard')
         bb.set("cfg", {host = "h0", net = {ip = "1.1.1.1"}})
-        bb.set_provider("live", function(...)
+        bb.set_provider("live", {get = function(...)
             local path = {...}
             local cur = bb.get("cfg")
             for _, seg in ipairs(path) do
@@ -1327,7 +1327,7 @@ TEST_F(ScriptNodeIntegrationTest, DottedKeyThroughProviderRoot) {
                 cur = cur[seg]
             end
             return cur
-        end)
+        end})
         return bb.get("live.host"),      -- fn("host")      -> "h0"
                bb.get("live.net.ip"),     -- fn("net","ip")  -> "1.1.1.1"
                bb.get("live.net.mtu")     -- fn("net","mtu") -> nil
@@ -1345,9 +1345,9 @@ TEST_F(ScriptNodeIntegrationTest, DottedKeyProviderSeesExactArgs) {
     // branch on them - here building a joined key string.
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bb = require('blackboard')
-        bb.set_provider("env", function(...)
+        bb.set_provider("env", {get = function(...)
             return table.concat({...}, ":")
-        end)
+        end})
         return bb.get("env"),        -- no args    -> ""
                bb.get("env.a.b")     -- "a","b"    -> "a:b"
     )"));
@@ -1673,7 +1673,7 @@ TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamBlackboardRefProvider) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bt = require('bt')
         local bb = require('blackboard')
-        bb.set_provider("tmo", function() return 30 end)
+        bb.set_provider("tmo", {get = function() return 30 end})
         local ok, err = bt.init({root = "res://root.json"})
         if not ok then return false, err end
         local status = bt.exec({interval = 10, max_step = 40})
@@ -1797,10 +1797,10 @@ TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamRereadsProviderPerRun) {
         local bt = require('bt')
         local bb = require('blackboard')
         local calls = 0
-        bb.set_provider("tmo", function()
+        bb.set_provider("tmo", {get = function()
             calls = calls + 1
             return calls <= 1 and 30 or 0   -- run 1: 30ms budget; later: forever
-        end)
+        end})
         local ok, err = bt.init({root = "res://root.json"})
         if not ok then return false, err end
         local status = bt.exec({interval = 5, max_step = 80})
@@ -2346,20 +2346,22 @@ TEST_F(ScriptNodeIntegrationTest, BlackboardConditionKeyVsKeyGatesBranch) {
 
 // --- blackboard value provider Tests ---
 //
-// bb.set_provider(key, fn) installs a computed source: every read of the key
-// (bb.get, $key resolution at Enter, Blackboard condition) invokes fn fresh.
+// bb.set_provider(key, {get = fn, set = fn2}) installs a provider interface:
+// every read of the key (bb.get, $key resolution at Enter, Blackboard
+// condition) invokes get fresh; a dotted write through the root invokes
+// set(value, path...).
 
 TEST_F(ScriptNodeIntegrationTest, BlackboardProviderLuaRoundTrip) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bb = require('blackboard')
         local n = 0
-        bb.set_provider("counter", function() n = n + 1; return n end)
+        bb.set_provider("counter", {get = function() n = n + 1; return n end})
         local a = bb.get("counter")
         local b = bb.get("counter")
         local has = bb.has("counter")
         bb.set("counter", "static")            -- set replaces the provider
         local c = bb.get("counter")
-        bb.set_provider("gone", function() return 1 end)
+        bb.set_provider("gone", {get = function() return 1 end})
         bb.remove("gone")                      -- remove drops the provider
         return a, b, has, c, bb.has("gone")
     )"));
@@ -2383,7 +2385,7 @@ TEST_F(ScriptNodeIntegrationTest, BlackboardProviderFeedsDollarKeyAtEnter) {
         local bt = require('bt')
         local bb = require('blackboard')
         local n = 0
-        bb.set_provider("who", function() n = n + 1; return "user" .. n end)
+        bb.set_provider("who", {get = function() n = n + 1; return "user" .. n end})
         bt.init({root = "res://root.json"})
         bt.exec({interval = 10})
         return bb.get("got_target")
@@ -2396,9 +2398,9 @@ TEST_F(ScriptNodeIntegrationTest, BlackboardProviderFeedsDollarKeyAtEnter) {
 TEST_F(ScriptNodeIntegrationTest, BlackboardProviderErrorYieldsNil) {
     auto r = AWAIT_BT(rt->RunScript(R"(
         local bb = require('blackboard')
-        bb.set_provider("bad", function() error("boom") end)
+        bb.set_provider("bad", {get = function() error("boom") end})
         local v = bb.get("bad")          -- error -> nil, no crash
-        bb.set_provider("ok", function() return "still" .. "works" end)
+        bb.set_provider("ok", {get = function() return "still" .. "works" end})
         return v, bb.get("ok")
     )"));
     ASSERT_EQ(r.status, LUA_OK);
@@ -2419,7 +2421,7 @@ TEST_F(ScriptNodeIntegrationTest, BlackboardConditionSeesProviderValue) {
         local bt = require('bt')
         local bb = require('blackboard')
         local mode = "fast"
-        bb.set_provider("mode", function() return mode end)
+        bb.set_provider("mode", {get = function() return mode end})
         bt.init({root = "res://root.json"})
         local s1 = bt.exec({interval = 10})
         local fb1 = bb.get("fell_back")
@@ -2434,6 +2436,249 @@ TEST_F(ScriptNodeIntegrationTest, BlackboardConditionSeesProviderValue) {
     EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[1]));  // guard met
     EXPECT_EQ(std::get<std::string>(r.values[2]), "success");
     EXPECT_EQ(std::get<bool>(r.values[3]), true);                      // fallback ran
+}
+
+TEST_F(ScriptNodeIntegrationTest, ProviderSetNodeDottedWriteRoutesToSet) {
+    // A Set node whose params.key is dotted, over a provider root: the
+    // write routes to the provider's set(value, path...) — nothing is
+    // stored under a literal key.
+    PutRoot(R"({"type":"Set","params":{"key":"cfg.net.ip","value":"2.2.2.2"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        local seen = {}
+        bb.set_provider("cfg", {
+            get = function(...) return "g" end,
+            set = function(v, ...)
+                seen.value = v
+                seen.path = {...}
+            end,
+        })
+        bt.init({root = "res://root.json"})
+        local status = bt.exec({interval = 10})
+        return status, seen.value, #seen.path, seen.path[1], seen.path[2],
+               bb.has("cfg.net.ip")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 6u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+    EXPECT_EQ(std::get<std::string>(r.values[1]), "2.2.2.2");
+    EXPECT_EQ(std::get<int64_t>(r.values[2]), 2);
+    EXPECT_EQ(std::get<std::string>(r.values[3]), "net");
+    EXPECT_EQ(std::get<std::string>(r.values[4]), "ip");
+    EXPECT_EQ(std::get<bool>(r.values[5]), false);  // no literal entry created
+}
+
+TEST_F(ScriptNodeIntegrationTest, SetNodeDottedWriteIntoLuaTable) {
+    // A Set node writing "t.x" where "t" is a static table: the rawset
+    // lands in the very table Lua holds — t.x is visible on the original
+    // table object.
+    PutRoot(R"({"type":"Set","params":{"key":"t.x","value":"new"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        local t = {x = "old"}
+        bb.set("t", t)
+        bt.init({root = "res://root.json"})
+        local status = bt.exec({interval = 10})
+        return status, t.x, bb.get("t.x")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 3u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+    EXPECT_EQ(std::get<std::string>(r.values[1]), "new");  // Lua-side visible
+    EXPECT_EQ(std::get<std::string>(r.values[2]), "new");
+}
+
+TEST_F(ScriptNodeIntegrationTest, SetProviderValidatesShape) {
+    // The provider must be a table with at least one function field.
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        local ok1, err1 = pcall(bb.set_provider, "k", function() return 1 end)  -- old fn form
+        local ok2, err2 = pcall(bb.set_provider, "k", {})                       -- neither field
+        local ok3, err3 = pcall(bb.set_provider, "k", {get = 42})               -- non-function
+        local ok4 = pcall(bb.set_provider, "k", {get = function() return 1 end})
+        return ok1, err1, ok2, err2, ok3, err3, ok4
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 7u);
+    EXPECT_FALSE(std::get<bool>(r.values[0]));
+    EXPECT_NE(std::get<std::string>(r.values[1]).find("must be a table"),
+              std::string::npos);
+    EXPECT_FALSE(std::get<bool>(r.values[2]));
+    EXPECT_NE(std::get<std::string>(r.values[3]).find("needs a 'get' or 'set'"),
+              std::string::npos);
+    EXPECT_FALSE(std::get<bool>(r.values[4]));
+    EXPECT_NE(std::get<std::string>(r.values[5]).find("must be a function"),
+              std::string::npos);
+    EXPECT_TRUE(std::get<bool>(r.values[6]));
+}
+
+TEST_F(ScriptNodeIntegrationTest, ProviderSetErrorIsLoggedNotFatal) {
+    // A provider set that raises: the error is logged, the write drops,
+    // and the Set node still returns Success.
+    PutRoot(R"({"type":"Set","params":{"key":"cfg.a","value":1}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set_provider("cfg", {
+            set = function() error("set-boom") end,
+        })
+        bt.init({root = "res://root.json"})
+        local status = bt.exec({interval = 10})
+        return status, bb.has("cfg.a")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+    EXPECT_EQ(std::get<bool>(r.values[1]), false);  // write dropped, no literal
+}
+
+TEST_F(ScriptNodeIntegrationTest, ProviderSelfReadViaDottedKeyStops) {
+    // A provider get that reads back its own dotted key hits the shared
+    // recursion cap: nil instead of a stack overflow.
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        bb.set_provider("loop", {get = function(seg) return bb.get("loop." .. seg) end})
+        local v = bb.get("loop.a")
+        return type(v)
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "nil");
+}
+
+// --- async provider Tests ---
+//
+// provider get/set run as coroutines: they may sleep/await. Every consumer
+// suspends while such a call is in flight and picks the value up on a later
+// tick; synchronous providers complete without suspension.
+
+TEST_F(ScriptNodeIntegrationTest, AsyncProviderFeedsDollarKeyParam) {
+    // params.target = "$slow" where the provider's get sleeps: param
+    // resolution spans several ticks (node Running) before Enter runs and
+    // the script echoes the resolved value.
+    PutRoot(R"({"type":"Script","source":"scripts/bb_ref_args.lua","params":{"target":"$slow"}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set_provider("slow", {get = function() sleep(30); return "late-value" end})
+        bt.init({root = "res://root.json"})
+        bt.exec({interval = 5, max_step = 80})
+        return bb.get("got_target")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "late-value");
+}
+
+TEST_F(ScriptNodeIntegrationTest, AsyncProviderBbGetAndBbSetSuspend) {
+    // bb.get / bb.set suspend transparently while an async provider runs;
+    // the resumed values flow straight through as the calls' returns.
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        local seen = {}
+        bb.set_provider("cfg", {
+            get = function(...) sleep(20); return table.concat({...}, "/") end,
+            set = function(v, ...) sleep(10); seen = {v = v, path = {...}} end,
+        })
+        local a = bb.get("cfg.net.ip")    -- suspends until get finishes
+        bb.set("cfg.net.ip", "2.2.2.2")   -- suspends until set finishes
+        return a, seen.v, table.concat(seen.path, ":")
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 3u);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "net/ip");
+    EXPECT_EQ(std::get<std::string>(r.values[1]), "2.2.2.2");
+    EXPECT_EQ(std::get<std::string>(r.values[2]), "net:ip");
+}
+
+TEST_F(ScriptNodeIntegrationTest, SetNodeReferenceReadsAsyncProvider) {
+    // Set dst=$slow where the provider's get sleeps: the Set node stays
+    // Running until the value arrives, then writes; a Blackboard condition
+    // downstream verifies the copied value.
+    PutRoot(R"({"type":"Sequence","children":[)"
+            R"({"type":"Set","params":{"key":"attempt","value":"$slow"}},)"
+            R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"attempt","op":"==","value":7}}}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set_provider("slow", {get = function() sleep(25); return 7 end})
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 5, max_step = 80})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, AsyncProviderBlackboardCondition) {
+    // A Blackboard condition on a provider key whose get sleeps: the guard
+    // reads Running while the value is in flight (stale-while-running),
+    // then the met verdict lands.
+    PutRoot(R"({"type":"Success","condition":{"type":"Blackboard","params":{"key":"mode","op":"==","value":"go"}}})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set_provider("mode", {get = function() sleep(20); return "go" end})
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 5, max_step = 80})
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, AsyncProviderPipelineTimeout) {
+    // Pipeline *timeout = "$tmo" where the provider's get sleeps: the step
+    // parks in the resolve phase (Running) until the value arrives, then
+    // the wait window honors the resolved budget (cond_falsy never met ->
+    // the 30ms timeout fires -> failure, proving the resolve completed).
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/cond_falsy.lua"},)"
+            R"("*timeout":"$tmo","*retry":0}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set_provider("tmo", {get = function() sleep(20); return 30 end})
+        local ok, err = bt.init({root = "res://root.json"})
+        if not ok then return false, err end
+        local status = bt.exec({interval = 5, max_step = 80})
+        return true, status
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_TRUE(r.values[0] == LuaValue(true)) << "bt.init ok";
+    auto* st = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(*st, "failure");  // resolved 30ms timeout fired
+}
+
+TEST_F(ScriptNodeIntegrationTest, AsyncProviderMutualRecursionCap) {
+    // Two providers whose gets read each OTHER through bb.get: the chain
+    // runs synchronously on one thread and hits the shared depth cap —
+    // nil, no crash, no stack overflow.
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        bb.set_provider("a", {get = function() return bb.get("b") end})
+        bb.set_provider("b", {get = function() return bb.get("a") end})
+        local v = bb.get("a")
+        return type(v)
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    EXPECT_EQ(std::get<std::string>(r.values[0]), "nil");
+}
+
+TEST_F(ScriptNodeIntegrationTest, ToTableWithAsyncProviderSnapshotsNil) {
+    // bb.to_table() can only make a synchronous provider attempt: a
+    // provider that yields is cancelled and snapshotted as nil.
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bb = require('blackboard')
+        bb.set_provider("slow", {get = function() sleep(50); return 1 end})
+        bb.set("plain", 5)
+        local t = bb.to_table()
+        return t.plain, t.slow
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    EXPECT_EQ(std::get<int64_t>(r.values[0]), 5);
+    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(r.values[1]));
 }
 
 // --- SetNode Tests ---
@@ -2523,7 +2768,7 @@ TEST_F(ScriptNodeIntegrationTest, SetNodeReferenceReadsProvider) {
         local bt = require('bt')
         local bb = require('blackboard')
         local n = 0
-        bb.set_provider("pv", function() n = n + 1; return n end)
+        bb.set_provider("pv", {get = function() n = n + 1; return n end})
         bt.init({root = "res://root.json"})
         return bt.exec({interval = 10})
     )"));

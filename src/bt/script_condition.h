@@ -2,6 +2,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -54,9 +55,22 @@ private:
     NodeStatus HandleResult(const ScriptResult& result);
     void CallExit(const std::string& reason);
 
-    // Build the Enter params table: starts from `args_` and overlays any
-    // `$key` blackboard references (`bb_refs_`), read fresh at Enter time.
-    ArgsMap ResolveArgsForEnter(Blackboard& bb) const;
+    // Pre-Enter `$key` param resolution. All refs resolve (in parallel)
+    // BEFORE Enter runs: static values fill immediately; provider-served
+    // refs launch provider.get coroutines and the condition stays Running
+    // until every one completes — then Enter receives the full args table.
+    // One possibly-suspended provider read (the yielded_co_/has_result_
+    // pattern, one slot per param).
+    struct PendingParam {
+        lua_State* co = nullptr;  // outstanding coroutine (null = done/none)
+        bool done = false;
+        ScriptResult result;
+    };
+    void StartParamResolution(Blackboard& bb);  // fills resolved_/pending_
+    void CollectResolved();                     // pending_ -> resolved_ (warns misses)
+    void CancelParamResolution();
+    // args_ overlaid with the resolved `$key` values.
+    ArgsMap EnterArgs() const;
 
     std::string name_;
     std::string script_path_;
@@ -69,6 +83,12 @@ private:
 
     bool active_ = false;
     bool entering_ = false;
+    // Enter sequencing: kIdle -> (resolve params) -> kReady -> Enter.
+    enum class EnterStage { kIdle, kResolving, kReady };
+    EnterStage enter_stage_ = EnterStage::kIdle;
+    std::vector<PendingParam> pending_params_;         // parallel to pending_names_
+    std::vector<std::string> pending_names_;
+    std::unordered_map<std::string, LuaValue> resolved_;  // completed $key values
 
     lua_State* yielded_co_ = nullptr;
     bool has_result_ = false;

@@ -1,10 +1,12 @@
 #include "blackboard_condition.h"
 
 #include <optional>
+#include <utility>
 #include <variant>
 
 #include "blackboard.h"
-#include "lua_types.h"
+#include "lua_runtime.h"
+#include "provider_call.h"
 #include "types.h"
 
 namespace {
@@ -52,6 +54,12 @@ std::optional<int> ValuesOrder(const LuaValue& a, const LuaValue& b) {
     return std::nullopt;
 }
 
+// The value a completed provider read delivered (nil for an empty return
+// or an error — errors are logged inside provider_call).
+LuaValue ResultValue(const ScriptResult& r) {
+    return (!r.values.empty()) ? r.values[0] : LuaValue(nullptr);
+}
+
 }  // namespace
 
 // static
@@ -79,29 +87,89 @@ BlackboardCondition::BlackboardCondition(std::string key, std::string op,
       key2_(std::move(key2)),
       op_(std::move(op)) {}
 
-NodeStatus BlackboardCondition::Tick(Blackboard& bb, BtEventQueue& /*events*/) {
-    if (op_ == "exists") {
-        return bb.Has(key_) ? NodeStatus::kSuccess : NodeStatus::kFailure;
-    }
+BlackboardCondition::~BlackboardCondition() {
+    CancelPending();
+}
 
-    auto lhs = bb.Get(key_);
-    if (!lhs.has_value()) {
+async_simple::coro::Lazy<bool> BlackboardCondition::Init(lua_State* /*L*/,
+                                                         LuaRuntime* ctx) {
+    lua_ctx_ = ctx;  // backs provider get coroutines
+    co_return true;
+}
+
+void BlackboardCondition::CancelPending() {
+    if (!lua_ctx_) {
+        lhs_pend_ = {};
+        rhs_pend_ = {};
+        return;
+    }
+    if (lhs_pend_.co != nullptr) {
+        lua_ctx_->CancelCall(lhs_pend_.co);
+        lhs_pend_ = {};
+    }
+    if (rhs_pend_.co != nullptr) {
+        lua_ctx_->CancelCall(rhs_pend_.co);
+        rhs_pend_ = {};
+    }
+}
+
+bool BlackboardCondition::StartRead(Blackboard& bb, const std::string& key,
+                                    std::optional<LuaValue>& out,
+                                    PendingCall& pend) {
+    auto look = bb.Lookup(key);
+    switch (look.kind) {
+    case BbReadResult::Kind::kValue:
+        out = std::move(look.value);
+        return false;
+    case BbReadResult::Kind::kMissing:
+        return false;  // stays nullopt -> comparison treats as not met
+    case BbReadResult::Kind::kProvider: {
+        if (!lua_ctx_) {
+            spdlog::warn(
+                "Blackboard condition: provider key '{}' has no LuaRuntime",
+                key);
+            return false;
+        }
+        auto res = provider_call::InvokeProviderGet(
+            lua_ctx_, look.provider, look.path,
+            [&pend](ScriptResult r) {
+                pend.done = true;
+                pend.result = std::move(r);
+            });
+        if (res.yielded) {
+            pend.co = res.co;
+            return true;  // in flight
+        }
+        // Synchronous provider completion: the callback already fired.
+        out = ResultValue(pend.result);
+        pend = {};
+        return false;
+    }
+    }
+    return false;
+}
+
+NodeStatus BlackboardCondition::Compare() {
+    lhs_pend_ = {};
+    rhs_pend_ = {};
+
+    if (!lhs_val_.has_value()) {
         // Missing key is "not met" for every comparison op — including "!=".
         return NodeStatus::kFailure;
     }
-
     LuaValue rhs = rhs_;
     if (!key2_.empty()) {
-        // Live key-vs-key: read the right side fresh from the blackboard.
-        auto r = bb.Get(key2_);
-        if (!r.has_value()) return NodeStatus::kFailure;  // rhs missing -> not met
-        rhs = *r;
+        if (!rhs_val_.has_value()) {
+            return NodeStatus::kFailure;  // rhs missing -> not met
+        }
+        rhs = *rhs_val_;
     }
 
-    if (op_ == "==") return ValuesEqual(*lhs, rhs) ? NodeStatus::kSuccess : NodeStatus::kFailure;
-    if (op_ == "!=") return ValuesEqual(*lhs, rhs) ? NodeStatus::kFailure : NodeStatus::kSuccess;
+    const LuaValue& lhs = *lhs_val_;
+    if (op_ == "==") return ValuesEqual(lhs, rhs) ? NodeStatus::kSuccess : NodeStatus::kFailure;
+    if (op_ == "!=") return ValuesEqual(lhs, rhs) ? NodeStatus::kFailure : NodeStatus::kSuccess;
 
-    auto ord = ValuesOrder(*lhs, rhs);
+    auto ord = ValuesOrder(lhs, rhs);
     if (!ord) {
         set_last_error("Blackboard condition key '" + key_ +
                        "' value not orderable against op '" + op_ + "'");
@@ -112,4 +180,40 @@ NodeStatus BlackboardCondition::Tick(Blackboard& bb, BtEventQueue& /*events*/) {
              : (op_ == "<")  ? (*ord < 0)
                              : (*ord <= 0);  // "<="
     return met ? NodeStatus::kSuccess : NodeStatus::kFailure;
+}
+
+NodeStatus BlackboardCondition::Tick(Blackboard& bb, BtEventQueue& /*events*/) {
+    if (op_ == "exists") {
+        return bb.Has(key_) ? NodeStatus::kSuccess : NodeStatus::kFailure;
+    }
+
+    // Finish in-flight provider reads (both sides run in parallel).
+    if (lhs_pend_.co != nullptr || rhs_pend_.co != nullptr) {
+        if (lhs_pend_.co != nullptr) {
+            if (!lhs_pend_.done) return NodeStatus::kRunning;
+            lhs_val_ = ResultValue(lhs_pend_.result);
+        }
+        if (rhs_pend_.co != nullptr) {
+            if (!rhs_pend_.done) return NodeStatus::kRunning;
+            rhs_val_ = ResultValue(rhs_pend_.result);
+        }
+        return Compare();
+    }
+
+    // Fresh evaluation: read both sides (provider reads may suspend).
+    lhs_val_.reset();
+    rhs_val_.reset();
+    bool in_flight = StartRead(bb, key_, lhs_val_, lhs_pend_);
+    if (!key2_.empty()) {
+        in_flight |= StartRead(bb, key2_, rhs_val_, rhs_pend_);
+    } else {
+        rhs_val_ = rhs_;  // literal right side
+    }
+    if (in_flight) return NodeStatus::kRunning;
+    return Compare();
+}
+
+void BlackboardCondition::Reset() {
+    CancelPending();
+    NodeCondition::Reset();
 }

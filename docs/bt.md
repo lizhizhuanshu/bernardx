@@ -105,7 +105,7 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | `Parallel` | 复合 | `params` | 并行所有子节点，策略控制结果 |
 | `RandomSelector` / `RandomSequence` | 复合 | — | 同 Selector/Sequence，每次 Reset 后随机排列子节点顺序 |
 | `Script` | 叶子 | `source`, `params` | 执行 Lua 脚本 |
-| `Set` | 叶子 | `params` | **内置黑板写 Action**（零脚本）：`params.key`（必填）写入目标键；`params.value`（标量，缺省写 nil）写入值。字符串值以 `$` 开头为黑板引用——`"$src"` 在**每次 Tick** 实时读 `blackboard[src]` 拷入（缺键写 nil 并告警；`src` 支持[点号路径](../api/blackboard.md#点号路径取表内字段)，如 `"$cfg.net.ip"`），`"$$x"` 转义为字面 `"$x"`。写入后立即 Success，常与 `Blackboard` 条件配合组成纯声明式树 |
+| `Set` | 叶子 | `params` | **内置黑板写 Action**（零脚本）：`params.key`（必填）写入目标键——key 可带 `.`，按[点号路径写入](../api/blackboard.md#点号路径取表内字段)路由（根键装了[提供器](../api/blackboard.md#value-提供器可异步)时调其 `set`，静态表则 `rawset` 写入）；`params.value`（标量，缺省写 nil）写入值。字符串值以 `$` 开头为黑板引用——`"$src"` 在**每次 Tick** 实时读 `blackboard[src]` 拷入（缺键写 nil 并告警；`src` 支持[点号路径](../api/blackboard.md#点号路径取表内字段)，如 `"$cfg.net.ip"`），`"$$x"` 转义为字面 `"$x"`。`$src` 读或写入目标是**异步提供器**时节点保持 Running 直到完成（无提供器路径单 tick 完成），常与 `Blackboard` 条件配合组成纯声明式树 |
 | `Subtree` | 叶子 | `source`, `params` | 加载 `source` 指向的子树 JSON（递归）；`params` 透传给子树内节点（见[子树参数透传](#子树参数透传)）；`condition` 支持 `"child_condition"` 透传子树根的条件（见上[节点结构](#节点结构)） |
 | `Template` | —（解析期展开） | `source`, `params` | **模板内联展开**：与 Subtree 完全相同的加载/`{{}}` 参数替换/`data` 引用解析，但**不产生运行时节点**——解析时把目标节点直接替换到 Template 的位置（树里不存在包装层）。Template 自身声明的 `condition` 转挂到展开后的根节点上。**参数即契约**：模板 JSON 需要而上层 `params` 未提供的 `{{key}}` 是**解析期硬错误**（报错列出全部缺失键与模板名），不会留字面量拖到运行期。适合把参数化片段内联进 Pipeline 步骤等"包装纯属噪音"的场合 |
 | `Wait` | 叶子 | `params` | 等待若干毫秒后 Success：`params.timeout` 为**数值**（固定等待，默认 1000）或**两元素数组 `[lo, hi]`**（闭区间均匀随机，每次运行重摇；`[v]` 等价固定 v）。`0` 立即 Success。旧 `min_timeout`/`max_timeout` 已移除，出现即解析报错 |
@@ -132,7 +132,7 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `*target` | object（条件） | 该步的**目标状态**（见[条件](#条件)）："这步做完时应当成立"。**已成立 → 该步跳过**（工作已完成）；不成立 → 执行本步动作。可选，缺省 = 动作完成即目标（该步不会被跳过，动作跑完即过）。条件对象上可写 `abort` 字段（`Self`/`LowerPriority`/`Both`）开启**响应式中断**——guard 的镜像语义（对 target，"**成立**"才是事件）：`Self` = 动作运行期间 target 成立 → 中断动作、跳过剩余工作立即前进；`LowerPriority` = 后续步运行期间**更早**步的 target 成立→不成立翻转（前置回退，如中途被登出）→ 打断当前工作回跳重做该步；`Both` = 两者 |
-| `*timeout` | int、`[lo,hi]` 或 `"$key"` (**毫秒**) | 本步动作跑完后等待 `*target` 成立的墙钟预算；数组形式表示闭区间内**均匀随机**；0/缺省 = 无限等（缺省时若 Pipeline 定义了 `params.timeout` 则用该默认值）。**分配时机是本步每次进入等待窗口时**（Reset 后的每轮运行重新分配）：`[lo,hi]` 重摇、`"$key"` 黑板引用活读（provider 活调，值可为整数或 `{lo,hi}` 表）。引用解析失败（缺键/类型错）记日志并按 0 处理（= 无限等），不报解析错误 |
+| `*timeout` | int、`[lo,hi]` 或 `"$key"` (**毫秒**) | 本步动作跑完后等待 `*target` 成立的墙钟预算；数组形式表示闭区间内**均匀随机**；0/缺省 = 无限等（缺省时若 Pipeline 定义了 `params.timeout` 则用该默认值）。**分配时机是本步每次进入等待窗口时**（Reset 后的每轮运行重新分配）：`[lo,hi]` 重摇、`"$key"` 黑板引用活读（provider 活调，值可为整数或 `{lo,hi}` 表）。引用解析失败（缺键/类型错）记日志并按 0 处理（= 无限等），不报解析错误。`"$key"` 是**异步提供器**时 Pipeline 先停在解析相位（Running）直到值到齐，**等待预算的时钟从解析完成时起算** |
 | `*retry` | int、`[lo,hi]` 或 `"$key"` | 等待本步 `*target` 超时后，**重跑本步动作**的最大次数；同样支持 `[lo,hi]` 范围随机与 `"$key"` 黑板引用，缺省时回退 `params.retry`，分配时机同上 |
 
 执行：
@@ -184,7 +184,7 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 | `Or` | `children` | 任一成立即成立，短路到首个 Success/Running |
 | `Not` | `child` | 反转 Success/Failure，Running 透传 |
 
-**Blackboard 条件**直接比较黑板值与一个字面量或另一个黑板 key 的值，同步、零脚本，适合简单的状态门控。与节点一致，类型专属配置全部放在 `params` 里：
+**Blackboard 条件**直接比较黑板值与一个字面量或另一个黑板 key 的值，零脚本，适合简单的状态门控（静态值时同步；比较任一侧是**异步提供器**时条件先返回 Running、两侧并行读取完成后给出判定——重求值期间守卫沿用上一次终态，即 stale-while-running）。与节点一致，类型专属配置全部放在 `params` 里：
 
 ```json
 "condition": { "type":"Blackboard", "params":{ "key":"page", "op":"==", "value":"home" } }  // key 对字面量
@@ -267,7 +267,7 @@ return M
 
 **`params` 支持标量和 table**：`params` 的值除 `nil`/`bool`/`int`/`double`/`string` 外，也可是 object 或 array——在 `Enter(params)` 里收到的是**真正的 Lua table**，可嵌套访问（`params.config.hp`）；数组按 Lua 惯例从 1 开始。table 在 `bt.init` 阶段于 `lua_State` 上构建并以 `LuaRef` 持有，生命周期随节点。
 
-**`$key` 黑板引用**：`params` 的字符串值以 `$` 开头（如 `"$proxy.ip"`）表示黑板引用，在该节点/条件 Enter 时实时读入（`$$` 转义为字面 `$`）。引用的 key 支持[点号路径](../api/blackboard.md#点号路径取表内字段)——`"$proxy.ip"` 取 `blackboard[proxy]` 表的 `ip` 字段（根键装了[提供器](../api/blackboard.md#value-提供器-computed-value)时，后续段作为参数传给提供器函数）；缺键时该参数为 `nil` 并告警。
+**`$key` 黑板引用**：`params` 的字符串值以 `$` 开头（如 `"$proxy.ip"`）表示黑板引用（`$$` 转义为字面 `$`）。引用的 key 支持[点号路径](../api/blackboard.md#点号路径取表内字段)——`"$proxy.ip"` 取 `blackboard[proxy]` 表的 `ip` 字段（根键装了[提供器](../api/blackboard.md#value-提供器可异步)时，后续段作为参数传给其 `get`）。**所有 `$key` 参数在该节点/条件 Enter 之前解析完毕**：多个引用并行发起，全部完成后才进 Enter——引用是异步提供器时节点保持 Running 直到值到齐（同步引用不产生额外 tick）；缺键时该参数为 `nil` 并告警。
 
 ## 子树参数透传
 

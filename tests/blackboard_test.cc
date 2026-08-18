@@ -52,6 +52,15 @@ protected:
 
     lua_State* L;
     Blackboard bb;
+
+    // A stand-in provider table ref (type LUA_TTABLE). Lookup/Store never
+    // invoke the provider — the ref's contents are irrelevant here, only
+    // its identity and type matter.
+    LuaRef NewProviderTable() {
+        lua_newtable(L);
+        int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        return std::make_shared<StatefulLuaRef>(ref, LUA_TTABLE, L);
+    }
 };
 
 }  // namespace
@@ -117,6 +126,106 @@ TEST_F(DottedKeyTest, FlatLookupUnchangedWithoutDot) {
     bb.Set("x", LuaValue(static_cast<int64_t>(5)));
     EXPECT_EQ(std::get<int64_t>(*bb.Get("x")), 5);
     EXPECT_FALSE(bb.Get("nope").has_value());
+}
+
+// --- Dotted-key WRITE tests ---
+//
+// Set("a.b", v): a literal "a.b" entry wins; a provider root routes to the
+// provider's Set; a static table root rawsets into the table; a missing or
+// non-table root stores a plain literal key.
+
+TEST_F(DottedKeyTest, DottedWriteRoutesToProviderSet) {
+    // A provider root reports kProvider with the remaining segments — the
+    // caller (SetNode / bb.set) invokes the provider's set itself. Nothing
+    // is stored under a literal key.
+    LuaRef tbl = NewProviderTable();
+    bb.SetProvider("cfg", tbl);
+    auto w = bb.Store("cfg.net.ip", LuaValue(static_cast<int64_t>(42)));
+    EXPECT_EQ(w.kind, BbWriteResult::Kind::kProvider);
+    EXPECT_EQ(w.path, (std::vector<std::string>{"net", "ip"}));
+    EXPECT_EQ(w.provider.get(), tbl.get());  // the installed table ref
+    EXPECT_FALSE(bb.Has("cfg.net.ip"));      // no literal entry created
+}
+
+TEST_F(DottedKeyTest, DottedWriteRawsetsIntoStaticTable) {
+    // The write lands in the very table Lua holds: keep our own registry
+    // ref to the same object and read it back Lua-side.
+    lua_newtable(L);
+    lua_pushvalue(L, -1);
+    int own = luaL_ref(L, LUA_REGISTRYINDEX);
+    bb.Set("t", WrapTopTable());
+
+    bb.Set("t.x", LuaValue(static_cast<int64_t>(7)));
+    EXPECT_EQ(std::get<int64_t>(*bb.Get("t.x")), 7);  // engine read-back
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, own);  // the SAME table object
+    lua_getfield(L, -1, "x");
+    EXPECT_EQ(lua_tointeger(L, -1), 7);      // Lua-side visible
+    lua_pop(L, 2);
+    luaL_unref(L, LUA_REGISTRYINDEX, own);
+}
+
+TEST_F(DottedKeyTest, DottedWriteRawsetsNested) {
+    SetTable("cfg", [this]() {
+        lua_newtable(L);                        // cfg.net
+        lua_pushstring(L, "1.1.1.1");
+        lua_setfield(L, -2, "ip");
+        lua_setfield(L, -2, "net");             // cfg.net = {ip=..}
+    });
+    bb.Set("cfg.net.ip", LuaValue(std::string("2.2.2.2")));
+    EXPECT_EQ(std::get<std::string>(*bb.Get("cfg.net.ip")), "2.2.2.2");
+}
+
+TEST_F(DottedKeyTest, DottedWriteMidPathMissIsNoOp) {
+    // No auto-vivify: a missing mid field (or a non-table mid value, an
+    // empty segment) warns and drops the write — nothing is stored.
+    SetTable("t", [this]() {
+        lua_pushinteger(L, 1);
+        lua_setfield(L, -2, "n");
+    });
+    bb.Set("t.nope.x", LuaValue(static_cast<int64_t>(5)));   // missing mid field
+    bb.Set("t.n.deeper", LuaValue(static_cast<int64_t>(5)));  // non-table mid
+    bb.Set("t..n", LuaValue(static_cast<int64_t>(5)));        // empty segment
+    bb.Set("t.", LuaValue(static_cast<int64_t>(5)));          // trailing dot
+    EXPECT_FALSE(bb.Get("t.nope.x").has_value());
+    EXPECT_FALSE(bb.Get("t.n.deeper").has_value());
+    EXPECT_FALSE(bb.Has("t.nope.x"));  // no literal entries created either
+    EXPECT_FALSE(bb.Has("t..n"));
+    EXPECT_FALSE(bb.Has("t."));
+    EXPECT_FALSE(bb.Has("t.n.deeper"));
+}
+
+TEST_F(DottedKeyTest, DottedWriteRootMissingOrScalarFallsBackToLiteral) {
+    bb.Set("a.b", LuaValue(std::string("v1")));      // root missing -> literal
+    EXPECT_TRUE(bb.Has("a.b"));
+    EXPECT_EQ(std::get<std::string>(*bb.Get("a.b")), "v1");
+
+    bb.Set("scalar", LuaValue(std::string("s")));
+    bb.Set("scalar.ip", LuaValue(std::string("v2")));  // scalar root -> literal
+    EXPECT_TRUE(bb.Has("scalar.ip"));
+    EXPECT_EQ(std::get<std::string>(*bb.Get("scalar.ip")), "v2");
+}
+
+TEST_F(DottedKeyTest, DottedWriteLiteralKeyShadowsRouting) {
+    // A literal "p.q" entry already present: Store overwrites the literal
+    // (kStored), and the root provider is never consulted (mirrors Lookup).
+    bb.Set("p.q", LuaValue(std::string("first")));
+    bb.SetProvider("p", NewProviderTable());
+    auto w = bb.Store("p.q", LuaValue(std::string("second")));
+    EXPECT_EQ(w.kind, BbWriteResult::Kind::kStored);
+    EXPECT_EQ(std::get<std::string>(*bb.Get("p.q")), "second");
+}
+
+TEST_F(DottedKeyTest, DottedWriteRejectsCrossStateRefValue) {
+    SetTable("t", []() {});
+    lua_State* L2 = luaL_newstate();
+    lua_newtable(L2);
+    int r2 = luaL_ref(L2, LUA_REGISTRYINDEX);
+    LuaValue foreign(std::make_shared<StatefulLuaRef>(r2, LUA_TTABLE, L2));
+    bb.Set("t.x", std::move(foreign));  // ref from another state -> warn, no-op
+    EXPECT_FALSE(bb.Get("t.x").has_value());
+    luaL_unref(L2, LUA_REGISTRYINDEX, r2);
+    lua_close(L2);
 }
 
 // --- Blackboard Tests ---
@@ -186,94 +295,65 @@ TEST(BlackboardTest, MultipleTypes) {
     EXPECT_EQ(std::get<std::string>(*bb.Get("str_val")), "text");
 }
 
-// --- Value provider Tests ---
+// --- Provider (Lookup/Store routing) Tests ---
 //
-// SetProvider installs a computed-value source: every Get invokes it fresh.
-// A key holds either a static value or a provider — last writer wins.
+// The blackboard stores a provider as the {get,set} table's LuaRef and
+// NEVER invokes it: a provider-served read/write reports kProvider (with
+// the table ref + remaining path segments) and the CALLER drives the
+// provider (see provider_call.h / blackboard_library.cc). These tests
+// cover the routing only — invocation behavior lives in the runtime
+// integration tests.
 
-TEST(BlackboardTest, ProviderInvokedOnEveryGet) {
-    Blackboard bb;
-    int calls = 0;
-    bb.SetProvider("n", [&calls](const std::vector<std::string>&) -> LuaValue {
-        ++calls;
-        return LuaValue(static_cast<int64_t>(calls));
-    });
-    EXPECT_EQ(std::get<int64_t>(*bb.Get("n")), 1);
-    EXPECT_EQ(std::get<int64_t>(*bb.Get("n")), 2);
-    EXPECT_EQ(std::get<int64_t>(*bb.Get("n")), 3);
+TEST_F(DottedKeyTest, ProviderKeyLookupReportsProvider) {
+    LuaRef tbl = NewProviderTable();
+    bb.SetProvider("cfg", tbl);
+
+    // Flat read: kProvider, no segments, the installed ref.
+    auto flat = bb.Lookup("cfg");
+    EXPECT_EQ(flat.kind, BbReadResult::Kind::kProvider);
+    EXPECT_TRUE(flat.path.empty());
+    EXPECT_EQ(flat.provider.get(), tbl.get());
+
+    // Dotted read: the remaining segments, any depth.
+    auto dotted = bb.Lookup("cfg.net.ip");
+    EXPECT_EQ(dotted.kind, BbReadResult::Kind::kProvider);
+    EXPECT_EQ(dotted.path, (std::vector<std::string>{"net", "ip"}));
+    EXPECT_EQ(dotted.provider.get(), tbl.get());
+
+    // Static-only convenience: provider keys read as missing.
+    EXPECT_FALSE(bb.Get("cfg").has_value());
+    // Provider counts as present.
+    EXPECT_TRUE(bb.Has("cfg"));
 }
 
-TEST(BlackboardTest, ProviderCanReadOtherKeys) {
-    Blackboard bb;
-    bb.Set("base", LuaValue(static_cast<int64_t>(10)));
-    bb.SetProvider("double_base", [&bb](const std::vector<std::string>&) -> LuaValue {
-        auto base = bb.Get("base");  // re-enters the blackboard (no lock held)
-        return LuaValue(static_cast<int64_t>(std::get<int64_t>(*base) * 2));
-    });
-    EXPECT_EQ(std::get<int64_t>(*bb.Get("double_base")), 20);
-    bb.Set("base", LuaValue(static_cast<int64_t>(50)));
-    EXPECT_EQ(std::get<int64_t>(*bb.Get("double_base")), 100);  // live
+TEST_F(DottedKeyTest, SetReplacesProviderAndViceVersa) {
+    bb.SetProvider("k", NewProviderTable());
+    bb.Set("k", LuaValue(std::string("static")));  // flat Set replaces
+    auto after_set = bb.Lookup("k");
+    EXPECT_EQ(after_set.kind, BbReadResult::Kind::kValue);
+    EXPECT_EQ(std::get<std::string>(after_set.value), "static");
+
+    bb.SetProvider("k", NewProviderTable());  // SetProvider replaces
+    EXPECT_EQ(bb.Lookup("k").kind, BbReadResult::Kind::kProvider);
 }
 
-TEST(BlackboardTest, SetReplacesProviderAndViceVersa) {
-    Blackboard bb;
-    bb.SetProvider("k", [](const std::vector<std::string>&) -> LuaValue { return LuaValue(std::string("computed")); });
-    EXPECT_EQ(std::get<std::string>(*bb.Get("k")), "computed");
-    bb.Set("k", LuaValue(std::string("static")));
-    EXPECT_EQ(std::get<std::string>(*bb.Get("k")), "static");
-    bb.SetProvider("k", [](const std::vector<std::string>&) -> LuaValue { return LuaValue(std::string("again")); });
-    EXPECT_EQ(std::get<std::string>(*bb.Get("k")), "again");
-}
-
-TEST(BlackboardTest, ProviderHasRemoveClear) {
-    Blackboard bb;
-    bb.SetProvider("p", [](const std::vector<std::string>&) -> LuaValue { return LuaValue(static_cast<int64_t>(1)); });
+TEST_F(DottedKeyTest, ProviderHasRemoveClear) {
+    bb.SetProvider("p", NewProviderTable());
     EXPECT_TRUE(bb.Has("p"));  // provider counts as present
     bb.Remove("p");
     EXPECT_FALSE(bb.Has("p"));
-    bb.SetProvider("q", [](const std::vector<std::string>&) -> LuaValue { return LuaValue(static_cast<int64_t>(1)); });
+    bb.SetProvider("q", NewProviderTable());
     bb.Clear();
     EXPECT_FALSE(bb.Has("q"));
 }
 
-TEST(BlackboardTest, ProviderReturningNilIsPresentNil) {
-    Blackboard bb;
-    bb.SetProvider("nils", [](const std::vector<std::string>&) -> LuaValue { return LuaValue(nullptr); });
-    auto v = bb.Get("nils");
-    ASSERT_TRUE(v.has_value());  // present (provider installed)...
-    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(*v));  // ...but nil
-}
-
-TEST(BlackboardTest, ProviderReceivesDottedPathSegments) {
-    // A dotted read on a provider root hands the remaining segments to the
-    // provider; its return value IS the result (no descent after it).
-    Blackboard bb;
-    bb.SetProvider("cfg", [](const std::vector<std::string>& path) -> LuaValue {
-        if (path.empty()) return LuaValue(std::string("flat"));
-        std::string joined;
-        for (size_t i = 0; i < path.size(); ++i) {
-            joined += (i ? "/" : "") + path[i];
-        }
-        return LuaValue(joined);
-    });
-    // Flat read: no segments.
-    EXPECT_EQ(std::get<std::string>(*bb.Get("cfg")), "flat");
-    // Dotted reads: segments in order, any depth.
-    EXPECT_EQ(std::get<std::string>(*bb.Get("cfg.host")), "host");
-    EXPECT_EQ(std::get<std::string>(*bb.Get("cfg.net.ip")), "net/ip");
-    EXPECT_EQ(std::get<std::string>(*bb.Get("cfg.a.b.c")), "a/b/c");
-}
-
-
-TEST(BlackboardTest, ProviderSelfReadStopsAtRecursionLimit) {
-    Blackboard bb;
-    // Provider reading its own key: guarded, returns nullopt instead of
-    // recursing forever (the nested Get hits the depth cap).
-    bb.SetProvider("loop", [&bb](const std::vector<std::string>&) -> LuaValue {
-        auto v = bb.Get("loop");
-        return v ? *v : LuaValue(nullptr);
-    });
-    auto v = bb.Get("loop");
-    EXPECT_TRUE(v.has_value());  // outer Get returns the provider's nil
-    EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(*v));
+TEST_F(DottedKeyTest, ProviderLiteralKeyShadowsRoot) {
+    // A literal dotted entry wins over the root's provider on both sides.
+    bb.Set("cfg.net.ip", LuaValue(std::string("literal")));
+    bb.SetProvider("cfg", NewProviderTable());
+    auto r = bb.Lookup("cfg.net.ip");
+    EXPECT_EQ(r.kind, BbReadResult::Kind::kValue);
+    EXPECT_EQ(std::get<std::string>(r.value), "literal");
+    bb.Remove("cfg.net.ip");
+    EXPECT_EQ(bb.Lookup("cfg.net.ip").kind, BbReadResult::Kind::kProvider);
 }

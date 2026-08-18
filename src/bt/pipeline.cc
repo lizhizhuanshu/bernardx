@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <cmath>
 #include <optional>
+#include <utility>
 
 #include "bt_event_queue.h"
 #include "bt_utils.h"
 #include "blackboard.h"
 #include "node.h"
 #include "node_condition.h"
+#include "provider_call.h"
 #include "types.h"
 
 Pipeline::Pipeline(uint32_t id, std::string name)
@@ -30,6 +32,7 @@ async_simple::coro::Lazy<bool> Pipeline::Init(lua_State* L, LuaRuntime* ctx) {
     // Composite::Init inits the action children; the *target conditions are
     // owned by this pipeline (not set on the nodes), so init them here.
     lua_state_ = L;  // backs $key-ref LuaRefs ({lo,hi} tables) at resolve time
+    lua_ctx_ = ctx;  // backs provider get coroutines for $key refs
     if (!co_await Composite::Init(L, ctx)) co_return false;
     for (auto& step : steps_) {
         if (step.target && !co_await step.target->Init(L, ctx)) {
@@ -41,20 +44,14 @@ async_simple::coro::Lazy<bool> Pipeline::Init(lua_State* L, LuaRuntime* ctx) {
     co_return true;
 }
 
-// Resolve one edge param to an int for THIS run. `def` supplies the
-// pipeline-level default when the step's own param is unset. A `$key` ref is
-// read from the blackboard fresh (providers invoke); an int value fixes it,
-// a {lo,hi} table rolls. Returns -1 with an error log when the ref can't
-// resolve (the caller treats -1 as 0 = wait forever / no retry).
-int Pipeline::ResolveEdgeParam(Blackboard& bb, const EdgeParam& e,
-                               const EdgeParam& def, const char* what) {
-    const EdgeParam& p = (e.kind == EdgeParam::Kind::kFixed && e.lo < 0) ? def : e;
-    if (p.kind == EdgeParam::Kind::kFixed) return p.lo < 0 ? 0 : p.lo;
-    if (p.kind == EdgeParam::Kind::kRange) return RollIntInRange(p.lo, p.hi, rng_);
-    // kBbRef: read the blackboard fresh for this run.
-    auto v = bb.Get(p.key);
+// One resolved edge value -> int for THIS run: an integer fixes it, a
+// {lo,hi} table rolls. Returns -1 with an error log when the value can't
+// be used (the caller treats -1 as 0 = wait forever / no retry).
+int Pipeline::FinishEdgeParam(const std::optional<LuaValue>& v,
+                              const EdgeParam& p, const char* what) {
     if (!v.has_value()) {
-        spdlog::error("Pipeline '{}': {} blackboard key '{}' not set", name(), what, p.key);
+        spdlog::error("Pipeline '{}': {} blackboard key '{}' not set",
+                      name(), what, p.key);
         return -1;
     }
     if (auto* i64 = std::get_if<int64_t>(&*v)) {
@@ -97,15 +94,86 @@ int Pipeline::ResolveEdgeParam(Blackboard& bb, const EdgeParam& e,
     return -1;
 }
 
-void Pipeline::ResolveStepBudgets(Blackboard& bb, size_t i) {
-    if (cur_timeout_[i] < 0) {
-        int t = ResolveEdgeParam(bb, steps_[i].timeout, def_timeout_, "*timeout");
-        cur_timeout_[i] = t < 0 ? 0 : t;
+void Pipeline::CancelPendingResolves() {
+    if (lua_ctx_ != nullptr) {
+        if (resolve_timeout_.co != nullptr) lua_ctx_->CancelCall(resolve_timeout_.co);
+        if (resolve_retry_.co != nullptr) lua_ctx_->CancelCall(resolve_retry_.co);
     }
-    if (cur_retry_[i] < 0) {
-        int r = ResolveEdgeParam(bb, steps_[i].retry, def_retry_, "*retry");
-        cur_retry_[i] = r < 0 ? 0 : r;
+    resolve_timeout_ = {};
+    resolve_retry_ = {};
+}
+
+// Resolve this step's budgets for the CURRENT run when it enters its wait
+// window. Fixed/range params (and the pipeline defaults) resolve inline; a
+// `$key` ref reads the blackboard — a static value finishes inline, while
+// a provider-served key launches the provider's get as a coroutine and the
+// pipeline parks in kResolve until both reads complete. Returns false when
+// a resolve is in flight.
+bool Pipeline::ResolveStepBudgets(Blackboard& bb, size_t i) {
+    bool in_flight = false;
+    auto resolve = [&](const EdgeParam& e, const EdgeParam& def, const char* what,
+                       int& cur, PendingValue& pend) {
+        if (cur >= 0) return;  // already resolved this run
+        const EdgeParam& p =
+            (e.kind == EdgeParam::Kind::kFixed && e.lo < 0) ? def : e;
+        if (p.kind == EdgeParam::Kind::kFixed) {
+            cur = p.lo < 0 ? 0 : p.lo;
+            return;
+        }
+        if (p.kind == EdgeParam::Kind::kRange) {
+            cur = RollIntInRange(p.lo, p.hi, rng_);
+            return;
+        }
+        // kBbRef: read the blackboard fresh for this run.
+        auto look = bb.Lookup(p.key);
+        switch (look.kind) {
+        case BbReadResult::Kind::kValue:
+            cur = FinishEdgeParam(std::move(look.value), p, what);
+            break;
+        case BbReadResult::Kind::kMissing:
+            cur = FinishEdgeParam(std::nullopt, p, what);
+            break;
+        case BbReadResult::Kind::kProvider: {
+            if (!lua_ctx_) {
+                spdlog::error("Pipeline '{}': {} provider key '{}' has no LuaRuntime",
+                              name(), what, p.key);
+                cur = 0;
+                break;
+            }
+            pend = {};
+            pend.src = p;
+            pend.what = what;
+            auto out = provider_call::InvokeProviderGet(
+                lua_ctx_, look.provider, look.path,
+                [&pend](ScriptResult r) {
+                    pend.done = true;
+                    pend.value = (!r.values.empty())
+                                     ? std::optional<LuaValue>(std::move(r.values[0]))
+                                     : std::nullopt;
+                });
+            if (out.yielded) {
+                pend.co = out.co;
+                in_flight = true;
+            } else {
+                // Synchronous provider completion: the callback fired.
+                int done = FinishEdgeParam(pend.value, pend.src, pend.what);
+                pend = {};
+                cur = done < 0 ? 0 : done;
+            }
+            break;
+        }
+        }
+        if (cur < 0) cur = 0;  // failed ref = wait forever / no retry
+    };
+    resolve(steps_[i].timeout, def_timeout_, "*timeout", cur_timeout_[i],
+            resolve_timeout_);
+    resolve(steps_[i].retry, def_retry_, "*retry", cur_retry_[i],
+            resolve_retry_);
+    if (in_flight) {
+        phase_ = Phase::kResolve;
+        return false;
     }
+    return true;
 }
 
 NodeStatus Pipeline::EvalTarget(Blackboard& bb, BtEventQueue& events, size_t i) {
@@ -159,6 +227,7 @@ bool Pipeline::EvaluateTargetAborts(Blackboard& bb, BtEventQueue& events) {
             // regressed step: fresh act phase (its action re-runs), fresh
             // budgets. If the target came back by the time it re-runs, the
             // normal scan-forward skips it.
+            CancelPendingResolves();  // stale budgets for the aborted step
             children_[current_child_index_]->OnAborted();
             current_child_index_ = i;
             children_[i]->Reset();
@@ -248,9 +317,13 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
                              "aborting the rest of the action",
                              name(), current_child_index_);
                 children_[current_child_index_]->OnAborted();
+                // Budgets first (a provider-backed `$key` resolve parks in
+                // kResolve for a few ticks); the wait starts once final.
+                if (!ResolveStepBudgets(bb, current_child_index_)) {
+                    return NodeStatus::kRunning;
+                }
                 phase_ = Phase::kWait;  // the wait below advances this tick
                 wait_start_ms_ = events.now_ms();
-                ResolveStepBudgets(bb, current_child_index_);
                 continue;  // fall into the wait with the target already met
             }
 
@@ -263,9 +336,41 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
                 return NodeStatus::kFailure;
             }
             // Action done → wait for this step's target (absent target: met).
+            // Budgets first (a provider-backed `$key` resolve parks in
+            // kResolve for a few ticks); the wait window — and its clock —
+            // starts once the budgets are final.
+            if (!ResolveStepBudgets(bb, current_child_index_)) {
+                return NodeStatus::kRunning;
+            }
             phase_ = Phase::kWait;
             wait_start_ms_ = events.now_ms();
-            ResolveStepBudgets(bb, current_child_index_);
+            // fall through to the wait this tick
+        }
+
+        if (phase_ == Phase::kResolve) {
+            // In-flight `$key` provider reads for the current step's
+            // budgets: wait for BOTH sides, then enter the wait window.
+            if (resolve_timeout_.co != nullptr && !resolve_timeout_.done) {
+                return NodeStatus::kRunning;
+            }
+            if (resolve_retry_.co != nullptr && !resolve_retry_.done) {
+                return NodeStatus::kRunning;
+            }
+            const size_t i = current_child_index_;
+            if (resolve_timeout_.co != nullptr) {
+                int t = FinishEdgeParam(resolve_timeout_.value, resolve_timeout_.src,
+                                        resolve_timeout_.what);
+                cur_timeout_[i] = t < 0 ? 0 : t;
+                resolve_timeout_ = {};
+            }
+            if (resolve_retry_.co != nullptr) {
+                int r = FinishEdgeParam(resolve_retry_.value, resolve_retry_.src,
+                                        resolve_retry_.what);
+                cur_retry_[i] = r < 0 ? 0 : r;
+                resolve_retry_ = {};
+            }
+            phase_ = Phase::kWait;
+            wait_start_ms_ = events.now_ms();
             // fall through to the wait this tick
         }
 
@@ -311,6 +416,7 @@ void Pipeline::Reset() {
     started_ = false;
     phase_ = Phase::kScan;
     wait_start_ms_ = 0;
+    CancelPendingResolves();
     std::fill(retries_used_.begin(), retries_used_.end(), 0);
     std::fill(cur_timeout_.begin(), cur_timeout_.end(), -1);  // re-roll next run
     std::fill(cur_retry_.begin(), cur_retry_.end(), -1);
@@ -325,6 +431,7 @@ void Pipeline::OnAborted() {
     started_ = false;
     phase_ = Phase::kScan;
     wait_start_ms_ = 0;
+    CancelPendingResolves();
     std::fill(cur_timeout_.begin(), cur_timeout_.end(), -1);
     std::fill(cur_retry_.begin(), cur_retry_.end(), -1);
     std::fill(target_prev_.begin(), target_prev_.end(), NodeStatus::kFailure);
