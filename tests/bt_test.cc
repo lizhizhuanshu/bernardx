@@ -1364,6 +1364,91 @@ TEST_F(ScriptNodeIntegrationTest, InitErrorInSequenceStopsEarly) {
     EXPECT_NE(err->find("nonexistent.lua"), std::string::npos);
 }
 
+// --- Template node: parse-time in-place expansion ---
+
+TEST(TreeParserTemplate, ExpandsInPlaceWithoutWrapperNode) {
+    // The Template is GONE after parsing: the tree holds the expanded node
+    // directly (no SubtreeNode / no wrapper), with params substituted.
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    provider->Put("tpl.json", R"({"type":"Script","source":"scripts/login.lua"})");
+    provider->Put("root.json", R"({"type":"Template","source":"res://tpl.json"})");
+
+    auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
+    ASSERT_NE(nullptr, res.root);
+    EXPECT_TRUE(res.error.empty());
+    // The expanded node itself is the root - not wrapped.
+    EXPECT_EQ(nullptr, dynamic_cast<SubtreeNode*>(res.root.get()));
+    auto* script = dynamic_cast<ScriptNode*>(res.root.get());
+    ASSERT_NE(nullptr, script);
+    EXPECT_EQ(script->script_path(), "scripts/login.lua");
+}
+
+TEST(TreeParserTemplate, SubstitutesParamsLikeSubtree) {
+    // {{key}} params forward into the template JSON (type-preserving whole
+    // value, text interpolation for fragments) + the template's own data
+    // refs resolve - the full Subtree pipeline.
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    provider->Put("tpl.json",
+        R"({"type":"Script","source":".{{which}}",)"
+        R"("data":{"home":"scripts/login.lua","cart":"scripts/cart.lua"}})");
+    provider->Put("root.json",
+        R"({"type":"Template","source":"res://tpl.json","params":{"which":"cart"}})");
+
+    auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
+    ASSERT_NE(nullptr, res.root);
+    auto* script = dynamic_cast<ScriptNode*>(res.root.get());
+    ASSERT_NE(nullptr, script);
+    EXPECT_EQ(script->script_path(), "scripts/cart.lua");
+}
+
+TEST(TreeParserTemplate, ConditionReattachesToExpandedRoot) {
+    // A guard declared on the Template survives expansion: it lands on the
+    // expanded root node.
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    provider->Put("tpl.json", R"({"type":"Script","source":"a.lua"})");
+    provider->Put("root.json",
+        R"({"type":"Template","source":"res://tpl.json",)"
+        R"("condition":{"type":"Blackboard","key":"flag","op":"=="}})");
+
+    auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
+    ASSERT_NE(nullptr, res.root);
+    EXPECT_NE(nullptr, res.root->condition());
+    EXPECT_EQ(res.root->condition()->type(), "Blackboard");
+}
+
+TEST(TreeParserTemplate, DetectsCircularReference) {
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    provider->Put("a.json", R"({"type":"Template","source":"res://b.json"})");
+    provider->Put("b.json", R"({"type":"Template","source":"res://a.json"})");
+    provider->Put("root.json", R"({"type":"Template","source":"res://a.json"})");
+
+    auto res = AWAIT_BT(TreeParser::LoadAndParse("res://root.json", provider));
+    EXPECT_EQ(nullptr, res.root);
+    EXPECT_NE(res.error.find("circular"), std::string::npos);
+}
+
+// E2E: a Template used inline inside a Pipeline expands to a plain step -
+// path_report / execution see the expanded Script, not a wrapper.
+TEST_F(ScriptNodeIntegrationTest, TemplateInsidePipelineRunsExpanded) {
+    resource_provider->Put("click_tpl.json",
+        R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"{{page}}","flaky":0}})");
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Template","source":"res://click_tpl.json","params":{"page":"cart"}},)"
+            R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"done","value":true},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"done","value":true}}})"
+            R"(]})");
+    blackboard->Set("page", LuaValue(std::string("home")));
+
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        return bt.exec({interval = 10, max_step = 30})
+    )");
+    EXPECT_EQ(status, "success");
+    EXPECT_EQ(*blackboard->Get("page"), LuaValue(std::string("cart")));  // expanded step ran
+    EXPECT_EQ(*blackboard->Get("done"), LuaValue(true));
+}
+
 // --- Pipeline edge-param `$key` blackboard references ---
 //
 // `*timeout`/`*retry` accept "$key": read from the blackboard at parse time

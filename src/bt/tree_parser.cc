@@ -714,6 +714,63 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseSubtree(const json& j, Pars
     co_return node;
 }
 
+// Template: parse-time in-place expansion. Like Subtree (loads `source` JSON,
+// forwards `params` via {{}} substitution + its own data refs), but NO runtime
+// node exists: the parsed target node replaces the Template node in the tree.
+// The Template's own `condition` (if any) is re-attached to the expanded root,
+// so the expansion point keeps its guard. Use it when the wrapper would be
+// pure noise (e.g. a parameterized step inline in a Pipeline); use Subtree
+// when the wrapper itself is meaningful (shared, named, condition-transparent).
+async_simple::coro::Lazy<std::unique_ptr<Node>> ParseTemplate(const json& j, ParseContext& ctx) {
+    if (!j.contains("source") || !j["source"].is_string()) {
+        SetError(ctx, "Template node missing 'source' field");
+        co_return nullptr;
+    }
+    std::string source = j["source"].get<std::string>();
+
+    if (ctx.resolving.count(source)) {
+        SetError(ctx, "circular Template reference '" + source + "'");
+        co_return nullptr;
+    }
+    if (!ctx.provider) {
+        SetError(ctx, "template loading unavailable for '" + source + "'");
+        co_return nullptr;
+    }
+
+    auto content = co_await LoadAsset(source, ctx.provider);
+    if (!content) {
+        SetError(ctx, "failed to load template '" + source + "'");
+        co_return nullptr;
+    }
+    json sub_j;
+    try {
+        sub_j = json::parse(*content);
+    } catch (const json::parse_error& e) {
+        SetError(ctx, std::string("failed to parse template '") + source + "': " + e.what());
+        co_return nullptr;
+    }
+
+    if (j.contains("params") && j["params"].is_object() && !j["params"].empty()) {
+        SubstituteTemplates(sub_j, j["params"]);
+    }
+    ApplyDataResolution(sub_j);
+
+    ctx.resolving.insert(source);
+    auto sub_root = co_await ParseNode(sub_j, ctx);
+    ctx.resolving.erase(source);
+
+    if (!sub_root) {
+        if (ctx.error.empty()) SetError(ctx, "failed to parse template '" + source + "'");
+        co_return nullptr;
+    }
+
+    // Re-attach the expansion point's own guard (if declared) onto the
+    // expanded root — the Template itself no longer exists to carry it.
+    if (!co_await ApplyCondition(j, sub_root.get(), ctx)) co_return nullptr;
+    ReadDescription(j, sub_root.get());
+    co_return sub_root;  // in-place: the expanded node IS this tree position
+}
+
 // Wrapper (single-child decorator) nodes take their sole child from the `child`
 // field as a direct object — not a `children` array. Composites still use the
 // `children` array; the singular/plural split keeps each honest.
@@ -910,6 +967,7 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseNode(const json& j, ParseCo
     if (type == "Pipeline") co_return co_await ParsePipeline(j, ctx);
     if (type == "Script") co_return co_await ParseScriptLeaf(j, ctx);
     if (type == "Subtree") co_return co_await ParseSubtree(j, ctx);
+    if (type == "Template") co_return co_await ParseTemplate(j, ctx);
     if (type == "Repeat") co_return co_await ParseRepeat(j, ctx);
     if (type == "Retry") co_return co_await ParseRetry(j, ctx);
     if (type == "Set") co_return co_await ParseSet(j, ctx);
