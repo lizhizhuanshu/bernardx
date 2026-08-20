@@ -856,6 +856,71 @@ TEST(BtEventQueueTest, ConcurrentPushDrain) {
 
 // --- ScriptNode Colon-Method Integration Tests ---
 
+// Exposes `errc.raise()` — a C function that raises an EMPTY error object
+// (lua_pushstring("") + lua_error, no luaL_where prefix), mimicking host C
+// functions like the worker's custom `assert`. Used to regression-test
+// error surfacing: an empty C-raised error must still report the calling
+// Lua script's location, not a bare "=[C]".
+class EmptyErrorLibrary : public LuaLibrary {
+public:
+    std::string name() const override { return "errc"; }
+    void Open(lua_State* L) override {
+        lua_newtable(L);
+        lua_pushcfunction(L, Raise);
+        lua_setfield(L, -2, "raise");
+    }
+
+private:
+    static int Raise(lua_State* L) {
+        lua_pushliteral(L, "");
+        return lua_error(L);
+    }
+};
+
+// --- FormatScriptError ---
+
+TEST(FormatScriptErrorTest, LuaRaisedErrorReturnedVerbatim) {
+    ScriptErrorDetail d;
+    d.message = "scripts/x.lua:12: attempt to index a nil value";
+    d.source = "@scripts/x.lua";
+    d.line = 12;
+    EXPECT_EQ(FormatScriptError(d), d.message);
+}
+
+TEST(FormatScriptErrorTest, CRaisedErrorGetsLocationPrefix) {
+    // C-raised messages carry no "source:line:" prefix — synthesize one from
+    // the nearest Lua frame so the error points at the calling script line.
+    ScriptErrorDetail d;
+    d.message = "ios api not initialized";
+    d.source = "@scripts/a.lua";
+    d.line = 9;
+    d.raised_in_c = true;
+    EXPECT_EQ(FormatScriptError(d), "scripts/a.lua:9: ios api not initialized");
+}
+
+TEST(FormatScriptErrorTest, EmptyCErrorMessageNamesItAndKeepsLocation) {
+    // Regression: used to surface a bare "=[C]".
+    ScriptErrorDetail d;
+    d.message = "";
+    d.source = "@scripts/node_count.lua";
+    d.line = 57;
+    d.raised_in_c = true;
+    EXPECT_EQ(FormatScriptError(d),
+              "scripts/node_count.lua:57: (no error message)");
+}
+
+TEST(FormatScriptErrorTest, EmptyMessageWithoutLocationStillNamed) {
+    ScriptErrorDetail d;
+    d.message = "";
+    EXPECT_EQ(FormatScriptError(d), "(no error message)");
+}
+
+TEST(FormatScriptErrorTest, NoLocationReturnsMessageAlone) {
+    ScriptErrorDetail d;
+    d.message = "cannot resume dead coroutine";
+    EXPECT_EQ(FormatScriptError(d), "cannot resume dead coroutine");
+}
+
 class ScriptNodeIntegrationTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -871,6 +936,7 @@ protected:
             .WithResourceProvider(resource_provider)
             .RegisterLibrary(bb_lib)
             .RegisterLibrary(lib)
+            .RegisterLibrary(std::make_shared<EmptyErrorLibrary>())
             .Create();
     }
 
@@ -1472,6 +1538,49 @@ TEST_F(ScriptNodeIntegrationTest, ScriptRuntimeErrorReturnsError) {
     auto* status = std::get_if<std::string>(&r.values[1]);
     ASSERT_NE(status, nullptr);
     EXPECT_EQ(*status, "failure");
+}
+
+// Regression: a C function raising an EMPTY error object used to surface as
+// "Enter failed: =[C]" — the C-frame chunk marker with the message lost.
+// It must instead point at the Lua line that called the failing C function.
+TEST_F(ScriptNodeIntegrationTest, EmptyCErrorSurfacesLuaLocation) {
+    PutRoot(R"({"type":"Script","source":"scripts/c_error_empty.lua"})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 10})
+        return true, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    auto* err = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(err, nullptr);
+    EXPECT_NE(err->find("c_error_empty.lua:4"), std::string::npos)
+        << "error should carry the calling Lua frame, got: " << *err;
+    EXPECT_NE(err->find("(no error message)"), std::string::npos)
+        << "empty message should be named, got: " << *err;
+    EXPECT_EQ(err->find("=[C]"), std::string::npos)
+        << "must not surface the C chunk marker, got: " << *err;
+}
+
+// Regression: result.error was moved out of the captured detail BEFORE the
+// struct move, so error_detail.message arrived EMPTY and Enter/Tick failure
+// details degraded to a bare "source:line" (or "=[C]" for C-raised errors),
+// dropping the actual message.
+TEST_F(ScriptNodeIntegrationTest, RuntimeErrorDetailKeepsMessage) {
+    PutRoot(R"({"type":"Script","source":"scripts/runtime_error.lua"})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 10})
+        return true, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    auto* err = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(err, nullptr);
+    EXPECT_NE(err->find("something went wrong"), std::string::npos)
+        << "error detail should keep the Lua error message, got: " << *err;
 }
 
 TEST_F(ScriptNodeIntegrationTest, NodeReturnsFailureIsNotError) {

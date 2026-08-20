@@ -34,6 +34,11 @@ struct ScriptErrorDetail {
     int line = -1;           // line number where error occurred
     std::string message;     // original Lua error message
     std::string stack_trace; // "file:line -> file:line -> ..."
+    // True when the error was raised from inside a C function (level-0 frame
+    // is "=[C]"). Such messages carry no "source:line:" prefix (luaL_where is
+    // empty in C frames), so formatters synthesize a location from the
+    // nearest Lua frame (source/line above already point at it).
+    bool raised_in_c = false;
 };
 
 struct ScriptResult {

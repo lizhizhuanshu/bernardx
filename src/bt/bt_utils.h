@@ -87,20 +87,28 @@ inline void PushArgsTable(lua_State* L,
 }
 
 // Format a script error for surfacing to callers (bt.exec's second return
-// value). Lua 5.4 runtime errors already embed "source:line: " in the message,
-// so it is returned verbatim when present; otherwise the debug source/line
-// (stripped of Lua's "@" chunk marker) are synthesized so the result always
-// carries a location. Returns "unknown error" only when nothing is available.
+// value). Lua 5.4 runtime errors raised from Lua code already embed
+// "source:line: " in the message and are returned verbatim. Errors raised
+// inside C functions carry no location (luaL_where is empty in C frames) —
+// those get a "source:line: " prefix synthesized from the nearest Lua frame,
+// so the result always points at the offending script line. An empty message
+// (e.g. a C function raising error("")) surfaces as "(no error message)"
+// instead of a bare chunk marker like "=[C]".
 inline std::string FormatScriptError(const ScriptErrorDetail& d) {
-    if (!d.message.empty()) return d.message;
     std::string src = d.source;
     if (!src.empty() && src.front() == '@') src.erase(0, 1);
-    std::string out = src;
-    if (d.line > 0) {
-        if (!out.empty()) out += ":";
-        out += std::to_string(d.line);
+    std::string location;
+    if (!src.empty() && d.line > 0) {
+        location = src + ":" + std::to_string(d.line);
+    } else if (!src.empty() || d.line > 0) {
+        location = d.line > 0 ? std::to_string(d.line) : src;
     }
-    return out.empty() ? "unknown error" : out;
+
+    std::string msg = d.message.empty() ? "(no error message)" : d.message;
+    if (d.raised_in_c && !location.empty()) {
+        return location + ": " + msg;
+    }
+    return msg;
 }
 
 class ShuffledIndexTracker {

@@ -88,13 +88,31 @@ std::string CollectStackTrace(lua_State* L) {
 ScriptErrorDetail CaptureErrorDetail(lua_State* L) {
     ScriptErrorDetail detail;
     const char* err = lua_tostring(L, -1);
-    detail.message = err ? err : "unknown error";
+    if (err) {
+        detail.message = err;
+    } else {
+        // Non-string error object (nil/table/userdata/...): lua_tostring
+        // cannot convert it — name the type instead of a generic "unknown".
+        detail.message = std::string("error object (") +
+                         lua_typename(L, lua_type(L, -1)) + ")";
+    }
 
+    // Location: walk outward from the error frame and report the nearest
+    // LUA frame. An error raised inside a C function leaves "=[C]" at
+    // level 0 — useless to users; the Lua line that CALLED the failing C
+    // function is the actionable location.
     lua_Debug debug;
-    if (lua_getstack(L, 0, &debug)) {
+    for (int level = 0; lua_getstack(L, level, &debug); ++level) {
         lua_getinfo(L, "Sl", &debug);
-        detail.source = debug.source ? debug.source : "";
-        detail.line = debug.currentline;
+        const char* src = debug.source ? debug.source : "";
+        if (level == 0) {
+            detail.raised_in_c = src[0] == '=';
+        }
+        if (src[0] != '=') {
+            detail.source = src;
+            detail.line = debug.currentline;
+            break;
+        }
     }
 
     detail.stack_trace = CollectStackTrace(L);
@@ -585,8 +603,8 @@ void LuaRuntime::ProcessTask(TaskRequest task) {
                            ReleaseCoroutine(co);
                            ScriptResult result;
                            result.status = load_result;
-                           result.error = std::move(detail.message);
                            result.error_detail = std::move(detail);
+                           result.error = result.error_detail.message;
                            task.promise.setValue(std::move(result));
                            co = nullptr;
                        }
@@ -817,8 +835,8 @@ bool LuaRuntime::CallWithCallback(lua_State* co, int nargs, std::function<void(S
     if (status != LUA_OK) {
         auto detail = CaptureErrorDetail(co);
         spdlog::error("LuaRuntime::CallWithCallback: {}", detail.message);
-        result.error = std::move(detail.message);
         result.error_detail = std::move(detail);
+        result.error = result.error_detail.message;
         lua_pop(co, 1);
     }
     if (status == LUA_OK) {
@@ -868,8 +886,8 @@ void LuaRuntime::MaybeRecycleCo(lua_State* co, int status, int nresults) {
 
         ScriptResult result;
         result.status = status;
-        result.error = std::move(detail.message);
         result.error_detail = std::move(detail);
+        result.error = result.error_detail.message;
 
         auto it = completions_.find(co);
         if (it != completions_.end()) {
@@ -975,8 +993,8 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::AwaitCoroutine(lua_State* co,
     ReleaseCoroutine(co);
     ScriptResult result;
     result.status = status;
-    result.error = std::move(detail.message);
     result.error_detail = std::move(detail);
+    result.error = result.error_detail.message;
     co_return result;
 }
 
@@ -1004,8 +1022,8 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::DoFileAsync(const std::string
         ReleaseCoroutine(co);
         ScriptResult result;
         result.status = load_status;
-        result.error = std::move(detail.message);
         result.error_detail = std::move(detail);
+        result.error = result.error_detail.message;
         co_return result;
     }
 
