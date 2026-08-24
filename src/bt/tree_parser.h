@@ -25,7 +25,9 @@ struct ParseResult {
 //                    path under the res/ root, .json included)
 //   "<abs>"       -> absolute filesystem path (direct read)
 //
-//   root_path — path to a JSON file holding the root node object (required)
+//   root_path — path to a JSON file holding the root node object (required);
+//            a `.bt` path is accepted too and compiled by the DSL compiler
+//            (bt_dsl.h) into the same node JSON before anything else
 //
 //   params — optional object of template values. When non-empty, every {{key}}
 //            placeholder in ANY string field of the root JSON is substituted
@@ -50,7 +52,8 @@ public:
         std::shared_ptr<ResourceProvider> provider,
         nlohmann::json params = nlohmann::json::object(),
         std::shared_ptr<Blackboard> blackboard = nullptr,
-        lua_State* L = nullptr);
+        lua_State* L = nullptr,
+        std::string registry_path = {});  // .bt 根的动词注册表（空 = 内嵌默认）
 
     // Sync entry (unit tests): parse a root node JSON object directly. No file
     // loading — Subtree nodes are unsupported here (no loader) and will error.

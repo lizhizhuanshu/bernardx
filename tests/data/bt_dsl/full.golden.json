@@ -1,0 +1,264 @@
+{
+  "type": "Pipeline",
+  "name": "tree_name",
+  "description": "根描述",
+  "children": [
+    {
+      "type": "Script",
+      "name": "step_a",
+      "source": "actions/open_app.lua",
+      "params": {
+        "package_name": "com.x"
+      },
+      "*target": {
+        "type": "Script",
+        "source": "conds/in_app.lua",
+        "params": {
+          "package_name": "com.x"
+        }
+      },
+      "description": "任务导向:until=目标态(*target)"
+    },
+    {
+      "type": "Sequence",
+      "name": "step_b",
+      "children": [
+        {
+          "type": "Inverter",
+          "name": "step_b_when",
+          "child": {
+            "type": "Script",
+            "name": "step_b_when_n",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/Ad"
+            }
+          }
+        },
+        {
+          "type": "Script",
+          "name": "step_b_body",
+          "source": "actions/click.lua",
+          "params": {
+            "desc": "**/B",
+            "by": "class_chain"
+          }
+        }
+      ],
+      "*target": {
+        "type": "Script",
+        "source": "conds/see.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/B"
+        }
+      }
+    },
+    {
+      "type": "Script",
+      "name": "step_c",
+      "source": "actions/swipe_on_node.lua",
+      "params": {
+        "order": "up",
+        "desc": "**/List",
+        "by": "class_chain"
+      },
+      "*target": {
+        "type": "Script",
+        "source": "conds/node_target_count.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/List",
+          "op": ">=",
+          "value": 3
+        }
+      }
+    },
+    {
+      "type": "Pipeline",
+      "name": "group_c",
+      "children": [
+        {
+          "type": "Script",
+          "name": "inner",
+          "source": "actions/click.lua",
+          "params": {
+            "desc": "**/C",
+            "by": "class_chain"
+          },
+          "*target": {
+            "type": "Script",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/C"
+            }
+          }
+        }
+      ],
+      "*target": {
+        "type": "And",
+        "children": [
+          {
+            "type": "Script",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/A"
+            }
+          },
+          {
+            "type": "Script",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/B"
+            }
+          }
+        ]
+      },
+      "description": "容器步:子行缩进 → Pipeline"
+    },
+    {
+      "type": "Wait",
+      "name": "settle",
+      "params": {
+        "timeout": [
+          200,
+          400
+        ]
+      },
+      "description": "Wait"
+    },
+    {
+      "type": "Set",
+      "name": "mark",
+      "params": {
+        "key": "page",
+        "value": "home"
+      },
+      "description": "Set(黑板写)"
+    },
+    {
+      "type": "Set",
+      "name": "copy",
+      "params": {
+        "key": "dst",
+        "value": "$src"
+      },
+      "description": "Set 黑板拷贝(@键 = 运行期引用)"
+    },
+    {
+      "type": "Subtree",
+      "name": "login",
+      "source": "bt/subtrees/login_flow.json",
+      "params": {
+        "user": "alice"
+      },
+      "description": "Subtree(bt/subtrees/login_flow.json)"
+    },
+    {
+      "type": "Retry",
+      "name": "scroll_find",
+      "params": {
+        "max_count": 5,
+        "interval": [
+          800,
+          1200
+        ]
+      },
+      "*target": {
+        "type": "Script",
+        "source": "conds/see.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/List"
+        }
+      },
+      "child": {
+        "type": "Selector",
+        "name": "scroll_find_sel",
+        "children": [
+          {
+            "type": "Script",
+            "name": "until",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/List"
+            }
+          },
+          {
+            "type": "Sequence",
+            "name": "body",
+            "children": [
+              {
+                "type": "Script",
+                "name": "swipe",
+                "source": "actions/swipe_on_node.lua",
+                "params": {
+                  "order": "up",
+                  "desc": "**/List",
+                  "by": "class_chain"
+                }
+              },
+              {
+                "type": "Script",
+                "name": "until_after",
+                "source": "conds/see.lua",
+                "params": {
+                  "by": "class_chain",
+                  "desc": "**/List"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "Selector",
+      "name": "dispatch",
+      "children": [
+        {
+          "type": "Sequence",
+          "name": "branch_1",
+          "children": [
+            {
+              "type": "Script",
+              "name": "when",
+              "source": "conds/see.lua",
+              "params": {
+                "by": "class_chain",
+                "desc": "**/DialogA"
+              }
+            },
+            {
+              "type": "Script",
+              "name": "close",
+              "source": "actions/click.lua",
+              "params": {
+                "desc": "**/DialogA",
+                "by": "class_chain"
+              }
+            }
+          ]
+        },
+        {
+          "type": "Sequence",
+          "name": "branch_2",
+          "children": [
+            {
+              "type": "Wait",
+              "name": "skip",
+              "params": {
+                "timeout": 100
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

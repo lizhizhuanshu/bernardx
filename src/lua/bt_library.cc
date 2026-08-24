@@ -67,12 +67,13 @@ static async_simple::coro::Lazy<void> InitAsync(
     nlohmann::json root_params,
     std::shared_ptr<ResourceProvider> provider,
     bool trace_paths,
-    uint64_t expected_generation) {
+    uint64_t expected_generation,
+    std::string registry_path) {
     // The engine's blackboard + main Lua state let Pipeline edge params carry
     // "$key" blackboard references (read at parse time).
     auto parse_result = co_await TreeParser::LoadAndParse(
         root_path, provider, std::move(root_params),
-        engine->shared_blackboard(), rt->main_state());
+        engine->shared_blackboard(), rt->main_state(), std::move(registry_path));
     if (engine->generation() != expected_generation) {
         // Stopped mid-load; unblock the awaiter so it doesn't hang.
         rt->PushResume(handle, {std::string("stopped")});
@@ -197,13 +198,17 @@ int bt_init(lua_State* L) {
         return 2;
     }
 
-    // root: path to the root node JSON file ("res://rel" resource or absolute). Required.
+    // root: path to the root node JSON file ("res://rel" resource or absolute).
+    // A `.bt` path is compiled by the DSL compiler (bt_dsl.h) first. Required.
     std::string root_path = ReadStringOpt(L, 1, "root");
     if (root_path.empty()) {
         lua_pushnil(L);
         lua_pushstring(L, "root (string path) required");
         return 2;
     }
+    // registry: optional path replacing the DSL compiler's embedded default
+    // verb registry — only meaningful for `.bt` roots.
+    std::string registry_path = ReadStringOpt(L, 1, "registry");
     bool trace_paths = ReadBoolOpt(L, 1, "trace_paths", true);
 
     // params: optional table of template values forwarded into the root JSON by
@@ -228,7 +233,8 @@ int bt_init(lua_State* L) {
     InitAsync(rt_ctx, handle, engine->shared_from_this(),
                std::move(root_path),
                std::move(root_params),
-               rt_ctx->shared_resource_provider(), trace_paths, gen)
+               rt_ctx->shared_resource_provider(), trace_paths, gen,
+               std::move(registry_path))
         .via(rt_ctx->executor())
         .detach();
     return lua_yield(L, 0);

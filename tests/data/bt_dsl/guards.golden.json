@@ -1,0 +1,227 @@
+{
+  "type": "Pipeline",
+  "name": "guards",
+  "description": "when 包装三形态",
+  "children": [
+    {
+      "type": "Script",
+      "name": "g1",
+      "source": "actions/click.lua",
+      "params": {
+        "desc": "**/A",
+        "by": "class_chain"
+      },
+      "condition": {
+        "type": "Blackboard",
+        "params": {
+          "key": "flag",
+          "op": "exists"
+        }
+      },
+      "*target": {
+        "type": "Script",
+        "source": "conds/see.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/A"
+        }
+      }
+    },
+    {
+      "type": "Sequence",
+      "name": "g2",
+      "children": [
+        {
+          "type": "Selector",
+          "name": "g2_when",
+          "children": [
+            {
+              "type": "Script",
+              "name": "g2_when_0",
+              "source": "conds/see.lua",
+              "params": {
+                "by": "class_chain",
+                "desc": "**/A"
+              }
+            },
+            {
+              "type": "Script",
+              "name": "g2_when_1",
+              "source": "conds/see.lua",
+              "params": {
+                "by": "class_chain",
+                "desc": "**/B"
+              }
+            }
+          ]
+        },
+        {
+          "type": "Wait",
+          "name": "g2_body",
+          "params": {
+            "timeout": 100
+          }
+        }
+      ]
+    },
+    {
+      "type": "Sequence",
+      "name": "g3",
+      "children": [
+        {
+          "type": "Inverter",
+          "name": "g3_when",
+          "child": {
+            "type": "Script",
+            "name": "g3_when_n",
+            "source": "conds/in_app.lua",
+            "params": {
+              "package_name": "com.x"
+            }
+          }
+        },
+        {
+          "type": "Script",
+          "name": "g3_body",
+          "source": "actions/open_app.lua",
+          "params": {
+            "package_name": "com.x"
+          }
+        }
+      ],
+      "*target": {
+        "type": "Script",
+        "source": "conds/in_app.lua",
+        "params": {
+          "package_name": "com.x"
+        }
+      },
+      "*retry": 1
+    },
+    {
+      "type": "Pipeline",
+      "name": "g4",
+      "children": [
+        {
+          "type": "Wait",
+          "name": "inner",
+          "params": {
+            "timeout": 50
+          }
+        }
+      ],
+      "condition": {
+        "type": "Blackboard",
+        "params": {
+          "key": "done",
+          "op": "==",
+          "value": 1
+        }
+      }
+    },
+    {
+      "type": "Sequence",
+      "name": "g5",
+      "children": [
+        {
+          "type": "Sequence",
+          "name": "g5_when",
+          "children": [
+            {
+              "type": "Script",
+              "name": "g5_when_0",
+              "source": "conds/see.lua",
+              "params": {
+                "by": "class_chain",
+                "desc": "**/X"
+              }
+            },
+            {
+              "type": "Script",
+              "name": "g5_when_1",
+              "source": "conds/node_target_count.lua",
+              "params": {
+                "by": "class_chain",
+                "desc": "**/Y",
+                "op": ">=",
+                "value": 2
+              }
+            }
+          ]
+        },
+        {
+          "type": "Pipeline",
+          "name": "g5_body",
+          "children": [
+            {
+              "type": "Script",
+              "name": "i1",
+              "source": "actions/set_text.lua",
+              "params": {
+                "text": "hi",
+                "desc": "**/T",
+                "by": "class_chain"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Pipeline",
+      "name": "g6",
+      "children": [
+        {
+          "type": "Wait",
+          "name": "i2",
+          "params": {
+            "timeout": 10
+          }
+        },
+        {
+          "type": "Script",
+          "name": "i3",
+          "source": "actions/click.lua",
+          "params": {
+            "desc": "**/Z",
+            "by": "class_chain"
+          }
+        }
+      ],
+      "*target": {
+        "type": "And",
+        "children": [
+          {
+            "type": "Script",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/Z"
+            }
+          },
+          {
+            "type": "Not",
+            "child": {
+              "type": "Script",
+              "source": "conds/see.lua",
+              "params": {
+                "by": "class_chain",
+                "desc": "**/W"
+              }
+            }
+          }
+        ]
+      },
+      "params": {
+        "retry": [
+          2,
+          3
+        ],
+        "timeout": [
+          4000,
+          6000
+        ]
+      }
+    }
+  ]
+}

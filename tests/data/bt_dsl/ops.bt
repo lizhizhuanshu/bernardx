@@ -1,0 +1,10 @@
+ops: # 条件算子全家福
+  let k = "value"
+  a1: until attr "**/L" checked == "on" click "**/L"
+  a2: until (see "**/A" and (not see "**/B" or count "**/C" != 2)) wait 100ms
+  a3: until bb counter >= 3.5 set_text "**/T" text="x"
+  a4: until bb token exists ime_input value="hi"
+  a5: ime_delete
+  a6: ime_enter
+  a7: until see "**/S" key == $k click
+  a8: node_count "**/N" key="hits"

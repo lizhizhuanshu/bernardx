@@ -1,0 +1,19 @@
+tree_name: # 根描述
+  let url = "https://www.baidu.com/"
+
+  step_a: until in_app "com.x" open_app "com.x"   # 任务导向:until=目标态(*target)
+  step_b: when not see "**/Ad" until see "**/B" click "**/B"
+  step_c: until count "**/List" >= 3 swipe_on_node "**/List" order="up"
+  group_c: until (see "**/A" and see "**/B"):  # 容器步:子行缩进 → Pipeline
+    inner: until see "**/C" click
+  settle: wait [200,400]ms                     # Wait
+  mark: set page = "home"                      # Set(黑板写)
+  copy: set dst = @src                         # Set 黑板拷贝(@键 = 运行期引用)
+  login: use login_flow(user="alice")          # Subtree(bt/subtrees/login_flow.json)
+  scroll_find: repeat until see "**/List" max 5 interval [800,1200]ms:
+    swipe: swipe_on_node "**/List" order="up"
+  dispatch: choose:
+    when see "**/DialogA":
+      close: click "**/DialogA"
+    otherwise:
+      skip: wait 100ms

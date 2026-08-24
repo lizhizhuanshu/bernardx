@@ -107,6 +107,7 @@ add_library(bernardx_lib STATIC
     src/lua/file_system_resource_provider.cc
     src/bt/behavior_tree_engine.cc
     src/bt/path_tracer.cc
+    src/bt/bt_dsl.cc
     src/bt/tree_parser.cc
     src/bt/single_child_node.cc
     src/bt/lua_script_host.cc
@@ -183,6 +184,8 @@ if(BERNARDX_BUILD_TESTS)
 
     file(GLOB TEST_SOURCES tests/*.cc)
     add_executable(bernardx_test ${TEST_SOURCES})
+    target_compile_definitions(bernardx_test PRIVATE
+        BERNARDX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
     target_link_libraries(bernardx_test PRIVATE bernardx_lib GTest::gtest_main)
     target_include_directories(bernardx_test PRIVATE ${CMAKE_SOURCE_DIR}/src/lua ${CMAKE_SOURCE_DIR}/src/bt)
     target_include_directories(bernardx_test SYSTEM PRIVATE ${CINATRA_DIR}/include)

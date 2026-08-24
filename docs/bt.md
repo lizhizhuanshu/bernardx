@@ -27,8 +27,9 @@ local bt = require('bt')
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `root` | string | **是** | 根节点 JSON 文件路径（见[路径解析](#路径解析)） |
-| `params` | table | 否 | 根模板参数：把根 JSON 里任意字符串字段的 `{{key}}` 占位符按值替换（规则同[子树参数透传](#子树参数透传)：整值占位保留类型、片段占位按文本插值、未知 key 留字面量并告警）。不传则根按原样加载 |
+| `root` | string | **是** | 根节点 JSON 文件路径（见[路径解析](#路径解析)）；`.bt` 后缀则先经 DSL 编译（见 [DSL (.bt)](bt_dsl.md)） |
+| `params` | table | 否 | 根模板参数：把根 JSON 里任意字符串字段的 `{{key}}` 占位符按值替换（规则同[子树参数透传](#子树参数透传)：整值占位保留类型、片段占位按文本插值、未知 key 留字面量并告警）。不传则根按原样加载；`.bt` 根编译**之后**同样适用 |
+| `registry` | string | 否 | `.bt` 根的动词注册表路径（同 `root` 的解析规则），**整体替换**内嵌默认词表（见 [DSL (.bt)](bt_dsl.md)）。JSON 根忽略此字段 |
 | `trace_paths` | bool | 否 | 采集路径数据（默认 `true`） |
 
 `bt.exec`：
@@ -68,6 +69,10 @@ bt.exec({ interval = 50 })
 - `<绝对路径>` → 直接读文件系统。
 
 Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` 加载（与主脚本 `require()` 共用加载器）——请把 `scripts/` 等目录纳入 `CodeProvider` 搜索路径。两套加载器各管一摊：JSON 拓扑走 `ResourceProvider`，脚本走 `CodeProvider`。
+
+## DSL (.bt)
+
+`root`（及 Subtree/Template 的 `source`）还可以直接给 `.bt` 文本 DSL 文件——由内置编译器在加载时译成与 JSON 完全等价的节点树（键序一致，可用 bernard-agent2 的 Python 编译器做差分验收）。语法、词表（registry）模型与子树 `.json → .bt` 自动兜底见 **[bt_dsl.md](bt_dsl.md)**。
 
 ## 节点结构
 

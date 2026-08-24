@@ -1,0 +1,152 @@
+{
+  "type": "Pipeline",
+  "name": "ops",
+  "description": "条件算子全家福",
+  "children": [
+    {
+      "type": "Script",
+      "name": "a1",
+      "source": "actions/click.lua",
+      "params": {
+        "desc": "**/L",
+        "by": "class_chain"
+      },
+      "*target": {
+        "type": "Script",
+        "source": "conds/see.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/L",
+          "key": "checked",
+          "value": "on"
+        }
+      }
+    },
+    {
+      "type": "Wait",
+      "name": "a2",
+      "params": {
+        "timeout": 100
+      },
+      "*target": {
+        "type": "And",
+        "children": [
+          {
+            "type": "Script",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/A"
+            }
+          },
+          {
+            "type": "Or",
+            "children": [
+              {
+                "type": "Not",
+                "child": {
+                  "type": "Script",
+                  "source": "conds/see.lua",
+                  "params": {
+                    "by": "class_chain",
+                    "desc": "**/B"
+                  }
+                }
+              },
+              {
+                "type": "Script",
+                "source": "conds/node_target_count.lua",
+                "params": {
+                  "by": "class_chain",
+                  "desc": "**/C",
+                  "op": "!=",
+                  "value": 2
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "Script",
+      "name": "a3",
+      "source": "actions/set_text.lua",
+      "params": {
+        "text": "x",
+        "desc": "**/T",
+        "by": "class_chain"
+      },
+      "*target": {
+        "type": "Blackboard",
+        "params": {
+          "key": "counter",
+          "op": ">=",
+          "value": 3.5
+        }
+      }
+    },
+    {
+      "type": "Script",
+      "name": "a4",
+      "source": "actions/ime_action.lua",
+      "params": {
+        "action": "input",
+        "value": "hi"
+      },
+      "*target": {
+        "type": "Blackboard",
+        "params": {
+          "key": "token",
+          "op": "exists"
+        }
+      }
+    },
+    {
+      "type": "Script",
+      "name": "a5",
+      "source": "actions/ime_action.lua",
+      "params": {
+        "action": "delete"
+      }
+    },
+    {
+      "type": "Script",
+      "name": "a6",
+      "source": "actions/ime_action.lua",
+      "params": {
+        "action": "input",
+        "value": "\n"
+      }
+    },
+    {
+      "type": "Script",
+      "name": "a7",
+      "source": "actions/click.lua",
+      "params": {
+        "desc": "**/S",
+        "by": "class_chain"
+      },
+      "*target": {
+        "type": "Script",
+        "source": "conds/see.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/S",
+          "key": "key",
+          "value": "value"
+        }
+      }
+    },
+    {
+      "type": "Script",
+      "name": "a8",
+      "source": "actions/node_count.lua",
+      "params": {
+        "key": "hits",
+        "desc": "**/N",
+        "by": "class_chain"
+      }
+    }
+  ]
+}

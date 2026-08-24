@@ -1,0 +1,101 @@
+{
+  "type": "Pipeline",
+  "name": "mods_tree",
+  "description": "修饰符/常量/参数形态",
+  "children": [
+    {
+      "type": "Script",
+      "name": "a1",
+      "source": "actions/open_app.lua",
+      "params": {
+        "package_name": "com.demo"
+      },
+      "*target": {
+        "type": "Script",
+        "source": "conds/in_app.lua",
+        "params": {
+          "package_name": "com.demo"
+        }
+      },
+      "*retry": 2,
+      "*timeout": [
+        8000,
+        12000
+      ],
+      "description": "打开应用"
+    },
+    {
+      "type": "Script",
+      "name": "a2",
+      "source": "actions/tap_xy.lua",
+      "params": {
+        "x": 100,
+        "y": 200.5
+      },
+      "*target": {
+        "type": "Script",
+        "source": "conds/see.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/Hero"
+        }
+      },
+      "*timeout": 3000
+    },
+    {
+      "type": "Script",
+      "name": "a3",
+      "source": "actions/press_key.lua",
+      "params": {
+        "key": "enter"
+      },
+      "description": "回车"
+    },
+    {
+      "type": "Script",
+      "name": "a4",
+      "source": "actions/set_text.lua",
+      "params": {
+        "text": "$user",
+        "clear": true,
+        "desc": "**/Hero",
+        "by": "class_chain"
+      }
+    },
+    {
+      "type": "Script",
+      "name": "a5",
+      "source": "actions/escalate.lua",
+      "params": {
+        "note": "give up"
+      },
+      "condition": {
+        "type": "Blackboard",
+        "params": {
+          "key": "ready",
+          "op": "==",
+          "value": true
+        }
+      }
+    },
+    {
+      "type": "Script",
+      "name": "a6",
+      "source": "actions/set_text.lua",
+      "params": {
+        "text": "say \"hi\"\\n",
+        "desc": "**/Box",
+        "by": "class_chain"
+      }
+    },
+    {
+      "type": "Script",
+      "name": "a7",
+      "source": "actions/click.lua",
+      "params": {
+        "desc": "$target",
+        "by": "class_chain"
+      }
+    }
+  ]
+}

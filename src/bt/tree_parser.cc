@@ -22,6 +22,7 @@ extern "C" {
 
 #include "resource_provider.h"
 
+#include "bt_dsl.h"
 #include "composite.h"
 #include "condition_composite.h"
 #include "constant_node.h"
@@ -288,6 +289,58 @@ LoadAsset(const std::string& path, std::shared_ptr<ResourceProvider> provider) {
     std::ifstream ifs(path, std::ios::in | std::ios::binary);
     if (!ifs.is_open()) co_return std::nullopt;
     co_return std::string(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
+}
+
+// Load a tree file and parse it to JSON. A `.bt` path (by extension) is
+// compiled by the DSL compiler first — `registry_text` (empty = the embedded
+// default registry) is only consulted for DSL paths. `what` labels errors
+// ("root"/"subtree"/"template"). When `allow_bt_fallback` and a `.json` path
+// fails to load, the sibling `.bt` (same stem) is tried — so `use x` (which
+// always emits `x.json` for Python parity) transparently picks up a `.bt`
+// subtree; the fallback compiles with the EMBEDDED registry (a custom registry
+// option applies to the root only).
+async_simple::coro::Lazy<std::optional<json>>
+LoadTreeJson(const std::string& path, std::shared_ptr<ResourceProvider> provider,
+             const std::string& registry_text, const char* what,
+             bool allow_bt_fallback, std::string& error) {
+    std::string used_path = path;
+    auto content = co_await LoadAsset(path, provider);
+    if (!content && allow_bt_fallback &&
+        path.size() > 5 && path.compare(path.size() - 5, 5, ".json") == 0) {
+        std::string alt = path.substr(0, path.size() - 5) + ".bt";
+        auto alt_content = co_await LoadAsset(alt, provider);
+        if (alt_content) {
+            content = std::move(alt_content);
+            used_path = alt;
+        }
+    }
+    if (!content) {
+        error = std::string("failed to load ") + what + " '" + path + "'";
+        co_return std::nullopt;
+    }
+    if (bt_dsl::IsBtPath(used_path)) {
+        bt_dsl::DslResult dsl = registry_text.empty()
+            ? bt_dsl::CompileText(*content)
+            : bt_dsl::CompileText(*content, &registry_text);
+        if (!dsl.error.empty()) {
+            error = std::string("failed to compile ") + what + " bt dsl '" + used_path +
+                    "': " + dsl.error;
+            co_return std::nullopt;
+        }
+        try {
+            co_return json::parse(dsl.tree.dump());
+        } catch (const json::parse_error& e) {
+            error = std::string("failed to parse ") + what + " bt dsl output '" +
+                    used_path + "': " + e.what();
+            co_return std::nullopt;
+        }
+    }
+    try {
+        co_return json::parse(*content);
+    } catch (const json::parse_error& e) {
+        error = std::string("failed to parse ") + what + " '" + used_path + "': " + e.what();
+        co_return std::nullopt;
+    }
 }
 
 void ReadDescription(const json& j, Node* node) {
@@ -685,17 +738,16 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseSubtree(const json& j, Pars
         co_return nullptr;
     }
 
-    auto content = co_await LoadAsset(source, ctx.provider);
-    if (!content) {
-        SetError(ctx, "failed to load subtree '" + source + "'");
-        co_return nullptr;
-    }
     json sub_j;
-    try {
-        sub_j = json::parse(*content);
-    } catch (const json::parse_error& e) {
-        SetError(ctx, std::string("failed to parse subtree '") + source + "': " + e.what());
-        co_return nullptr;
+    {
+        std::string err;
+        auto sub = co_await LoadTreeJson(source, ctx.provider, /*registry_text=*/{},
+                                         "subtree", /*allow_bt_fallback=*/true, err);
+        if (!sub) {
+            SetError(ctx, err);
+            co_return nullptr;
+        }
+        sub_j = std::move(*sub);
     }
 
     // Forward this Subtree node's `params` into the subtree JSON by
@@ -777,17 +829,16 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseTemplate(const json& j, Par
         co_return nullptr;
     }
 
-    auto content = co_await LoadAsset(source, ctx.provider);
-    if (!content) {
-        SetError(ctx, "failed to load template '" + source + "'");
-        co_return nullptr;
-    }
     json sub_j;
-    try {
-        sub_j = json::parse(*content);
-    } catch (const json::parse_error& e) {
-        SetError(ctx, std::string("failed to parse template '") + source + "': " + e.what());
-        co_return nullptr;
+    {
+        std::string err;
+        auto sub = co_await LoadTreeJson(source, ctx.provider, /*registry_text=*/{},
+                                         "template", /*allow_bt_fallback=*/true, err);
+        if (!sub) {
+            SetError(ctx, err);
+            co_return nullptr;
+        }
+        sub_j = std::move(*sub);
     }
 
     if (j.contains("params") && j["params"].is_object() && !j["params"].empty()) {
@@ -1048,22 +1099,36 @@ TreeParser::LoadAndParse(const std::string& root_path,
                          std::shared_ptr<ResourceProvider> provider,
                          nlohmann::json params,
                          std::shared_ptr<Blackboard> blackboard,
-                         lua_State* L) {
+                         lua_State* L,
+                         std::string registry_path) {
     ParseResult result;
 
-    auto root_content = co_await LoadAsset(root_path, provider);
-    if (!root_content) {
-        result.error = "failed to load root '" + root_path + "'";
-        spdlog::error("TreeParser: {}", result.error);
-        co_return result;
+    // A `.bt` root is compiled by the DSL compiler before anything else; its
+    // output lands exactly where `json::parse` used to produce `root_j`, so
+    // {{key}} templating / data refs / ParseNode below apply unchanged (a .bt
+    // string may still carry {{key}} placeholders). An optional `registry`
+    // path replaces the embedded default verb table — DSL roots only.
+    std::string registry_text;  // 空 = 内嵌默认 registry
+    if (bt_dsl::IsBtPath(root_path) && !registry_path.empty()) {
+        auto rt = co_await LoadAsset(registry_path, provider);
+        if (!rt) {
+            result.error = "failed to load registry '" + registry_path + "'";
+            spdlog::error("TreeParser: {}", result.error);
+            co_return result;
+        }
+        registry_text = std::move(*rt);
     }
     json root_j;
-    try {
-        root_j = json::parse(*root_content);
-    } catch (const json::parse_error& e) {
-        result.error = std::string("failed to parse root '") + root_path + "': " + e.what();
-        spdlog::error("TreeParser: {}", result.error);
-        co_return result;
+    {
+        std::string err;
+        auto root = co_await LoadTreeJson(root_path, provider, registry_text, "root",
+                                          /*allow_bt_fallback=*/false, err);
+        if (!root) {
+            result.error = err;
+            spdlog::error("TreeParser: {}", result.error);
+            co_return result;
+        }
+        root_j = std::move(*root);
     }
     if (!root_j.is_object()) {
         result.error = "root '" + root_path + "' must be a JSON object";

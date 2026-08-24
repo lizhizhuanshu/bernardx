@@ -1,0 +1,15 @@
+{
+  "type": "Pipeline",
+  "name": "t1",
+  "description": "最小树",
+  "children": [
+    {
+      "type": "Script",
+      "name": "a1",
+      "source": "actions/open_app.lua",
+      "params": {
+        "package_name": "com.x"
+      }
+    }
+  ]
+}

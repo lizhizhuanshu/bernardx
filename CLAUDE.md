@@ -17,7 +17,8 @@ docs/             # 文档
 - [使用说明](docs/usage.md) — 构建、安装、运行、项目结构、Lua API 概览、依赖列表
 - [Lua API 参考](docs/lua_api.md) — 全局函数、http 模块、bt 模块、require/loadfile
 - [Lua Library 开发规范](docs/lua_library_guide.md) — 基类接口、Open/Close 模式、异步 yield/resume、metatable/userdata、命名约定
-- [行为树](docs/bt.md) — bt.init/bt.exec 生命周期（root 为 JSON 文件路径，`res://`资源或绝对路径；Subtree 按 path 加载）、节点类型、装饰器、完整示例
+- [行为树](docs/bt.md) — bt.init/bt.exec 生命周期（root 为 JSON **或 .bt DSL** 文件路径，`res://`资源或绝对路径；Subtree 按 path 加载）、节点类型、装饰器、完整示例
+- [BT DSL (.bt)](docs/bt_dsl.md) — 文本 DSL 语法、registry 词表模型、golden 差分测试与再生
 - [运行时核心架构](docs/architecture.md) — 组件关系、require 模块解析、异步加载时序（mermaid）
 
 ## 构建
@@ -30,5 +31,15 @@ cmake --build build
 ## 运行测试
 
 ```bash
-cd build && ./lua_runtime_test
+cmake -B build_test -DBERNARDX_BUILD_EXECUTABLE=ON -DBERNARDX_BUILD_TESTS=ON
+cmake --build build_test -j
+./build_test/bernardx_test
+```
+
+（测试块在 `BERNARDX_BUILD_EXECUTABLE` 与 `BERNARDX_BUILD_TESTS` 双开关之后，两个都要给。）
+
+`.bt` DSL 的 golden 基线改动时（先改 agent2 侧 dsl.py）：
+
+```bash
+python3 tools/gen_bt_dsl_goldens.py --agent2 /path/to/bernard-agent2
 ```
