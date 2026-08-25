@@ -1,0 +1,8 @@
+task_x[step_retry=@common_action_retry, step_timeout=@common_action_timeout]: # 步级预设(黑板引用)
+  g: until see "**/A":
+    a1: click desc="**/A"
+  a2[timeout=@common_network_timeout]: until see "**/B" click desc="**/B"
+  h[retry=1, step_timeout=[8000,12000]ms]: until see "**/C":
+    inner: until see "**/D":
+      a3: click desc="**/D"
+  a4[retry=2, timeout=5000ms]: until see "**/E" click desc="**/E"

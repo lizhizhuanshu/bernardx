@@ -14,7 +14,7 @@ bt.exec({ interval = 50 })
 缩进定层级（任意一致宽度，同级必须一致；tab 拒绝）。行结构：
 
 ```
-tree_name: # 根描述
+tree_name[step_retry=@common_action_retry, step_timeout=@common_action_timeout]: # 根描述
 let url = "https://www.baidu.com/"          # 常量（仅根级；引用写 $url）
 
 step_a: until in_app "com.x" open_app "com.x"   # 任务导向：until=目标态(*target)
@@ -39,7 +39,14 @@ dispatch: choose:
 
 - **when** = guard（不成立则该步失败）：纯 bb 条件 → 引擎原生 `condition`；其余 → 可等待条件前缀 Sequence。
 - **until** = 目标态（`*target`；缺省 = 动作完成即目标）。容器行另有 `until` 时挂 Pipeline 级 `*target`。
-- **mods** = `[retry=N|[lo,hi], timeout=N|[lo,hi]ms]`（顺序可交换）：动作/装饰行 → 步级 `*retry`/`*timeout`；容器行 → Pipeline 级缺省 `params.retry/timeout`。
+- **mods** = `[retry=N|[lo,hi]|@key, timeout=N|[lo,hi]ms|@key]`（顺序可交换）：动作/装饰行 → 步级
+  `*retry`/`*timeout`；容器行 → Pipeline 级缺省 `params.retry/timeout`。另有 `step_retry`/`step_timeout`
+  （仅根行/容器行）= **继承域缺省**：编译期级联进子树里每个未自带 `retry`/`timeout` 的 Pipeline 的
+  `params`（本级自带优先；同级 `retry`/`step_retry` 互斥）。
+- **mods 的 `@key`** = 运行期黑板引用（编译为引擎 `"$key"` 惰性解析：值可为 int 或 `{lo,hi}` 表，
+  每轮重摇）——步级自愈数值由用户黑板控制（约定预设键 `common_action_retry`/`common_action_timeout`
+  = 常规 UI 步、`common_network_retry`/`common_network_timeout` = launch_app/页面切换），树里只留引用：
+  `task_x[step_retry=@common_action_retry, step_timeout=@common_action_timeout]: # 目标`。
 - 行尾 `# 注释` → 节点 `description`。
 
 ### 条件表达式（cexpr）

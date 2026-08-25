@@ -309,6 +309,7 @@ struct Program {
     std::string name;
     std::string description;
     std::map<std::string, ojson> lets;  // 重复定义后者覆盖（Python dict 赋值）
+    ModList mods;                       // 根行修饰符（根 Pipeline 缺省/step_* 级联域）
     std::vector<AstNode> nodes;
 };
 
@@ -433,20 +434,40 @@ ScalarOrRange ParseDuration(Cur& c, int line_no, const std::string& what) {
     return v;
 }
 
-// `[retry=.., timeout=..]`（顺序可交换；timeout 单位 ms——Python 在两个值后都跳 ms）
+// `[retry=.., timeout=..]` / `[step_retry=.., step_timeout=..]`（顺序可交换；timeout
+// 单位 ms——Python 在两个值后都跳 ms）。值 = `@key` 黑板引用（→ 引擎 "$key" 惰性
+// 引用，运行期黑板给 int 或 {lo,hi} 表）| NUM | [lo,hi]。step_* = 继承域缺省（仅
+// 根行/容器行——编译期级联进子树各 Pipeline 的 params）；同级 retry/step_retry
+// （或 timeout/step_timeout）互斥（dsl.py _parse_modifiers）。
 ModList ParseModifiers(Cur& c, int line_no) {
     ModList mods;
     if (!c.IsSym(c.pos, "[")) return mods;
     ++c.pos;
     while (true) {
         const std::string* key = c.AtNameText(c.pos);
-        if (!key || (*key != "retry" && *key != "timeout"))
-            Fail(line_no, "修饰符应为 retry/timeout");
+        if (!key || (*key != "retry" && *key != "timeout" &&
+                     *key != "step_retry" && *key != "step_timeout"))
+            Fail(line_no, "修饰符应为 retry/timeout/step_retry/step_timeout");
         std::string k = *key;
+        const bool is_step = k.rfind("step_", 0) == 0;
+        const std::string base = is_step ? k.substr(5) : k;
+        const std::string other = is_step ? base : "step_" + base;
+        if (FindMod(mods, base) || FindMod(mods, other))
+            Fail(line_no, base + " 与 " + other + " 不能同时给出");
         ++c.pos;
         if (!c.IsSym(c.pos, "=")) Fail(line_no, "修饰符 " + k + " 缺少 =");
         ++c.pos;
-        ScalarOrRange v = ParseScalarOrRange(c, line_no, k, 0);
+        ScalarOrRange v;
+        const std::string* nm = c.AtNameText(c.pos);
+        if (nm && nm->size() > 1 && (*nm)[0] == '@') {
+            const std::string bb = nm->substr(1);
+            if (!IsBbName(bb))
+                Fail(line_no, "修饰符 " + k + " 黑板引用 " + *nm + " 后应为标识符");
+            v = ojson("$" + bb);
+            ++c.pos;
+        } else {
+            v = ParseScalarOrRange(c, line_no, k, 0);
+        }
         SkipMs(c);
         SetMod(mods, std::move(k), std::move(v));
         if (c.IsSym(c.pos, ",")) {
@@ -468,43 +489,73 @@ struct Block {
     int indent = 0;
     std::string text;
     std::string comment;
+    std::string root_mods;  // 根行 `[...]` 原文（BuildBlocks 提取，ParseProgram 解析）
     std::vector<Block> children;
 };
 
-// 根行 `^(\S+)\s*:\s*(?:#\s*(.*))?$` 的等价实现：分隔冒号取首词内**最后一个**
-// 冒号（正则贪心回溯的唯一可行解）；首词无冒号时允许 `name :` 形态。
-bool MatchRootLine(const std::string& text, std::string& name, std::string& desc) {
-    size_t wend = 0;
-    while (wend < text.size() && !IsSpace(text[wend])) ++wend;
-    std::string word = text.substr(0, wend);
-    size_t sep = std::string::npos;
-    size_t tail_begin;
-    if (!word.empty()) {
-        size_t colon = word.rfind(':');
-        if (colon != std::string::npos) {
-            sep = colon;
-            name = word.substr(0, colon);
-            tail_begin = colon + 1;
+// 根行 `^(\S+?)(\[mods\])?\s*:\s*(?:#\s*(.*))?$` 的等价实现（dsl.py _ROOT_RE）：
+// - 名字 = 非空白且非 `[` 的连续段（可含 `:`——head 内最后一个冒号分隔，正则
+//   贪心回溯的唯一可行解）；
+// - 名字后可紧跟 `[mods]` 组（内部允许空白与一层嵌套方括号——`[lo,hi]` 值），
+//   组与 `:` 之间允许空白；名字与 `[` 之间不允许空白；
+// - `:` 后为空白 + 可选 `# 描述` 到行尾（多余内容 → 拒）。
+bool MatchRootLine(const std::string& text, std::string& name, std::string& mods,
+                   std::string& desc) {
+    mods.clear();
+    desc.clear();
+    // ① head：非空白且非 '[' 的连续段
+    size_t p = 0;
+    while (p < text.size() && !IsSpace(text[p]) && text[p] != '[') ++p;
+    const std::string head = text.substr(0, p);
+    if (head.empty()) return false;
+
+    size_t tail_begin = std::string::npos;
+    if (p < text.size() && text[p] == '[') {
+        // ② 紧跟的 [mods] 组：配平扫描（可跨空白；一层嵌套括号）
+        int depth = 0;
+        size_t k = p;
+        bool closed = false;
+        for (; k < text.size(); ++k) {
+            if (text[k] == '[') ++depth;
+            else if (text[k] == ']') {
+                if (--depth == 0) {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        if (!closed) return false;
+        mods = text.substr(p, k - p + 1);
+        name = head;
+        size_t q = k + 1;
+        while (q < text.size() && IsSpace(text[q])) ++q;
+        if (q >= text.size() || text[q] != ':') return false;
+        tail_begin = q + 1;
+    } else {
+        // 无紧跟 mods 组：head 内最后一个 ':' 分隔（名字可含 ':'）
+        size_t colon = head.rfind(':');
+        if (colon == std::string::npos) {
+            // name : 形态：空白后直接 ':'
+            size_t q = p;
+            while (q < text.size() && IsSpace(text[q])) ++q;
+            if (q >= text.size() || text[q] != ':') return false;
+            name = head;
+            tail_begin = q + 1;
+        } else {
+            name = head.substr(0, colon);
+            if (name.empty()) return false;
+            tail_begin = p;  // 冒号在 head 末尾，其后即 tail
         }
     }
-    if (sep == std::string::npos) {
-        size_t p = wend;
-        while (p < text.size() && IsSpace(text[p])) ++p;
-        if (p >= text.size() || text[p] != ':') return false;
-        name = word;
-        tail_begin = p + 1;
-    }
-    if (name.empty()) return false;
-    size_t p = tail_begin;
-    while (p < text.size() && IsSpace(text[p])) ++p;
-    if (p >= text.size()) {
-        desc.clear();
-        return true;
-    }
-    if (text[p] != '#') return false;
-    ++p;
-    while (p < text.size() && IsSpace(text[p])) ++p;
-    desc = text.substr(p);
+
+    // ③ tail：空白 + 可选 `# 描述` 到行尾
+    size_t t = tail_begin;
+    while (t < text.size() && IsSpace(text[t])) ++t;
+    if (t >= text.size()) return true;
+    if (text[t] != '#') return false;
+    ++t;
+    while (t < text.size() && IsSpace(text[t])) ++t;
+    desc = text.substr(t);
     return true;
 }
 
@@ -542,9 +593,9 @@ Block BuildBlocks(const std::string& source) {
     if (entries.empty()) Fail(1, "空输入: 缺少根行 `name: #描述`");
 
     const Entry& first = entries[0];
-    Block root{first.line_no, 0, "", "", {}};
-    if (!MatchRootLine(first.text, root.text, root.comment))
-        Fail(first.line_no, "根行格式应为 `name: #描述`(不能带条件/修饰符)");
+    Block root{first.line_no, 0, "", "", "", {}};
+    if (!MatchRootLine(first.text, root.text, root.root_mods, root.comment))
+        Fail(first.line_no, "根行格式应为 `name[修饰符]: #描述`(不能带条件)");
     if (first.indent != 0) Fail(first.line_no, "根行必须在行首(无缩进)");
 
     std::vector<Block*> stack{&root};
@@ -918,6 +969,10 @@ void ValidateNode(const AstNode& node) {
         Fail(node.line_no, "repeat 需要循环体子行");
     if (node.kind == "choose" && node.branches.empty())
         Fail(node.line_no, "choose 需要分支子行");
+    if (node.kind != "container" &&
+        (FindMod(node.mods, "step_retry") || FindMod(node.mods, "step_timeout")))
+        Fail(node.line_no,
+             "step_retry/step_timeout 仅用于根行/容器行(叶子行用 retry/timeout)");
 }
 
 ojson TokenToLetValue(const Token& tk) {
@@ -935,6 +990,13 @@ Program ParseProgram(const std::string& source) {
     Program prog;
     prog.name = root.text;
     prog.description = root.comment;
+    if (!root.root_mods.empty()) {
+        LexResult lex = Tokenize(root.root_mods, root.line_no);
+        Cur c{&lex.tokens, 0};
+        prog.mods = ParseModifiers(c, root.line_no);
+        if (c.pos != lex.tokens.size())
+            Fail(root.line_no, "根行修饰符后有多余内容");
+    }
 
     for (const Block& blk : root.children) {
         LexResult lex = Tokenize(blk.text, blk.line_no);
@@ -1065,19 +1127,50 @@ public:
     Compiler(Program prog, Registry reg) : prog_(std::move(prog)), reg_(std::move(reg)) {}
 
     ojson Tree() {
+        Scope scope = StepScope(prog_.mods, Scope{});
         ojson t;
         t["type"] = "Pipeline";
         t["name"] = prog_.name;
         t["description"] = prog_.description;
         ojson kids = ojson::array();
-        for (const auto& n : prog_.nodes) kids.push_back(CompileNode(n));
+        for (const auto& n : prog_.nodes) kids.push_back(CompileNode(n, scope));
         t["children"] = std::move(kids);
+        PipelineParams(prog_.mods, scope, t);
         return t;
     }
 
 private:
     Program prog_;
     Registry reg_;
+
+    // step_* 继承域（dsl.py _step_scope）：{"retry": v, "timeout": v}，本级
+    // step_* 覆盖继承值（缺省继续下传）。
+    using Scope = std::map<std::string, ojson>;
+    static Scope StepScope(const ModList& mods, const Scope& inherited) {
+        Scope out = inherited;
+        if (const auto* v = FindMod(mods, "step_retry")) out["retry"] = *v;
+        if (const auto* v = FindMod(mods, "step_timeout")) out["timeout"] = *v;
+        return out;
+    }
+    // Pipeline 缺省参数（dsl.py _pipeline_params）：本级 retry/timeout 优先，
+    // 否则继承域的 step_* 值；两者皆无 → 不发 params。
+    static void PipelineParams(const ModList& mods, const Scope& scope, ojson& inner) {
+        ojson p = ojson::object();
+        bool any = false;
+        for (const char* key : {"retry", "timeout"}) {
+            if (const auto* own = FindMod(mods, key)) {
+                p[key] = *own;
+                any = true;
+            } else {
+                auto it = scope.find(key);
+                if (it != scope.end()) {
+                    p[key] = it->second;
+                    any = true;
+                }
+            }
+        }
+        if (any) inner["params"] = std::move(p);
+    }
 
     // 常量/引用解析：lit 原样 | bb → "$name"（引擎注入契约） | ref → let 查表（未定义硬 gate）
     ojson Lit(const Value& v, int line_no, const std::string& what = "值") {
@@ -1281,10 +1374,11 @@ private:
         return out;
     }
 
-    ojson CompileNode(const AstNode& node) {
+    ojson CompileNode(const AstNode& node, const Scope& scope) {
         const int ln = node.line_no;
 
         if (node.kind == "container") {
+            Scope inner_scope = StepScope(node.mods, scope);
             ojson inner;
             inner["type"] = "Pipeline";
             inner["name"] = node.name;
@@ -1292,14 +1386,9 @@ private:
             if (node.when && IsPureBb(*node.when))
                 inner["condition"] = CondJson(*node.when, ln);
             if (node.until) inner["*target"] = CondJson(*node.until, ln);
-            if (!node.mods.empty()) {
-                ojson p = ojson::object();
-                for (const char* k : {"retry", "timeout"})
-                    if (const ScalarOrRange* v = FindMod(node.mods, k)) p[k] = *v;
-                inner["params"] = std::move(p);
-            }
+            PipelineParams(node.mods, inner_scope, inner);
             ojson kids = ojson::array();
-            for (const auto& ch : node.children) kids.push_back(CompileNode(ch));
+            for (const auto& ch : node.children) kids.push_back(CompileNode(ch, inner_scope));
             inner["children"] = std::move(kids);
             return WrapWhen(node, std::move(inner), /*with_description=*/true, /*pipeline=*/true);
         }
@@ -1375,7 +1464,7 @@ private:
         if (node.kind == "repeat") {
             const CExpr& until = *node.rep_until;
             ojson body = ojson::array();
-            for (const auto& ch : node.children) body.push_back(CompileNode(ch));
+            for (const auto& ch : node.children) body.push_back(CompileNode(ch, scope));
             body.push_back(WaitableNode(until, ln, "until_after"));
 
             ojson sel_kids = ojson::array();
@@ -1418,7 +1507,7 @@ private:
                     seq["children"].push_back(WaitableNode(*br.when, br.line_no, "when"));
                 }
                 for (const auto& ch : br.children)
-                    seq["children"].push_back(CompileNode(ch));
+                    seq["children"].push_back(CompileNode(ch, scope));
                 branches.push_back(std::move(seq));
             }
             ojson out;

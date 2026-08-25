@@ -1,0 +1,126 @@
+{
+  "type": "Pipeline",
+  "name": "task_x",
+  "description": "步级预设(黑板引用)",
+  "children": [
+    {
+      "type": "Pipeline",
+      "name": "g",
+      "children": [
+        {
+          "type": "Script",
+          "name": "a1",
+          "source": "actions/click.lua",
+          "params": {
+            "desc": "**/A",
+            "by": "class_chain"
+          }
+        }
+      ],
+      "*target": {
+        "type": "Script",
+        "source": "conds/see.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/A"
+        }
+      },
+      "params": {
+        "retry": "$common_action_retry",
+        "timeout": "$common_action_timeout"
+      }
+    },
+    {
+      "type": "Script",
+      "name": "a2",
+      "source": "actions/click.lua",
+      "params": {
+        "desc": "**/B",
+        "by": "class_chain"
+      },
+      "*target": {
+        "type": "Script",
+        "source": "conds/see.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/B"
+        }
+      },
+      "*timeout": "$common_network_timeout"
+    },
+    {
+      "type": "Pipeline",
+      "name": "h",
+      "children": [
+        {
+          "type": "Pipeline",
+          "name": "inner",
+          "children": [
+            {
+              "type": "Script",
+              "name": "a3",
+              "source": "actions/click.lua",
+              "params": {
+                "desc": "**/D",
+                "by": "class_chain"
+              }
+            }
+          ],
+          "*target": {
+            "type": "Script",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/D"
+            }
+          },
+          "params": {
+            "retry": "$common_action_retry",
+            "timeout": [
+              8000,
+              12000
+            ]
+          }
+        }
+      ],
+      "*target": {
+        "type": "Script",
+        "source": "conds/see.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/C"
+        }
+      },
+      "params": {
+        "retry": 1,
+        "timeout": [
+          8000,
+          12000
+        ]
+      }
+    },
+    {
+      "type": "Script",
+      "name": "a4",
+      "source": "actions/click.lua",
+      "params": {
+        "desc": "**/E",
+        "by": "class_chain"
+      },
+      "*target": {
+        "type": "Script",
+        "source": "conds/see.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/E"
+        }
+      },
+      "*retry": 2,
+      "*timeout": 5000
+    }
+  ],
+  "params": {
+    "retry": "$common_action_retry",
+    "timeout": "$common_action_timeout"
+  }
+}
