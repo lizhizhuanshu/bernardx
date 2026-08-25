@@ -676,14 +676,15 @@ CExpr ParseCnot(Cur& c, int line_no, const std::vector<std::string>& end_names) 
     return ParseCatom(c, line_no, end_names);
 }
 
-// see 可选谓词 k == "v"（值须字符串字面量；$ref 免检）。属性名/值存在**字面**
-// 键 `key`/`value` 下（结构化下发，不做谓词拼接）——照抄 dsl.py。
+// see 可选谓词 k == "v"（值须字符串字面量；$ref / @黑板 免检）。属性名/值存在**字面**
+// 键 `key`/`value` 下（结构化下发，不做谓词拼接）——照抄 dsl.py。`allow_bb=true` 让
+// `see "X" k == @v` / `attr "X" k == @v` 可引用黑板，与 `set k = @v` / 动作参数 `text=@v` 对齐。
 void ParseSeePredicate(Cur& c, int line_no, ParamList& params) {
     if (!c.AtIsName(c.pos) || !c.IsSym(c.pos + 1, "==")) return;
     const std::string key = *c.AtNameText(c.pos);
     if (IsKeyword(key)) Fail(line_no, "属性名 " + key + " 是关键字");
     c.pos += 2;
-    Value v = ParseRefOrValue(c, line_no, "属性值");
+    Value v = ParseRefOrValue(c, line_no, "属性值", /*allow_bb=*/true);
     if (v.tag == "lit" && !v.lit.is_string()) Fail(line_no, "属性值应为字符串");
     SetParam(params, "key", Value::Lit(key));
     SetParam(params, "value", std::move(v));

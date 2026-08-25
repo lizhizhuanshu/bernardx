@@ -223,6 +223,42 @@ TEST(BtDslCompile, BbRefCompilesToInjectionContract) {
     EXPECT_EQ(res.tree["children"][1]["params"]["value"], "$src");
 }
 
+TEST(BtDslCompile, SeeAttrPredicateAcceptsBbRef) {
+    // see/attr 谓词值位置此前只收字符串字面量 / $ref，allow_bb=true 后 @bb_key 也通过。
+    // 编译产物仍是结构化下发：`value` 走 "$key" 注入约定，see 脚本按字段拿，不做字符串拼接。
+    bt_dsl::DslResult res = bt_dsl::CompileText(
+        "t:\n"
+        "  a: until attr \"**/X\" value == @proxy_url click \"**/X\"\n"
+        "  b: until see \"**/Y\" name == @tag click \"**/Y\"\n");
+    ASSERT_TRUE(res.error.empty()) << res.error;
+    auto a_target = res.tree["children"][0]["*target"];
+    EXPECT_EQ(a_target["type"], "Script");
+    EXPECT_EQ(a_target["params"]["by"], "class_chain");
+    EXPECT_EQ(a_target["params"]["desc"], "**/X");
+    EXPECT_EQ(a_target["params"]["key"], "value");
+    EXPECT_EQ(a_target["params"]["value"], "$proxy_url");  // @ → "$" 注入契约
+    auto b_target = res.tree["children"][1]["*target"];
+    EXPECT_EQ(b_target["params"]["key"], "name");
+    EXPECT_EQ(b_target["params"]["value"], "$tag");
+}
+
+TEST(BtDslCompile, SeeAttrPredicateRejectsNonStringLit) {
+    // 回归：加 allow_bb 后仍要把数字/布尔字面量挡在 lit 校验里，避免 see 脚本收到非字符串。
+    EXPECT_NE(ErrOf("t:\n  a: until attr \"**/X\" value == 1 click \"**/X\"")
+                  .find("属性值应为字符串"),
+              std::string::npos);
+    EXPECT_NE(ErrOf("t:\n  a: until see \"**/X\" on == true click \"**/X\"")
+                  .find("属性值应为字符串"),
+              std::string::npos);
+}
+
+TEST(BtDslCompile, SeeAttrPredicateRejectsInvalidBbName) {
+    // 黑板键名约束与其它位置一致：@ 后必须是合法标识符（IsBbName）。
+    EXPECT_NE(ErrOf("t:\n  a: until attr \"**/X\" v == @1bad click \"**/X\"")
+                  .find("黑板引用 @1bad 后应为标识符"),
+              std::string::npos);
+}
+
 TEST(BtDslCompile, WaitableBbGivesCleanError) {
     // Python 在此处 KeyError 崩溃（bb 无 waitable_source）——C++ 干净报错
     std::string src = "t:\n  r: repeat until bb flag exists max 2:\n    a: wait 1ms";
