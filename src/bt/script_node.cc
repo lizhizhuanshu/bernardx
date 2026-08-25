@@ -167,6 +167,19 @@ NodeStatus ScriptNode::ParseReturnValues(const std::vector<LuaValue>& values, bo
         deactivate = true;
         return NodeStatus::kFailure;
     }
+    // 双模 Tick 返回(与 ScriptCondition::ParseReturnValue 同一契约):状态串显式
+    // 选择;布尔/nil 按 Lua 真值判定(true=success,false/nil=failure)。conds 脚本
+    // (conds/see.lua 等)的 Tick 返回布尔——同一份脚本既作条件又作**可等待条件
+    // 节点**(choose when / repeat until 的子节点位),节点位没有真值判定会让
+    // 恒真条件也判失败。
+    if (const auto* b = std::get_if<bool>(&values[0])) {
+        deactivate = true;
+        return *b ? NodeStatus::kSuccess : NodeStatus::kFailure;
+    }
+    if (std::holds_alternative<std::nullptr_t>(values[0])) {  // nil = falsy
+        deactivate = true;
+        return NodeStatus::kFailure;
+    }
     auto* s = std::get_if<std::string>(&values[0]);
     if (!s) {
         std::string msg = "'" + name_ + "' returned unexpected value";
@@ -211,8 +224,9 @@ NodeStatus ScriptNode::HandleScriptResult(const ScriptResult& result) {
     auto ns = ParseReturnValues(result.values, deactivate);
     if (deactivate) {
         active_ = false;
-        auto* s = std::get_if<std::string>(&result.values[0]);
-        CallExit(s ? *s : "failure");
+        std::string reason = ns == NodeStatus::kSuccess ? "success" : "failure";
+        if (const auto* s = std::get_if<std::string>(&result.values[0])) reason = *s;
+        CallExit(reason);
     }
     return ns;
 }

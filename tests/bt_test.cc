@@ -1015,6 +1015,40 @@ TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
     EXPECT_EQ(status, "success");
 }
 
+TEST_F(ScriptNodeIntegrationTest, BooleanTickInWaitableNodePosition) {
+    // 双模 Tick(与 ScriptCondition 同一契约):布尔/nil 返回在**可等待条件节点位**
+    // (choose when / repeat until 的子节点)按 Lua 真值判定。cond_truthy(Tick→true)
+    // 的分支应选中执行(cond_falsy 兜底恒失败)——修复前布尔被视为 unexpected
+    // value,恒真条件也判失败(真机 conds/see.lua 即此形态)。
+    PutRoot(R"({"type":"Selector","children":[)"
+            R"({"type":"Sequence","children":[)"
+            R"({"type":"Script","source":"scripts/cond_truthy.lua"},)"
+            R"({"type":"Script","source":"scripts/bt_module.lua"}]},)"
+            R"({"type":"Script","source":"scripts/cond_falsy.lua"}]})");
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 10})
+        if not status then return false, err end
+        return true, status
+    )");
+    EXPECT_EQ(status, "success");
+}
+
+TEST_F(ScriptNodeIntegrationTest, NilTickInWaitableNodePositionFails) {
+    // nil = falsy:cond_falsy(Tick→nil)在节点位应判失败(单孩子 Selector 失败)。
+    PutRoot(R"({"type":"Selector","children":[)"
+            R"({"type":"Script","source":"scripts/cond_falsy.lua"}]})");
+    auto status = RunBtScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 10})
+        if not status then return false, err end
+        return true, status
+    )");
+    EXPECT_EQ(status, "failure");
+}
+
 TEST_F(ScriptNodeIntegrationTest, SubtreeParamsTemplatingPreservesTypes) {
     // A Subtree node forwards its `params` into the wrapped subtree JSON via
     // {{key}} placeholders. Whole-value placeholders preserve the param type
