@@ -25,6 +25,7 @@ group_c: until (see "**/A" and see "**/B"):  # 容器步：子行缩进 → Pipe
 settle: wait [200,400]ms                     # Wait
 mark: set page = "home"                      # Set（黑板写）
 copy: set dst = @src                         # Set 黑板拷贝（@键 = 运行期引用）
+clear: set page = nil                        # Set 删键（nil = 清理语义，Has->false）
 login: use login_flow(user="alice")          # Subtree(res://bt/subtrees/login_flow.json)
 fill: include ime_input(text="hi")           # Template(解析期就地展开,缺参硬错误)
 scroll_find: repeat until see "**/List" max 5 interval [800,1200]ms:

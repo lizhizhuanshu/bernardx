@@ -18,6 +18,9 @@ struct ScriptResult;
 //                              string starting with '$' is a blackboard
 //                              reference ('$src' copies blackboard[src] at
 //                              each Tick; '$$x' escapes to the literal "$x").
+//   remove  (bool, optional)  true = delete the key outright (DSL `set k = nil`)
+//                             instead of writing a value — Has(key) turns false.
+//                             Literal keys only, same semantics as Lua bb.remove.
 // Writes through a PROVIDER (a `$src` read from a provider key, or a
 // dotted write into a provider root) run the provider's get/set as a
 // coroutine: the node returns Running while that is in flight and Success
@@ -31,6 +34,10 @@ public:
 
     // Reference form: writes blackboard[ref_key] (read fresh) every Tick.
     SetNode(uint32_t id, std::string name, std::string key, BbParamRef ref);
+
+    // Remove form: deletes key_ every Tick (`set 键 = nil` clear semantics).
+    struct RemoveTag {};
+    SetNode(uint32_t id, std::string name, std::string key, RemoveTag);
 
     async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx) override;
     NodeStatus Tick(Blackboard& bb, BtEventQueue& events) override;
@@ -54,6 +61,7 @@ private:
     std::string key_;
     LuaValue value_ = LuaValue(nullptr);  // literal (ref form ignores)
     std::string ref_key_;                 // non-empty -> read bb[ref_key_] fresh
+    bool remove_ = false;                 // true -> Blackboard::Remove every Tick
 
     LuaRuntime* lua_ctx_ = nullptr;  // captured at Init (provider calls)
     PendingCall src_;                // pending $src provider read

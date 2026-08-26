@@ -150,6 +150,15 @@
       "description": "Set 黑板拷贝(@键 = 运行期引用)"
     },
     {
+      "type": "Set",
+      "name": "clear",
+      "params": {
+        "key": "page",
+        "remove": true
+      },
+      "description": "Set 删键(nil = 清理语义,Has->false)"
+    },
+    {
       "type": "Subtree",
       "name": "login",
       "source": "res://bt/subtrees/login_flow.json",

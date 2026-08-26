@@ -9,6 +9,7 @@ tree_name: # 根描述
   settle: wait [200,400]ms                     # Wait
   mark: set page = "home"                      # Set(黑板写)
   copy: set dst = @src                         # Set 黑板拷贝(@键 = 运行期引用)
+  clear: set page = nil                        # Set 删键(nil = 清理语义,Has->false)
   login: use login_flow(user="alice")          # Subtree(res://bt/subtrees/login_flow.json)
   scroll_find: repeat until see "**/List" max 5 interval [800,1200]ms:
     swipe: swipe_on_node "**/List" order="up"

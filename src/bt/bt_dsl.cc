@@ -286,7 +286,8 @@ struct AstNode {
     ScalarOrRange wait_dur;
     // set
     std::string set_key;
-    std::optional<Value> set_val;
+    std::optional<Value> set_val;   // nullopt + set_remove -> `set 键 = nil` 删键
+    bool set_remove = false;
     // use/include 共用（kind 区分：use=Subtree / include=Template）
     std::string use_target;
     ParamList use_args;
@@ -848,7 +849,13 @@ AstNode ParseNodeBlock(const Block& blk) {
         node.kind = "set";
         node.set_key = *key;
         c.pos += 3;
-        node.set_val = ParseRefOrValue(c, blk.line_no, "set 值", /*allow_bb=*/true);
+        if (c.IsName(c.pos, "nil")) {
+            // set 键 = nil -> 清理语义:删除黑板键(Has->false),与"写入 nil 值"区分
+            node.set_remove = true;
+            ++c.pos;
+        } else {
+            node.set_val = ParseRefOrValue(c, blk.line_no, "set 值", /*allow_bb=*/true);
+        }
     } else if (verb && (*verb == "use" || *verb == "include")) {
         const std::string* target = c.AtNameText(c.pos + 1);
         if (!target) Fail(blk.line_no, *verb + " 后应为子树/模板名");
@@ -1468,7 +1475,11 @@ private:
             out["name"] = node.name;
             ojson p = ojson::object();
             p["key"] = node.set_key;
-            p["value"] = Lit(*node.set_val, ln, "set 值");
+            if (node.set_remove) {
+                p["remove"] = true;  // `set 键 = nil` -> 引擎删键(Has->false)
+            } else {
+                p["value"] = Lit(*node.set_val, ln, "set 值");
+            }
             out["params"] = std::move(p);
             return WrapWhen(node, std::move(out), /*with_description=*/true);
         }

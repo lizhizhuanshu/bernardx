@@ -19,6 +19,11 @@ SetNode::SetNode(uint32_t id, std::string name, std::string key, BbParamRef ref)
       key_(std::move(key)),
       ref_key_(std::move(ref.key)) {}
 
+SetNode::SetNode(uint32_t id, std::string name, std::string key, RemoveTag)
+    : Leaf(id, "Set", std::move(name)),
+      key_(std::move(key)),
+      remove_(true) {}
+
 async_simple::coro::Lazy<bool> SetNode::Init(lua_State* /*L*/, LuaRuntime* ctx) {
     lua_ctx_ = ctx;  // backs provider get/set coroutines
     co_return true;
@@ -86,6 +91,14 @@ NodeStatus SetNode::Tick(Blackboard& bb, BtEventQueue& /*events*/) {
                          : LuaValue(nullptr);
         src_ = {};
         return DoWrite(bb, v);
+    }
+
+    // Remove form (`set 键 = nil`): delete the key outright - a no-op if
+    // absent. Literal keys only, same as Lua bb.remove. Remove never has a
+    // pending call, so it lives above the pending checks (unreachable there).
+    if (remove_) {
+        bb.Remove(key_);
+        return NodeStatus::kSuccess;
     }
 
     // Fresh tick: obtain the value to write.

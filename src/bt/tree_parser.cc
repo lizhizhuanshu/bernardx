@@ -969,7 +969,8 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseRetry(const json& j, ParseC
 // "value":v}} writes blackboard[k]=v at Tick. `value` must be a scalar; a
 // string starting with '$' is a blackboard reference ('$src' copies
 // blackboard[src] fresh at each Tick, '$$x' escapes to the literal "$x").
-// Absent value writes nil.
+// Absent value writes nil. params.remove=true deletes the key outright
+// (DSL `set k = nil`) - mutually exclusive with value.
 async_simple::coro::Lazy<std::unique_ptr<Node>> ParseSet(const json& j, ParseContext& ctx) {
     if (!j.contains("params") || !j["params"].is_object() ||
         !j["params"].contains("key") || !j["params"]["key"].is_string()) {
@@ -979,6 +980,16 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParseSet(const json& j, ParseCon
     std::string key = j["params"]["key"].get<std::string>();
     std::string name = j.value("name", "Set");
     uint32_t id = ctx.next_id++;
+
+    bool remove = j["params"].value("remove", false);
+    if (remove) {
+        if (j["params"].contains("value")) {
+            SetError(ctx, "Set node 'remove' and 'value' are mutually exclusive");
+            co_return nullptr;
+        }
+        co_return std::make_unique<SetNode>(id, std::move(name), std::move(key),
+                                            SetNode::RemoveTag{});
+    }
 
     json v = j["params"].contains("value") ? j["params"]["value"] : json(nullptr);
     if (v.is_string()) {
