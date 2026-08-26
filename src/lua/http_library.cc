@@ -20,6 +20,7 @@ extern "C" {
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 // --- Helpers ---
@@ -52,6 +53,110 @@ static cinatra::req_content_type parse_content_type(const char* s) {
     if (strcmp(s, "form") == 0) return cinatra::req_content_type::form_url_encode;
     if (strcmp(s, "octet") == 0) return cinatra::req_content_type::octet_stream;
     return cinatra::req_content_type::none;
+}
+
+// --- Proxy ---
+
+struct ProxyConfig {
+    std::string host;
+    std::string port;
+    std::string username;
+    std::string password;
+
+    bool enabled() const { return !host.empty(); }
+};
+
+static void apply_proxy(cinatra::coro_http_client& client, const ProxyConfig& proxy) {
+    if (!proxy.enabled()) return;
+    client.set_proxy(proxy.host, proxy.port);
+    if (!proxy.username.empty()) {
+        client.set_proxy_basic_auth(proxy.username, proxy.password);
+    }
+}
+
+// Parses "http://[user:pass@]host[:port]" or scheme-less "[user:pass@]host[:port]".
+// Port defaults to 8080. Raises a Lua error (synchronous, before yield) on bad input.
+static ProxyConfig parse_proxy(lua_State* L, const char* s) {
+    ProxyConfig proxy;
+    std::string_view sv(s);
+    if (sv.empty()) {
+        luaL_error(L, "http proxy must be a non-empty string");
+        return proxy;  // unreachable (luaL_error longjmps)
+    }
+
+    // Optional scheme: only "http://" (or none). Anything else (socks5://, https://...)
+    // is rejected — the underlying client speaks plain HTTP forward proxy only.
+    auto scheme_end = sv.find("://");
+    if (scheme_end != std::string_view::npos) {
+        std::string_view scheme = sv.substr(0, scheme_end);
+        if (scheme != "http") {
+            // luaL_error's formatter only supports plain %s, not %.*s.
+            luaL_error(L, "http proxy does not support scheme '%s' (only http)",
+                       std::string(scheme).c_str());
+            return proxy;
+        }
+        sv.remove_prefix(scheme_end + 3);
+    }
+
+    // Optional userinfo: everything before the last '@' is "user[:pass]".
+    if (auto at = sv.rfind('@'); at != std::string_view::npos) {
+        std::string_view userinfo = sv.substr(0, at);
+        auto colon = userinfo.find(':');
+        if (colon != std::string_view::npos) {
+            proxy.username = std::string(userinfo.substr(0, colon));
+            proxy.password = std::string(userinfo.substr(colon + 1));
+        } else {
+            proxy.username = std::string(userinfo);
+        }
+        sv.remove_prefix(at + 1);
+    }
+
+    // host[:port]; IPv6 literal hosts are bracketed ([::1]:8080).
+    if (sv.starts_with('[')) {
+        auto close = sv.find(']');
+        if (close == std::string_view::npos) {
+            luaL_error(L, "http proxy has unterminated IPv6 host in '%s'", s);
+            return proxy;
+        }
+        proxy.host = std::string(sv.substr(1, close - 1));
+        sv.remove_prefix(close + 1);
+    } else {
+        auto colon = sv.find(':');
+        if (colon != std::string_view::npos) {
+            proxy.host = std::string(sv.substr(0, colon));
+            sv.remove_prefix(colon);
+        } else {
+            proxy.host = std::string(sv);
+            sv = {};
+        }
+    }
+
+    // Remaining ":port" (empty means default).
+    if (!sv.empty()) {
+        if (!sv.starts_with(':')) {
+            luaL_error(L, "http proxy has invalid host/port in '%s'", s);
+            return proxy;
+        }
+        sv.remove_prefix(1);
+        if (!sv.empty() && sv.find_first_not_of("0123456789") == std::string_view::npos) {
+            uint64_t port_val = 0;
+            for (char c : sv) port_val = port_val * 10 + static_cast<uint64_t>(c - '0');
+            if (port_val == 0 || port_val > 65535) {
+                luaL_error(L, "http proxy port out of range in '%s'", s);
+                return proxy;
+            }
+            proxy.port = std::string(sv);
+        } else {
+            luaL_error(L, "http proxy has invalid port in '%s'", s);
+            return proxy;
+        }
+    }
+    if (proxy.port.empty()) proxy.port = "8080";
+    if (proxy.host.empty() || proxy.host.find('/') != std::string::npos) {
+        luaL_error(L, "http proxy is missing or has invalid host in '%s'", s);
+        return proxy;
+    }
+    return proxy;
 }
 
 // --- HTTP Lua C function ---
@@ -149,12 +254,21 @@ static int http_request(lua_State* L) {
     auto headers = parse_headers(L, headers_idx);
     lua_pop(L, 1);
 
+    // proxy (optional, "http://[user:pass@]host[:port]"; port defaults to 8080)
+    lua_getfield(L, 1, "proxy");
+    ProxyConfig proxy;
+    if (const char* proxy_str = lua_isstring(L, -1) ? lua_tostring(L, -1) : nullptr) {
+        proxy = parse_proxy(L, proxy_str);
+    }
+    lua_pop(L, 1);
+
     return do_request(L, [url = std::move(url_str), body = std::move(body), content_type,
                           headers = std::move(headers), http_method,
-                          timeout_ms](cinatra::coro_http_client& client) mutable {
+                          timeout_ms, proxy](cinatra::coro_http_client& client) mutable {
         if (timeout_ms > 0) {
             client.set_req_timeout(std::chrono::milliseconds(timeout_ms));
         }
+        apply_proxy(client, proxy);
         for (auto& [k, v] : headers) {
             client.add_header(k, v);
         }
@@ -185,6 +299,7 @@ struct WsConn {
     std::shared_ptr<HttpLibraryState> state;
     LuaRuntime::Ptr rt;
     std::string url;
+    ProxyConfig proxy;
     std::atomic<bool> closed{false};
 
     // Lua callback registry refs (accessed from Lua thread only)
@@ -234,9 +349,19 @@ static int ws_gc(lua_State* L) {
     return 0;
 }
 
-// http.ws_create(url) -> ws
+// http.ws_create(url [, options]) -> ws
+// options.proxy: "http://[user:pass@]host[:port]" — route the websocket through a proxy.
 static int ws_create(lua_State* L) {
     const char* url = luaL_checkstring(L, 1);
+    ProxyConfig proxy;
+    if (!lua_isnoneornil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TTABLE);
+        lua_getfield(L, 2, "proxy");
+        if (const char* proxy_str = lua_isstring(L, -1) ? lua_tostring(L, -1) : nullptr) {
+            proxy = parse_proxy(L, proxy_str);
+        }
+        lua_pop(L, 1);
+    }
     auto state = g_http_state.Get(L);
     if (!state || state->shutting_down.load() || !state->exec) {
         return luaL_error(L, "http library is shutting down");
@@ -248,6 +373,7 @@ static int ws_create(lua_State* L) {
     conn->state = std::move(state);
     conn->rt = rt;
     conn->url = url;
+    conn->proxy = std::move(proxy);
     new (slot) std::shared_ptr<WsConn>(std::move(conn));
     luaL_setmetatable(L, kWsMetatable);
 
@@ -321,6 +447,7 @@ static int ws_connect_method(lua_State* L) {
     asio::post(exec->context(), [exec, rt, handle, shared_conn]() mutable {
         auto client = std::make_shared<cinatra::coro_http_client>(exec);
         shared_conn->client = client;
+        apply_proxy(*client, shared_conn->proxy);
 
         client->connect(shared_conn->url).via(exec).start([rt, handle, shared_conn, exec](async_simple::Try<cinatra::resp_data>&& result) {
             if (shared_conn->closed.load()) return;

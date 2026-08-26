@@ -10,9 +10,13 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <functional>
+#include <memory>
+#include <string>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 
 #define AWAIT(lazy) async_simple::coro::syncAwait(lazy)
 
@@ -40,6 +44,40 @@ protected:
     std::unique_ptr<coro_io::ExecutorWrapper<>> exec;
     std::thread io_thread;
     LuaRuntime::Ptr rt;
+};
+
+// Mini HTTP forward proxy for proxy-routing tests: accepts one connection on
+// the fixture io_context, reads the full request head, lets a callback decide
+// the canned response, and keeps the captured head for post-hoc assertions.
+class MiniProxy {
+public:
+    explicit MiniProxy(asio::io_context& ioc)
+        : acceptor_(ioc, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 0)) {}
+
+    uint16_t port() const { return acceptor_.local_endpoint().port(); }
+
+    void start(std::function<std::string(const std::string&)> respond) {
+        auto socket = std::make_shared<asio::ip::tcp::socket>(acceptor_.get_executor());
+        acceptor_.async_accept(*socket,
+            [this, socket, respond = std::move(respond)](std::error_code ec) mutable {
+                if (ec) return;
+                auto buf = std::make_shared<asio::streambuf>();
+                asio::async_read_until(*socket, *buf, "\r\n\r\n",
+                    [this, socket, buf, respond = std::move(respond)](std::error_code ec, size_t) mutable {
+                        if (ec) return;
+                        request_head_.assign(asio::buffers_begin(buf->data()), asio::buffers_end(buf->data()));
+                        std::string response = respond(request_head_);
+                        asio::async_write(*socket, asio::buffer(response),
+                            [socket](std::error_code, size_t) {});
+                    });
+            });
+    }
+
+    const std::string& request_head() const { return request_head_; }
+
+private:
+    asio::ip::tcp::acceptor acceptor_;
+    std::string request_head_;
 };
 
 TEST_F(HttpLibraryTest, RequireReturnsTable) {
@@ -155,6 +193,113 @@ TEST_F(HttpLibraryTest, RequestHonorsTimeoutMs) {
     EXPECT_EQ(r.status, LUA_OK);
     // Resolved by our 100ms timeout, not cinatra's 60s default.
     EXPECT_LT(elapsed_ms, 5000);
+}
+
+TEST_F(HttpLibraryTest, RequestGoesThroughProxy) {
+    MiniProxy proxy(ioc);
+    proxy.start([](const std::string&) {
+        return std::string("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nvia-proxy");
+    });
+
+    // The target host is unresolvable (.invalid TLD), so the only way this
+    // request can succeed is by reaching the local proxy.
+    std::string script = R"(
+        local http = require("http")
+        local status, body, err = http.request({
+            url = "http://nonexistent.invalid/api",
+            proxy = "http://127.0.0.1:__PORT__",
+        })
+        assert(err == nil, "unexpected error: " .. tostring(err))
+        assert(status == 200, "expected 200, got " .. tostring(status))
+        assert(body == "via-proxy", "unexpected body: " .. tostring(body))
+    )";
+    script.replace(script.find("__PORT__"), 8, std::to_string(proxy.port()));
+
+    EXPECT_EQ(AWAIT(rt->RunScript(script)).status, LUA_OK);
+
+    // Absolute-form request line proves the client sent the request to the proxy.
+    EXPECT_NE(proxy.request_head().find("GET http://nonexistent.invalid"), std::string::npos)
+        << "proxy saw request head: " << proxy.request_head();
+}
+
+TEST_F(HttpLibraryTest, ProxyBasicAuthSendsAuthorization) {
+    MiniProxy proxy(ioc);
+    proxy.start([](const std::string& head) {
+        // base64("user:pass") == "dXNlcjpwYXNz"
+        if (head.find("Proxy-Authorization: Basic dXNlcjpwYXNz") != std::string::npos) {
+            return std::string("HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nauth-ok");
+        }
+        return std::string("HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n");
+    });
+
+    std::string script = R"(
+        local http = require("http")
+        local status, body, err = http.request({
+            url = "http://nonexistent.invalid/api",
+            proxy = "http://user:pass@127.0.0.1:__PORT__",
+        })
+        assert(err == nil, "unexpected error: " .. tostring(err))
+        assert(status == 200, "proxy did not accept our credentials, got " .. tostring(status))
+        assert(body == "auth-ok", "unexpected body: " .. tostring(body))
+    )";
+    script.replace(script.find("__PORT__"), 8, std::to_string(proxy.port()));
+
+    EXPECT_EQ(AWAIT(rt->RunScript(script)).status, LUA_OK);
+}
+
+TEST_F(HttpLibraryTest, ProxyInvalidInputRaisesLuaError) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local http = require("http")
+
+        -- non-http schemes are rejected (cinatra speaks HTTP forward proxy only)
+        local ok, err = pcall(http.request, {
+            url = "http://127.0.0.1:1/",
+            proxy = "socks5://127.0.0.1:1080",
+        })
+        assert(ok == false, "expected pcall to fail for socks5 proxy")
+        assert(tostring(err):find("socks5", 1, true) ~= nil,
+               "error should mention the scheme: " .. tostring(err))
+
+        -- empty host is also a parse error
+        ok, err = pcall(http.request, {url = "http://127.0.0.1:1/", proxy = "http://"})
+        assert(ok == false, "expected pcall to fail for empty proxy host")
+
+        -- same validation applies to ws_create options
+        ok, err = pcall(http.ws_create, "ws://127.0.0.1:1/", {proxy = "socks5://127.0.0.1:1080"})
+        assert(ok == false, "expected pcall to fail for ws_create socks5 proxy")
+    )")).status, LUA_OK);
+}
+
+TEST_F(HttpLibraryTest, WsConnectThroughProxy) {
+    MiniProxy proxy(ioc);
+    proxy.start([](const std::string&) {
+        // Minimal 101 upgrade reply; the client does not validate the accept key.
+        return std::string("HTTP/1.1 101 Switching Protocols\r\n"
+                           "Upgrade: websocket\r\n"
+                           "Connection: Upgrade\r\n"
+                           "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+                           "\r\n");
+    });
+
+    std::string script = R"(
+        local http = require("http")
+        local ws = http.ws_create("ws://nonexistent.invalid/echo", {
+            proxy = "http://127.0.0.1:__PORT__",
+        })
+        ws.onclose = function() end
+        ws.onerror = function() end
+        local ok = select(1, ws:connect())
+        assert(ok == true, "expected ws connect via proxy to succeed")
+    )";
+    script.replace(script.find("__PORT__"), 8, std::to_string(proxy.port()));
+
+    EXPECT_EQ(AWAIT(rt->RunScript(script)).status, LUA_OK);
+
+    // The upgrade request reached the proxy in absolute form with ws headers.
+    EXPECT_NE(proxy.request_head().find("GET http://nonexistent.invalid"), std::string::npos)
+        << "proxy saw request head: " << proxy.request_head();
+    EXPECT_NE(proxy.request_head().find("Upgrade: websocket"), std::string::npos)
+        << "proxy saw request head: " << proxy.request_head();
 }
 
 TEST_F(HttpLibraryTest, RequireCached) {

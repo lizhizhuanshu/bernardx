@@ -24,6 +24,7 @@ local status, body, err = http.request({
     },
     content_type = "json",      -- 可选
     timeout = 5000,             -- 可选，毫秒，不传或 <=0 用默认 60s
+    proxy = "http://127.0.0.1:7890",  -- 可选，经代理服务器访问
 })
 ```
 
@@ -35,6 +36,7 @@ local status, body, err = http.request({
 | headers | table | 否 | 请求头 `{["Key"] = "Value"}` |
 | content_type | string | 否 | 内容类型（见下表） |
 | timeout | integer | 否 | 请求超时（毫秒），超时后返回 `err`；不传或 `<= 0` 时使用默认 60s |
+| proxy | string | 否 | HTTP 代理服务器，格式 `"http://[user:pass@]host[:port]"`（也可省略 `http://` 前缀）；端口缺省 `8080`；仅支持 HTTP 代理（不支持 socks） |
 
 **返回值：** `status, body, err`
 
@@ -86,23 +88,45 @@ local s, b, e = http.request({
         ["X-Token"] = "abc123",
     },
 })
+
+-- 经代理服务器访问
+local s, b, e = http.request({
+    url = "https://httpbin.org/get",
+    proxy = "http://127.0.0.1:7890",
+})
+
+-- 经需要 Basic 认证的代理访问
+local s, b, e = http.request({
+    url = "http://httpbin.org/get",
+    proxy = "http://user:password@127.0.0.1:7890",
+})
 ```
+
+**代理说明：**
+
+- `proxy` 仅对该次请求生效（无全局默认），不传则直连
+- 明文 `http://` 目标：请求以绝对形式 URI 发给代理
+- `https://` 目标：自动先与代理建立 CONNECT 隧道，再进行 TLS 握手
+- URL 中内嵌 `user:pass@` 会作为代理的 Basic 认证（`Proxy-Authorization` 头）
+- 仅支持 HTTP 正向代理；`socks5://` 等其他 scheme 会抛出 Lua 错误
 
 ---
 
 ## WebSocket
 
-### http.ws_create(url)
+### http.ws_create(url [, options])
 
 创建 WebSocket 连接对象。
 
 ```lua
 local ws = http.ws_create("ws://localhost:8080/ws")
+local ws = http.ws_create("ws://localhost:8080/ws", {proxy = "http://127.0.0.1:7890"})
 ```
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | url | string | 是 | WebSocket URL（`ws://` 或 `wss://`） |
+| options | table | 否 | `{proxy = "http://[user:pass@]host[:port]"}` — 经 HTTP 代理建立 WebSocket 连接（格式同 `http.request` 的 `proxy` 字段；`wss://` 目标走 CONNECT 隧道） |
 
 **返回：** WebSocket 对象
 
