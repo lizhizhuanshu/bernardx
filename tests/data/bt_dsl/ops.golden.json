@@ -71,11 +71,10 @@
     {
       "type": "Script",
       "name": "a3",
-      "source": "actions/set_text.lua",
+      "source": "actions/ime_action.lua",
       "params": {
-        "text": "x",
-        "desc": "**/T",
-        "by": "class_chain"
+        "action": "input",
+        "value": "x"
       },
       "*target": {
         "type": "Blackboard",

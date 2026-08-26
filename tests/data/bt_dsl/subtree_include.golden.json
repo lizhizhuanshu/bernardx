@@ -1,0 +1,90 @@
+{
+  "type": "Pipeline",
+  "name": "tree_name",
+  "description": "跨文件引用:use=Subtree / include=Template",
+  "children": [
+    {
+      "type": "Subtree",
+      "name": "login",
+      "source": "res://bt/subtrees/login_flow.json",
+      "params": {
+        "user": "alice"
+      },
+      "description": "Subtree:带参"
+    },
+    {
+      "type": "Subtree",
+      "name": "plain",
+      "source": "res://bt/subtrees/helper.json",
+      "description": "Subtree:无参(不产 params 键)"
+    },
+    {
+      "type": "Subtree",
+      "name": "login_g",
+      "source": "res://bt/subtrees/login_flow.json",
+      "*target": {
+        "type": "Script",
+        "source": "conds/see.lua",
+        "params": {
+          "by": "class_chain",
+          "desc": "**/Home"
+        }
+      },
+      "description": "Subtree:until=目标态(*target)"
+    },
+    {
+      "type": "Template",
+      "name": "fill",
+      "source": "res://bt/subtrees/ime_input.json",
+      "params": {
+        "text": "hi"
+      },
+      "description": "Template:带参"
+    },
+    {
+      "type": "Template",
+      "name": "step",
+      "source": "res://bt/subtrees/helper.json",
+      "description": "Template:无参"
+    },
+    {
+      "type": "Sequence",
+      "name": "guarded",
+      "children": [
+        {
+          "type": "Inverter",
+          "name": "guarded_when",
+          "child": {
+            "type": "Script",
+            "name": "guarded_when_n",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/Ad"
+            }
+          }
+        },
+        {
+          "type": "Template",
+          "name": "guarded_body",
+          "source": "res://bt/subtrees/ime_input.json",
+          "params": {
+            "text": "x"
+          }
+        }
+      ],
+      "description": "when 守卫 → Sequence 前缀"
+    },
+    {
+      "type": "Subtree",
+      "name": "tuned",
+      "source": "res://bt/subtrees/login_flow.json",
+      "*retry": 2,
+      "*timeout": [
+        8000,
+        12000
+      ],
+      "description": "步级修饰符"
+    }
+  ]
+}

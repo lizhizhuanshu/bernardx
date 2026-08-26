@@ -48,7 +48,7 @@ std::string Trim(const std::string& s) {
 // dsl.py _KEYWORDS（含 true/false）
 bool IsKeyword(const std::string& s) {
     static const std::set<std::string> kKeywords = {
-        "let", "when", "until", "wait", "set", "use", "repeat", "choose",
+        "let", "when", "until", "wait", "set", "use", "include", "repeat", "choose",
         "otherwise", "and", "or", "not", "max", "interval", "ms", "true", "false"};
     return kKeywords.count(s) > 0;
 }
@@ -271,7 +271,7 @@ void SetMod(ModList& ms, std::string key, ScalarOrRange v) {
 }
 
 struct AstNode {
-    std::string kind;  // action/container/wait/set/use/repeat/choose（""=待定）
+    std::string kind;  // action/container/wait/set/use/include/repeat/choose（""=待定）
     std::string name;
     int line_no = 0;
     std::string description;
@@ -287,7 +287,7 @@ struct AstNode {
     // set
     std::string set_key;
     std::optional<Value> set_val;
-    // use
+    // use/include 共用（kind 区分：use=Subtree / include=Template）
     std::string use_target;
     ParamList use_args;
     // repeat
@@ -769,7 +769,21 @@ CExpr ParseCatom(Cur& c, int line_no, const std::vector<std::string>& end_names)
         SetParam(out.params, "value", ParseRefOrValue(c, line_no, "bb 值"));
         return out;
     }
-    Fail(line_no, "未知条件 `" + *name + "`");
+    // registry 自定义条件：`名字 [k=v ...]`。解析期放行任意名字，是否登记由编译期
+    // (CondJson/WaitableNode) 查 registry 校验——词表可扩展不需改语法。
+    // 尾随 k=v 与动作行参数同构(name= 才吃，不吞 and/or/until/max/动词)，值允许 @黑板。
+    if (const Token* st = c.At(c.pos); st && st->kind == Tk::kString) {
+        // `smell "**/A"` 之类的 see 拼写错误形态——定向提示优于"行尾有多余内容"
+        Fail(line_no, "未知条件 `" + *name +
+             "`(自定义条件仅 k=v 参数，不接受定位器;内建条件: see/attr/in_app/count/bb)");
+    }
+    while (c.AtIsName(c.pos) && c.IsSym(c.pos + 1, "=")) {
+        std::string key = *c.AtNameText(c.pos);
+        c.pos += 2;
+        Value v = ParseRefOrValue(c, line_no, "条件参数 " + key, /*allow_bb=*/true);
+        SetParam(out.params, std::move(key), std::move(v));
+    }
+    return out;
 }
 
 // ── 行解析（dsl.py 432-563） ─────────────────────────────────────────────
@@ -835,15 +849,15 @@ AstNode ParseNodeBlock(const Block& blk) {
         node.set_key = *key;
         c.pos += 3;
         node.set_val = ParseRefOrValue(c, blk.line_no, "set 值", /*allow_bb=*/true);
-    } else if (verb && *verb == "use") {
+    } else if (verb && (*verb == "use" || *verb == "include")) {
         const std::string* target = c.AtNameText(c.pos + 1);
-        if (!target) Fail(blk.line_no, "use 后应为子树名");
-        node.kind = "use";
+        if (!target) Fail(blk.line_no, *verb + " 后应为子树/模板名");
+        node.kind = *verb;
         node.use_target = *target;
         c.pos += 2;
         if (c.IsSym(c.pos, "(")) {
             ++c.pos;
-            node.use_args = ParseKvList(c, blk.line_no, "use 参数");
+            node.use_args = ParseKvList(c, blk.line_no, *verb + " 参数");
         }
     } else if (verb && *verb == "repeat") {
         if (!c.IsName(c.pos + 1, "until"))
@@ -943,7 +957,7 @@ AstNode BlockToNode(const Block& blk) {
     AstNode node = ParseNodeBlock(blk);
     if (!blk.children.empty()) {
         if (node.kind == "action" || node.kind == "wait" || node.kind == "set" ||
-            node.kind == "use")
+            node.kind == "use" || node.kind == "include")
             Fail(blk.line_no, node.kind + " 行不能有子行");
         if (node.kind == "choose") {
             for (const Block& child : blk.children) {
@@ -1034,7 +1048,7 @@ struct CondSpec {
 struct Registry {
     std::map<std::string, ActionSpec> actions;
     std::map<std::string, CondSpec> conds;
-    std::string subtree_dir = "bt/subtrees";
+    std::string subtree_dir = "res://bt/subtrees";
 
     explicit Registry(const std::string& registry_text) {
         ojson j;
@@ -1216,7 +1230,7 @@ private:
         }
         if (c.cond_name == "see" || c.cond_name == "count") {
             const CondSpec* spec = reg_.Cond(c.cond_name);
-            if (!spec) Fail(0, "未知条件 `" + c.cond_name + "`(registry.json 未登记)");
+            if (!spec) Fail(line_no, "未知条件 `" + c.cond_name + "`(registry.json 未登记)");
             ojson out;
             out["type"] = "Script";
             out["source"] = spec->cond_source;
@@ -1225,7 +1239,7 @@ private:
         }
         if (c.cond_name == "in_app") {
             const CondSpec* spec = reg_.Cond("in_app");
-            if (!spec) Fail(0, "未知条件 `in_app`(registry.json 未登记)");
+            if (!spec) Fail(line_no, "未知条件 `in_app`(registry.json 未登记)");
             const Value* pkg = FindParam(c.params, "package_name");
             ojson out;
             out["type"] = "Script";
@@ -1235,9 +1249,20 @@ private:
             out["params"] = std::move(p);
             return out;
         }
-        // bb
+        if (c.cond_name == "bb") {
+            ojson out;
+            out["type"] = "Blackboard";
+            out["params"] = CondParamsObject(c.params, line_no);
+            return out;
+        }
+        // registry 自定义条件（布尔契约）
+        const CondSpec* spec = reg_.Cond(c.cond_name);
+        if (!spec) Fail(line_no, "未知条件 `" + c.cond_name + "`(registry.json 未登记)");
+        if (spec->cond_source.empty())
+            Fail(line_no, "条件 " + c.cond_name + " 无布尔形态(registry 未登记 cond_source)");
         ojson out;
-        out["type"] = "Blackboard";
+        out["type"] = "Script";
+        out["source"] = spec->cond_source;
         out["params"] = CondParamsObject(c.params, line_no);
         return out;
     }
@@ -1263,8 +1288,8 @@ private:
             return out;
         }
         const CondSpec* spec = reg_.Cond(c.cond_name);
-        if (!spec) Fail(0, "未知条件 `" + c.cond_name + "`(registry.json 未登记)");
-        // Python 在 bb 上读 waitable_source 会 KeyError——这里干净报错
+        if (!spec) Fail(line_no, "未知条件 `" + c.cond_name + "`(registry.json 未登记)");
+        // bb 引擎原生条件无 waitable_source——干净报错
         if (spec->waitable_source.empty())
             Fail(line_no, "条件 " + c.cond_name + " 无可等待形态(registry 未登记 waitable_source)");
         ojson out;
@@ -1448,15 +1473,17 @@ private:
             return WrapWhen(node, std::move(out), /*with_description=*/true);
         }
 
-        if (node.kind == "use") {
+        if (node.kind == "use" || node.kind == "include") {
+            // use=Subtree（运行期包装节点，缺参仅 warn）；include=Template（解析期
+            // 就地展开，缺参硬错误）——同为 {subtree_dir}/<名>.json 源，.bt 兜底。
             ojson out;
-            out["type"] = "Subtree";
+            out["type"] = node.kind == "use" ? "Subtree" : "Template";
             out["name"] = node.name;
             out["source"] = reg_.subtree_dir + "/" + node.use_target + ".json";
             if (!node.use_args.empty()) {
                 ojson p = ojson::object();
                 for (const auto& kv : node.use_args)
-                    p[kv.first] = Lit(kv.second, ln, "use 参数 " + kv.first);
+                    p[kv.first] = Lit(kv.second, ln, node.kind + " 参数 " + kv.first);
                 out["params"] = std::move(p);
             }
             return WrapWhen(node, std::move(out), /*with_description=*/true);
@@ -1552,8 +1579,10 @@ const char* DefaultRegistryText() {
     "click":         { "source": "actions/click.lua", "primary": "desc", "auto_bind": ["desc"] },
     "swipe_on_node": { "source": "actions/swipe_on_node.lua", "primary": "desc", "auto_bind": ["desc"] },
     "node_count":    { "source": "actions/node_count.lua", "primary": "desc", "auto_bind": ["desc"], "requires": ["key"] },
-    "set_text":      { "source": "actions/set_text.lua", "primary": "desc", "auto_bind": ["desc"] },
-    "ime_input":     { "source": "actions/ime_action.lua", "fixed": { "action": "input" }, "requires": ["value"] },
+    "replace_text":  { "source": "actions/ime_action.lua", "primary": "desc",
+                       "fixed": { "action": "input" }, "requires": ["value"],
+                       "doc": "定位感知替换输入——定位 desc 节点自己聚焦, 占位符感知删旧+逐字输入+读回校验。占位符探测: 读值非空→删 len 次→复读不变→输入目标首字符作探针; 探针上屏=原读值是占位符(webview 字段常不暴露 placeholderValue, WDA 把占位符放 value), 探针不上屏=IME 不收该字段→诚实失败(不做 setValue 兜底)。",
+                       "params_doc": "desc/by 输入框定位(主参数, 显式或位置给出; 缺省退化为纯输入) value 新文本(必填) placeholder 已知占位符文案——与当前读值相等时免探测直判空框(录制时探测到会回填此参数)" },
     "ime_delete":    { "source": "actions/ime_action.lua", "fixed": { "action": "delete" } },
     "ime_enter":     { "source": "actions/ime_action.lua", "fixed": { "action": "input", "value": "\n" } },
     "open_app":      { "source": "actions/open_app.lua", "primary": "package_name", "auto_bind": ["package_name"] },
@@ -1562,7 +1591,11 @@ const char* DefaultRegistryText() {
     "press_key":     { "source": "actions/press_key.lua" },
     "escalate":      { "source": "actions/escalate.lua",
                        "doc": "失败升级——宣告此路不通，回退 agent 重新探索（bt_runner 解析 __BT_ESCALATE__ 标记）",
-                       "params_doc": "{note=升级原因}" }
+                       "params_doc": "{note=升级原因}" },
+    "scroll_to_input": { "source": "actions/scroll_to_input.lua", "primary": "desc", "auto_bind": ["desc"],
+                         "requires": ["target_desc", "text"],
+                         "doc": "把目标输入框滚动到容器的指定位置区间后聚焦并替换输入。 适用: 输入框 B 被可滑动容器 A 包裹, B 初始可能不可见或不在期望位置, 需要先把 B 滚到 A 的指定纵向/横向区间的 [lo,hi] 内(range 决定), 然后聚焦并以替换语义填入文本(沿用 ime.replace_text 协议)。",
+                         "params_doc": "desc/by             可互动节点(滚动容器) A 的定位(主参数) target_desc         目标输入框 B 的定位描述(必填) target_by           B 的定位方式, 缺省 class_chain text                替换输入的文本(必填) order               滑动方向 up|down|left|right, 缺省 up ——既决定 B 不可见时的兜底滑动方向, 也决定对齐轴(Y 或 X) range               \"lo,hi\" 字符串: B 中心在 A 中的允许区间, 0-1 闭区间 缺省 \"0.4,0.6\"(中间 20%)。亦可用 range_lo + range_hi 分开给。 distance            单次滑动距离占 A 滑动轴比例, 缺省 0.5 speed               滑动速度 0-1, 缺省 0.5 max_swipes          最大滑动尝试次数(不可见时/对齐时共用), 缺省 5 流程: 找 A → 找 B → B 不可见则按 order 滑(直到出现或耗尽 max_swipes)→ 计算 B 中心在 A 内的归一化位置 p, 与 [lo,hi] 比较 → p ∈ [lo,hi]: clickNode(B) 聚焦 + 拟人 sleep 等键盘 + ime.replace_text → success; 否则沿对齐轴朝区间方向滑, 距离朝 (lo+hi)/2 收敛(单次最多 0.8, 留差给下一轮收)。" }
   },
   "conds": {
     "see":    { "cond_source": "conds/see.lua", "waitable_source": "conds/see.lua",
@@ -1571,9 +1604,12 @@ const char* DefaultRegistryText() {
                 "binds": { "package_name": "package_name" } },
     "count":  { "cond_source": "conds/node_target_count.lua", "waitable_source": "conds/node_target_count.lua",
                 "locator": true },
+    "ime_enable": { "cond_source": "conds/ime_enable.lua", "waitable_source": "conds/ime_enable.lua",
+                    "doc": "IME(键盘)已稳定就绪——连续 N 帧 server_ready() 返回 true 才算 true。 用于「输入框已聚焦」的间接判定: 键盘弹起 = 必有聚焦输入框(在 iOS 上, 键盘仅在输入框获焦时弹起); 反之无键盘 = 聚焦未成功。 加重试窗口的原因: server_ready 是单次 HTTP GET, 键盘弹/收的过渡态(viewWillAppear/server.start 绑定端口的 ~50-200ms 窗口) 单点采样会抖动; server 与 viewWillDisappear 1:1 绑定, 任何引起键盘 dismiss 的事件都会让单次探针拿到 false。 连续 N 帧 true = 状态稳定 ~N*tick_ms, 过滤单点抖动, 失败重置计数。",
+                    "params_doc": "{stable_frames=N}" },
     "bb":     { "engine_cond": "Blackboard" }
   },
-  "subtree_dir": "bt/subtrees"
+  "subtree_dir": "res://bt/subtrees"
 }
 )json";
 }

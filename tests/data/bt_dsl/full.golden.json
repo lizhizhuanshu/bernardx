@@ -152,11 +152,11 @@
     {
       "type": "Subtree",
       "name": "login",
-      "source": "bt/subtrees/login_flow.json",
+      "source": "res://bt/subtrees/login_flow.json",
       "params": {
         "user": "alice"
       },
-      "description": "Subtree(bt/subtrees/login_flow.json)"
+      "description": "Subtree(res://bt/subtrees/login_flow.json)"
     },
     {
       "type": "Retry",

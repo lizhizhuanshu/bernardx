@@ -1,0 +1,8 @@
+tree_name: # 跨文件引用:use=Subtree / include=Template
+  login: use login_flow(user="alice")            # Subtree:带参
+  plain: use helper                              # Subtree:无参(不产 params 键)
+  login_g: until see "**/Home" use login_flow    # Subtree:until=目标态(*target)
+  fill: include ime_input(text="hi")             # Template:带参
+  step: include helper                           # Template:无参
+  guarded: when not see "**/Ad" include ime_input(text="x")  # when 守卫 → Sequence 前缀
+  tuned[retry=2, timeout=[8000,12000]ms]: use login_flow      # 步级修饰符

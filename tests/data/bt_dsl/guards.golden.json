@@ -156,11 +156,10 @@
             {
               "type": "Script",
               "name": "i1",
-              "source": "actions/set_text.lua",
+              "source": "actions/ime_action.lua",
               "params": {
-                "text": "hi",
-                "desc": "**/T",
-                "by": "class_chain"
+                "action": "input",
+                "value": "hi"
               }
             }
           ]

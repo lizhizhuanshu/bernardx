@@ -139,8 +139,8 @@ TEST(BtDslParse, PositionalDuplicateRejected) {
 }
 
 TEST(BtDslParse, RequiresEnforced) {
-    // ime_input requires value
-    EXPECT_NE(ErrOf("t:\n  a: ime_input").find("需要参数 value"), std::string::npos);
+    // replace_text requires value
+    EXPECT_NE(ErrOf("t:\n  a: replace_text").find("需要参数 value"), std::string::npos);
     // node_count requires key
     EXPECT_NE(ErrOf("t:\n  a: until see \"**/X\" node_count").find("需要参数 key"),
               std::string::npos);
@@ -208,18 +208,18 @@ TEST(BtDslParse, LetRules) {
     EXPECT_NE(ErrOf("t:\n  let a = 1 2").find("let 应为"), std::string::npos);
     // let 重复定义后者覆盖
     bt_dsl::DslResult res = bt_dsl::CompileText(
-        "t:\n  let a = \"x\"\n  let a = \"y\"\n  s: set_text \"**/T\" text=$a");
+        "t:\n  let a = \"x\"\n  let a = \"y\"\n  s: replace_text value=$a");
     ASSERT_TRUE(res.error.empty()) << res.error;
-    EXPECT_EQ(res.tree["children"][0]["params"]["text"], "y");
+    EXPECT_EQ(res.tree["children"][0]["params"]["value"], "y");
 }
 
 // ── 编译语义 ─────────────────────────────────────────────────────────────
 
 TEST(BtDslCompile, BbRefCompilesToInjectionContract) {
     bt_dsl::DslResult res = bt_dsl::CompileText(
-        "t:\n  a: set_text \"**/T\" text=@user\n  b: set dst = @src");
+        "t:\n  a: replace_text value=@user\n  b: set dst = @src");
     ASSERT_TRUE(res.error.empty()) << res.error;
-    EXPECT_EQ(res.tree["children"][0]["params"]["text"], "$user");
+    EXPECT_EQ(res.tree["children"][0]["params"]["value"], "$user");
     EXPECT_EQ(res.tree["children"][1]["params"]["value"], "$src");
 }
 
@@ -302,13 +302,42 @@ TEST(BtDslCompile, NonPureWhenOnContainerPutsEdgesOnWrapper) {
     EXPECT_EQ(outer["children"][1]["params"]["retry"], 1);
 }
 
+// ── use/include 跨文件引用 ───────────────────────────────────────────────
+
+TEST(BtDslCompile, UseAndIncludeEmitRefNodes) {
+    // use=Subtree / include=Template；同为 {subtree_dir}/<名>.json 源（.bt 兜底
+    // 在加载端 tree_parser），无参引用不产 params 键。
+    bt_dsl::DslResult res = bt_dsl::CompileText(
+        "t:\n"
+        "  a: use login_flow(user=\"alice\")\n"
+        "  b: include helper");
+    ASSERT_TRUE(res.error.empty()) << res.error;
+    const auto& sub = res.tree["children"][0];
+    EXPECT_EQ(sub["type"], "Subtree");
+    EXPECT_EQ(sub["source"], "res://bt/subtrees/login_flow.json");
+    EXPECT_EQ(sub["params"]["user"], "alice");
+    const auto& tpl = res.tree["children"][1];
+    EXPECT_EQ(tpl["type"], "Template");
+    EXPECT_EQ(tpl["source"], "res://bt/subtrees/helper.json");
+    EXPECT_FALSE(tpl.contains("params"));
+}
+
+TEST(BtDslParse, IncludeRules) {
+    EXPECT_NE(ErrOf("t:\n  a: include 123").find("应为子树/模板名"),
+              std::string::npos);
+    EXPECT_NE(ErrOf("t:\n  a: include x:\n    b: wait 1ms").find("不能有子行"),
+              std::string::npos);
+    EXPECT_NE(ErrOf("t:\n  a: include x(1)").find("include 参数"),
+              std::string::npos);
+}
+
 // ── Registry ─────────────────────────────────────────────────────────────
 
 TEST(BtDslRegistry, DefaultTextParses) {
     auto j = nlohmann::ordered_json::parse(bt_dsl::DefaultRegistryText());
     EXPECT_TRUE(j.contains("actions"));
     EXPECT_TRUE(j.contains("conds"));
-    EXPECT_EQ(j["subtree_dir"], "bt/subtrees");
+    EXPECT_EQ(j["subtree_dir"], "res://bt/subtrees");
 }
 
 TEST(BtDslRegistry, CustomRegistryReplacesDefault) {
@@ -338,6 +367,104 @@ TEST(BtDslRegistry, KeywordClashRejected) {
 TEST(BtDslRegistry, BadJsonRejected) {
     const std::string reg = "{not json";
     EXPECT_NE(ErrOf("t:\n  a: wait 1ms", &reg).find("registry"), std::string::npos);
+}
+
+// ── Registry 自定义条件：解析期放行任意名，编译期查词表校验 ───────────────
+
+static const std::string kCondReg = R"json({
+  "actions": { "click": { "source": "actions/click.lua", "primary": "desc",
+                          "auto_bind": ["desc"] } },
+  "conds": {
+    "see": { "cond_source": "conds/see.lua", "waitable_source": "conds/see.lua" },
+    "my_cond": { "cond_source": "conds/my.lua", "waitable_source": "conds/my_wait.lua" },
+    "bool_only": { "cond_source": "conds/bo.lua" },
+    "wait_only": { "waitable_source": "conds/wo.lua" }
+  }
+})json";
+
+TEST(BtDslRegistry, DefaultRegistryImeEnableUsable) {
+    // 内嵌默认词表登记的 ime_enable 此前被解析期硬编码拦截（登记了也写不进 .bt）
+    bt_dsl::DslResult res = bt_dsl::CompileText(
+        "t:\n  a: until ime_enable stable_frames=5 click \"**/A\"");
+    ASSERT_TRUE(res.error.empty()) << res.error;
+    const auto& target = res.tree["children"][0]["*target"];
+    EXPECT_EQ(target["type"], "Script");
+    EXPECT_EQ(target["source"], "conds/ime_enable.lua");
+    EXPECT_EQ(target["params"]["stable_frames"], 5);
+}
+
+TEST(BtDslRegistry, CustomCondUntilTarget) {
+    // 普通动作行 until → *target（布尔契约，cond_source）
+    bt_dsl::DslResult res =
+        bt_dsl::CompileText("t:\n  a: until my_cond click \"**/A\"", &kCondReg);
+    ASSERT_TRUE(res.error.empty()) << res.error;
+    const auto& target = res.tree["children"][0]["*target"];
+    EXPECT_EQ(target["type"], "Script");
+    EXPECT_EQ(target["source"], "conds/my.lua");
+    EXPECT_EQ(target["params"], nlohmann::json::object());
+}
+
+TEST(BtDslRegistry, CustomCondWhenGuardAndRepeat) {
+    // when 守卫（非纯 bb）→ 可等待前缀（waitable_source）
+    bt_dsl::DslResult w =
+        bt_dsl::CompileText("t:\n  a: when my_cond k=3 click \"**/A\"", &kCondReg);
+    ASSERT_TRUE(w.error.empty()) << w.error;
+    const auto& node = w.tree["children"][0];
+    EXPECT_EQ(node["type"], "Sequence");
+    const auto& guard = node["children"][0];
+    EXPECT_EQ(guard["type"], "Script");
+    EXPECT_EQ(guard["source"], "conds/my_wait.lua");
+    EXPECT_EQ(guard["params"]["k"], 3);
+    // repeat until 双形态：until/waitable 位 waitable_source + *target cond_source
+    bt_dsl::DslResult r = bt_dsl::CompileText(
+        "t:\n  a: repeat until my_cond max 2:\n    b: wait 1ms", &kCondReg);
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    const auto& rep = r.tree["children"][0];
+    EXPECT_EQ(rep["child"]["children"][0]["source"], "conds/my_wait.lua");
+    EXPECT_EQ(rep["*target"]["source"], "conds/my.lua");
+}
+
+TEST(BtDslRegistry, CustomCondNotAndOr) {
+    bt_dsl::DslResult res = bt_dsl::CompileText(
+        "t:\n  a: until (not my_cond and see \"**/A\") click \"**/B\"", &kCondReg);
+    ASSERT_TRUE(res.error.empty()) << res.error;
+    const auto& target = res.tree["children"][0]["*target"];
+    EXPECT_EQ(target["type"], "And");
+    EXPECT_EQ(target["children"][0]["type"], "Not");
+    EXPECT_EQ(target["children"][0]["child"]["source"], "conds/my.lua");
+}
+
+TEST(BtDslRegistry, UnknownCondCleanError) {
+    // 未登记名：报错移到编译期，带行号与"未登记"提示
+    const std::string err = ErrOf("t:\n  a: until smell click \"**/A\"");
+    EXPECT_NE(err.find("未知条件 `smell`"), std::string::npos);
+    EXPECT_NE(err.find("registry.json 未登记"), std::string::npos);
+    EXPECT_NE(err.find("第 2 行"), std::string::npos);
+}
+
+TEST(BtDslRegistry, UnknownCondLocatorHint) {
+    // see 拼写错误形态（名字后跟定位器）在解析期给定向提示
+    const std::string err = ErrOf("t:\n  a: until smell \"**/A\" click");
+    EXPECT_NE(err.find("未知条件 `smell`"), std::string::npos);
+    EXPECT_NE(err.find("不接受定位器"), std::string::npos);
+}
+
+TEST(BtDslRegistry, CustomRegistryReplacesDefaultConds) {
+    // 自定义词表整体替换默认：未登记的内建条件同样报"未登记"
+    EXPECT_NE(ErrOf("t:\n  a: until in_app \"com.x\" click \"**/A\"", &kCondReg)
+                  .find("registry.json 未登记"),
+              std::string::npos);
+}
+
+TEST(BtDslRegistry, CondMissingForms) {
+    // 只登记 waitable_source 的条件用在 *target 位 → 无布尔形态
+    EXPECT_NE(ErrOf("t:\n  a: until wait_only click \"**/A\"", &kCondReg)
+                  .find("无布尔形态"),
+              std::string::npos);
+    // 只登记 cond_source 的条件用在 when 守卫位 → 无可等待形态
+    EXPECT_NE(ErrOf("t:\n  a: when bool_only click \"**/A\"", &kCondReg)
+                  .find("无可等待形态"),
+              std::string::npos);
 }
 
 // ── 路径判定 ─────────────────────────────────────────────────────────────
@@ -410,6 +537,37 @@ TEST(BtDslTreeParser, SubtreeBtFallbackForJsonSource) {
     auto* pipe = dynamic_cast<Pipeline*>(sub->child());
     ASSERT_NE(nullptr, pipe);
     EXPECT_EQ(pipe->name(), "flow_inner");
+}
+
+TEST(BtDslTreeParser, BtRootUseAndIncludeLoad) {
+    auto provider = std::make_shared<MemoryResourceProvider>();
+    // .bt 根里的 use/include 编译产出 res://bt/subtrees/<名>.json → 兜底加载
+    // 同名 .bt（被调用内嵌默认词表编译）。
+    provider->Put("bt/tasks/main.bt",
+                  "main: # 根\n"
+                  "  login: use flow(user=\"alice\")\n"
+                  "  fill: include step(text=\"hi\")\n");
+    provider->Put("bt/subtrees/flow.bt", "flow_inner: # sub\n  s1: wait 1ms\n");
+    provider->Put("bt/subtrees/step.bt",
+                  "step_inner: # tpl\n  s2: replace_text value=\"{{text}}\"\n");
+    auto res = AWAIT_DSL(TreeParser::LoadAndParse("res://bt/tasks/main.bt", provider));
+    ASSERT_TRUE(res.error.empty()) << res.error;
+    auto* pipe = dynamic_cast<Pipeline*>(res.root.get());
+    ASSERT_NE(nullptr, pipe);
+    ASSERT_EQ(pipe->children().size(), 2u);
+    // use → 运行期 SubtreeNode 包装
+    auto* sub = dynamic_cast<SubtreeNode*>(pipe->children()[0].get());
+    ASSERT_NE(nullptr, sub);
+    EXPECT_EQ(dynamic_cast<Pipeline*>(sub->child())->name(), "flow_inner");
+    // include → 解析期就地展开：位置上直接是展开后的 Pipeline（无包装节点）
+    auto* expanded = dynamic_cast<Pipeline*>(pipe->children()[1].get());
+    ASSERT_NE(nullptr, expanded);
+    EXPECT_EQ(expanded->name(), "step_inner");
+    // 展开体里的动词按内嵌默认词表解析（replace_text → ime_action.lua）；
+    // {{text}} 参数替换契约由 tree_parser 测试覆盖。
+    auto* script = dynamic_cast<ScriptNode*>(expanded->children()[0].get());
+    ASSERT_NE(nullptr, script);
+    EXPECT_EQ(script->script_path(), "actions/ime_action.lua");
 }
 
 // ── bt.init Lua e2e：.bt root + registry 选项 + exec ─────────────────────

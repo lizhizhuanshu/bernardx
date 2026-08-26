@@ -4,7 +4,7 @@ mods_tree: # 修饰符/常量/参数形态
   a1[retry=2, timeout=[8000,12000]ms]: until in_app $pkg open_app $pkg  # 打开应用
   a2[timeout=3000ms]: until see $hero tap_point x=100 y=200.5
   a3: press_key key="enter"  # 回车
-  a4: set_text $hero text=@user clear=true
+  a4: replace_text value=@user
   a5: when bb ready == true escalate note="give up"
-  a6: set_text "**/Box" text="say \"hi\"\\n"
+  a6: replace_text value="say \"hi\"\\n"
   a7: click @target

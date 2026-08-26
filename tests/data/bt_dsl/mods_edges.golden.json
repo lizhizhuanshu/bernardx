@@ -54,12 +54,10 @@
     {
       "type": "Script",
       "name": "a4",
-      "source": "actions/set_text.lua",
+      "source": "actions/ime_action.lua",
       "params": {
-        "text": "$user",
-        "clear": true,
-        "desc": "**/Hero",
-        "by": "class_chain"
+        "action": "input",
+        "value": "$user"
       }
     },
     {
@@ -81,11 +79,10 @@
     {
       "type": "Script",
       "name": "a6",
-      "source": "actions/set_text.lua",
+      "source": "actions/ime_action.lua",
       "params": {
-        "text": "say \"hi\"\\n",
-        "desc": "**/Box",
-        "by": "class_chain"
+        "action": "input",
+        "value": "say \"hi\"\\n"
       }
     },
     {

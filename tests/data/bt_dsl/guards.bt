@@ -5,7 +5,7 @@ guards: # when 包装三形态
   g4: when bb done == 1:
     inner: wait 50ms
   g5: when see "**/X" and count "**/Y" >= 2:
-    i1: set_text "**/T" text="hi"
+    i1: replace_text value="hi"
   g6[retry=[2,3], timeout=[4000,6000]ms]: until see "**/Z" and not see "**/W":
     i2: wait 10ms
     i3: click "**/Z"
