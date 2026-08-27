@@ -35,6 +35,12 @@ struct ParseResult {
 //            keeps the param's original type, an embedded placeholder
 //            interpolates as text, an unknown key is left literal + warned.
 //
+//   defaults — optional object of bt.init global ranges for Pipeline edge
+//            params: `timeout`, `retry`, `response` (each an int, a [lo,hi]
+//            array, or a "$key" string). Applied as each Pipeline's BOTTOM
+//            fallback when a step carries no `*param` and `params.<param>` is
+//            absent, i.e.: step `*X` > params.X > global default.
+//
 //   blackboard — optional; when present, Pipeline edge params (`*timeout`,
 //            `*retry`) accept a "$key" blackboard reference: the value is read
 //            from the blackboard AT PARSE TIME (providers invoke fresh) and
@@ -51,6 +57,7 @@ public:
         const std::string& root_path,
         std::shared_ptr<ResourceProvider> provider,
         nlohmann::json params = nlohmann::json::object(),
+        nlohmann::json defaults = nlohmann::json::object(),
         std::shared_ptr<Blackboard> blackboard = nullptr,
         lua_State* L = nullptr,
         std::string registry_path = {});  // .bt 根的动词注册表（空 = 内嵌默认）
@@ -60,5 +67,6 @@ public:
     // `params` templating is applied exactly like LoadAndParse's.
     static ParseResult Parse(const std::string& root_json,
                              nlohmann::json params = nlohmann::json::object(),
+                             nlohmann::json defaults = nlohmann::json::object(),
                              std::shared_ptr<Blackboard> blackboard = nullptr);
 };

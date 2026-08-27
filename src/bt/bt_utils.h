@@ -148,3 +148,21 @@ inline int RollIntInRange(int lo, int hi, URBG&& g) {
     std::uniform_int_distribution<int> dist(lo, hi);
     return dist(std::forward<URBG>(g));
 }
+
+// Gaussian ("human-like") random integer centered on the inclusive [lo, hi]
+// range, drawn from the supplied URNG. Samples clump near the midpoint and
+// thin out toward the ends — modeling reaction latency, where the typical case
+// is far more likely than the extremes. The spread is set to 3σ per side
+// (σ = (hi-lo)/6), so ~99.7% of raw samples already fall inside [lo, hi] and
+// the rest are clamped. Degenerate ranges (hi <= lo) collapse to `lo`, so
+// lo==hi stays a fixed value. Used to resolve a [lo,hi] `*timeout`/`*response`
+// MS range (not `*retry`, which stays uniform — it's a count).
+template <typename URBG>
+inline int RollIntInRangeGaussian(int lo, int hi, URBG&& g) {
+    if (hi <= lo) return lo;
+    double mean = (lo + hi) / 2.0;
+    double sigma = (hi - lo) / 6.0;
+    std::normal_distribution<double> dist(mean, sigma);
+    int v = static_cast<int>(std::lround(dist(std::forward<URBG>(g))));
+    return v < lo ? lo : (v > hi ? hi : v);
+}

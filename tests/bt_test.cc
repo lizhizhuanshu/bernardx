@@ -1015,6 +1015,67 @@ TEST_F(ScriptNodeIntegrationTest, ArgsBoolType) {
     EXPECT_EQ(status, "success");
 }
 
+TEST_F(ScriptNodeIntegrationTest, ResponseGateDelaysThenRechecksBeforeActing) {
+    // `*response` (human reaction latency): an action waits this long before
+    // running, then re-checks the injected condition; if it regressed during
+    // the delay the action is NOT performed (kFailure -> the Pipeline redoes
+    // the precondition). Driven directly with a controllable clock.
+    Blackboard bb;
+    BtEventQueue ev;
+
+    // (1) Regressed recheck blocks the action after the delay elapses.
+    auto a = std::make_unique<ScriptNode>(1, "a", "scripts/bt_module.lua");
+    a->SetActionResponse(50, 50);
+    auto recheck = std::make_shared<MockCondition>(NodeStatus::kSuccess);
+    a->SetRecheckCondition(recheck);
+    ASSERT_TRUE(AWAIT_BT(a->Init(rt->main_state(), rt.get())));
+    ev.BeginTick(0);
+    EXPECT_EQ(a->Tick(bb, ev), NodeStatus::kRunning);   // reacting (delayed)
+    ev.BeginTick(49);
+    EXPECT_EQ(a->Tick(bb, ev), NodeStatus::kRunning);   // still reacting
+    ev.BeginTick(50);
+    recheck->set_status(NodeStatus::kFailure);          // condition regressed mid-delay
+    EXPECT_EQ(a->Tick(bb, ev), NodeStatus::kFailure);   // do NOT perform the action
+    a->Reset();
+
+    // (2) Recheck still holds -> the action runs once the delay elapses.
+    auto b = std::make_unique<ScriptNode>(2, "b", "scripts/bt_module.lua");
+    b->SetActionResponse(50, 50);
+    auto recheck_ok = std::make_shared<MockCondition>(NodeStatus::kSuccess);
+    b->SetRecheckCondition(recheck_ok);
+    ASSERT_TRUE(AWAIT_BT(b->Init(rt->main_state(), rt.get())));
+    ev.BeginTick(0);
+    EXPECT_EQ(b->Tick(bb, ev), NodeStatus::kRunning);
+    ev.BeginTick(49);
+    EXPECT_EQ(b->Tick(bb, ev), NodeStatus::kRunning);
+    ev.BeginTick(50);
+    EXPECT_EQ(b->Tick(bb, ev), NodeStatus::kSuccess);   // gate passed -> enter+tick complete
+    b->Reset();
+
+    // (3) Backward compatible: response unset (0) -> acts immediately, no
+    //     added reaction delay.
+    auto c = std::make_unique<ScriptNode>(3, "c", "scripts/bt_module.lua");
+    ASSERT_TRUE(AWAIT_BT(c->Init(rt->main_state(), rt.get())));
+    ev.BeginTick(0);
+    EXPECT_EQ(c->Tick(bb, ev), NodeStatus::kSuccess);
+    c->Reset();
+}
+
+TEST_F(ScriptNodeIntegrationTest, ResponseRangeRollsWithinBounds) {
+    // A `*response` given as a [lo,hi] range is rolled (Gaussian) into a value
+    // inside the bounds: before `lo` it is still reacting, and by `hi` it must
+    // have proceeded — proving the rolled delay never exceeds the window.
+    Blackboard bb; BtEventQueue ev;
+    auto n = std::make_unique<ScriptNode>(1, "n", "scripts/bt_module.lua");
+    n->SetActionResponse(40, 160);  // rolled ∈ [40,160]
+    ASSERT_TRUE(AWAIT_BT(n->Init(rt->main_state(), rt.get())));
+    ev.BeginTick(0);
+    EXPECT_EQ(n->Tick(bb, ev), NodeStatus::kRunning);   // reacting
+    ev.BeginTick(160);                                  // at the high bound the delay must be over
+    EXPECT_NE(n->Tick(bb, ev), NodeStatus::kRunning);   // proceeded (this run's roll ≤ 160)
+    n->Reset();
+}
+
 TEST_F(ScriptNodeIntegrationTest, BooleanTickInWaitableNodePosition) {
     // 双模 Tick(与 ScriptCondition 同一契约):布尔/nil 返回在**可等待条件节点位**
     // (choose when / repeat until 的子节点)按 Lua 真值判定。cond_truthy(Tick→true)
@@ -3680,6 +3741,72 @@ TEST(PipelineTest, RangeRetryResolvesWithinBounds) {
     }
     EXPECT_EQ(seen_min, lo);
     EXPECT_EQ(seen_max, hi);
+}
+
+TEST(Roll, GaussianStaysInRangeAndCenters) {
+    // `RollIntInRangeGaussian` (used for `*timeout`/`*response` ranges) must
+    // stay inside [lo,hi], clump near the midpoint, and degenerate to a fixed
+    // value when lo==hi.
+    std::mt19937 rng(12345);
+    const int lo = 100, hi = 200;
+    int sum = 0, near_end = 0;
+    const int N = 2000;
+    for (int i = 0; i < N; ++i) {
+        int v = RollIntInRangeGaussian(lo, hi, rng);
+        ASSERT_GE(v, lo);
+        ASSERT_LE(v, hi);
+        sum += v;
+        if (v <= lo + 10 || v >= hi - 10) ++near_end;  // tail draws are rare
+    }
+    // Mean clumps near the midpoint (150), not at the uniform expectation.
+    EXPECT_NEAR(static_cast<double>(sum) / N, (lo + hi) / 2.0, 8.0);
+    // Tails are present but a minority (~<35%; far below uniform's 30%-past-±10).
+    EXPECT_LE(near_end, N * 0.45);
+    // Degenerate ranges are fixed values (collapses to `lo`).
+    EXPECT_EQ(RollIntInRangeGaussian(50, 50, rng), 50);
+}
+
+TEST(PipelineTest, GlobalDefaultsApplyWhenStepAndParamsUnset) {
+    // bt.init global ranges (`defaults`) are the bottom fallback in a Pipeline:
+    // a step carrying no `*timeout`/`*retry` and a node with no `params.*`
+    // inherits them into the pipeline defaults.
+    auto res = TreeParser::Parse(
+        R"({"type":"Pipeline","name":"p","children":[{"type":"Script","name":"a","source":"a.lua"}]})",
+        nlohmann::json::object(),
+        nlohmann::json{{"timeout", {100, 200}}, {"retry", 5}});
+    ASSERT_NE(nullptr, res.root);
+    auto* pipe = dynamic_cast<Pipeline*>(res.root.get());
+    ASSERT_NE(nullptr, pipe);
+    using EP = Pipeline::EdgeParam;
+    ASSERT_EQ(pipe->timeout_default().kind, EP::Kind::kRange);
+    EXPECT_EQ(pipe->timeout_default().lo, 100);
+    EXPECT_EQ(pipe->timeout_default().hi, 200);
+    ASSERT_EQ(pipe->retry_default().kind, EP::Kind::kFixed);
+    EXPECT_EQ(pipe->retry_default().lo, 5);
+
+    // Per-node `params.timeout` still wins over the global default.
+    auto res2 = TreeParser::Parse(
+        R"({"type":"Pipeline","name":"p","params":{"timeout":400},"children":[{"type":"Script","name":"a","source":"a.lua"}]})",
+        nlohmann::json::object(),
+        nlohmann::json{{"timeout", {100, 200}}, {"retry", 5}});
+    ASSERT_NE(nullptr, res2.root);
+    auto* pipe2 = dynamic_cast<Pipeline*>(res2.root.get());
+    ASSERT_NE(nullptr, pipe2);
+    ASSERT_EQ(pipe2->timeout_default().kind, EP::Kind::kFixed);
+    EXPECT_EQ(pipe2->timeout_default().lo, 400);
+}
+
+TEST(PipelineTest, GlobalDefaultsUnsetWithoutDefaults) {
+    // No bt.init defaults and no `params.*` -> the pipeline default stays the
+    // effective zero (kind kFixed, lo==0 = wait forever / no retry).
+    auto res = TreeParser::Parse(
+        R"({"type":"Pipeline","name":"p","children":[{"type":"Script","name":"a","source":"a.lua"}]})");
+    ASSERT_NE(nullptr, res.root);
+    auto* pipe = dynamic_cast<Pipeline*>(res.root.get());
+    ASSERT_NE(nullptr, pipe);
+    using EP = Pipeline::EdgeParam;
+    ASSERT_EQ(pipe->timeout_default().kind, EP::Kind::kFixed);
+    EXPECT_EQ(pipe->timeout_default().lo, 0);
 }
 
 // --- Node guard (condition) + interruption tests ---

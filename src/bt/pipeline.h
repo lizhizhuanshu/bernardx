@@ -161,6 +161,10 @@ public:
     // lazy per-run resolution.
     void SetDefaultTimeout(EdgeParam timeout) { def_timeout_ = std::move(timeout); }
     void SetDefaultRetry(EdgeParam retry) { def_retry_ = std::move(retry); }
+    // Read-only accessors (tests): the resolved pipeline-level defaults, after
+    // the params.timeout/retry or bt.init global-default fallback is applied.
+    const EdgeParam& timeout_default() const { return def_timeout_; }
+    const EdgeParam& retry_default() const { return def_retry_; }
 
     NodeStatus Tick(Blackboard& bb, BtEventQueue& events) override;
     void Reset() override;
@@ -204,7 +208,7 @@ private:
     // One resolved edge value -> int for this run: an integer, or a
     // {lo,hi} table -> a roll. -1 (logged) = unresolvable value.
     int FinishEdgeParam(const std::optional<LuaValue>& v, const EdgeParam& p,
-                        const char* what);
+                        const char* what, bool gaussian);
     // Cancel any in-flight edge-param provider resolves.
     void CancelPendingResolves();
     // Skip steps whose targets are already met. Returns false when the scan

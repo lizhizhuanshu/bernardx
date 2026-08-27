@@ -514,8 +514,8 @@ TEST(BtDslTreeParser, RegistryOptionReplacesEmbedded) {
     provider->Put("bt/registry.json",
                   R"json({"actions":{"run":{"source":"scripts/counter.lua"}},"conds":{}})json");
     auto res = AWAIT_DSL(TreeParser::LoadAndParse(
-        "res://bt/tree.bt", provider, nlohmann::json::object(), nullptr, nullptr,
-        "res://bt/registry.json"));
+        "res://bt/tree.bt", provider, nlohmann::json::object(),
+        nlohmann::json::object(), nullptr, nullptr, "res://bt/registry.json"));
     ASSERT_TRUE(res.error.empty()) << res.error;
     auto* pipe = dynamic_cast<Pipeline*>(res.root.get());
     ASSERT_NE(nullptr, pipe);

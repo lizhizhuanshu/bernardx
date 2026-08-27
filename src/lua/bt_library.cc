@@ -65,14 +65,17 @@ static async_simple::coro::Lazy<void> InitAsync(
     BehaviorTreeEngine::Ptr engine,
     std::string root_path,
     nlohmann::json root_params,
+    nlohmann::json defaults,
     std::shared_ptr<ResourceProvider> provider,
     bool trace_paths,
     uint64_t expected_generation,
     std::string registry_path) {
     // The engine's blackboard + main Lua state let Pipeline edge params carry
-    // "$key" blackboard references (read at parse time).
+    // "$key" blackboard references (read at parse time). `defaults` holds the
+    // bt.init global ranges for *timeout/*retry/*response handed to every
+    // Pipeline as its bottom-most fallback (below the pipeline `params.*`).
     auto parse_result = co_await TreeParser::LoadAndParse(
-        root_path, provider, std::move(root_params),
+        root_path, provider, std::move(root_params), std::move(defaults),
         engine->shared_blackboard(), rt->main_state(), std::move(registry_path));
     if (engine->generation() != expected_generation) {
         // Stopped mid-load; unblock the awaiter so it doesn't hang.
@@ -211,6 +214,30 @@ int bt_init(lua_State* L) {
     std::string registry_path = ReadStringOpt(L, 1, "registry");
     bool trace_paths = ReadBoolOpt(L, 1, "trace_paths", true);
 
+    // Global default ranges for `*timeout` / `*retry` / `*response`, applied
+    // as the BOTTOM fallback in every Pipeline/action when neither the step nor
+    // the pipeline `params.*` sets the value. Each is an int, a [lo,hi] integer
+    // array, or a "$key" string (shapes validated in TreeParser; bad shapes are
+    // left unset and the per-step/params value (or 0) applies).
+    nlohmann::json defaults = nlohmann::json::object();
+    {
+        auto read_default = [&](const char* name) {
+            lua_getfield(L, 1, name);
+            if (lua_isinteger(L, -1)) {
+                defaults[name] = lua_tointeger(L, -1);
+            } else if (lua_istable(L, -1)) {
+                defaults[name] = LuaToJson(L, -1);  // a [lo,hi] array
+            } else if (lua_isstring(L, -1)) {
+                defaults[name] = lua_tostring(L, -1);  // a "$key" ref
+            }
+            lua_pop(L, 1);
+        };
+        read_default("default_timeout");
+        read_default("default_retry");
+        read_default("default_response");
+    }
+    if (defaults.empty()) defaults = nlohmann::json::object();
+
     // params: optional table of template values forwarded into the root JSON by
     // substituting {{key}} placeholders (same rules as Subtree param forwarding).
     nlohmann::json root_params = nlohmann::json::object();
@@ -233,6 +260,7 @@ int bt_init(lua_State* L) {
     InitAsync(rt_ctx, handle, engine->shared_from_this(),
                std::move(root_path),
                std::move(root_params),
+               std::move(defaults),
                rt_ctx->shared_resource_provider(), trace_paths, gen,
                std::move(registry_path))
         .via(rt_ctx->executor())

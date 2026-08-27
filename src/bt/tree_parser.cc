@@ -56,6 +56,10 @@ struct ParseContext {
     std::set<std::string> resolving;              // subtree path cycle guard
     uint32_t next_id = 1;
     std::string error;
+    // bt.init global ranges for *timeout/*retry/*response — the bottom-most
+    // Pipeline default (below `params.<param>`), applied to every Pipeline/
+    // action in the tree. Empty = no global fallback.
+    nlohmann::json defaults;
 };
 
 void SetError(ParseContext& ctx, std::string msg) {
@@ -594,6 +598,26 @@ Pipeline::EdgeParam kUnsetEdgeParam() {
     return EP{EP::Kind::kFixed, -1, -1, {}};
 }
 
+// The bt.init global fallback for a Pipeline edge param (`timeout`/`retry`/
+// `response`): parse `ctx.defaults[key]` into an EdgeParam (same shapes as the
+// step forms — an int, a [lo,hi] array, or a "$key" string). Returns nullopt
+// either because the key is absent (no global fallback) or because it's
+// malformed (then `ctx.error` is set and the caller MUST fail the parse).
+std::optional<Pipeline::EdgeParam> GlobalDefaultEdgeParam(ParseContext& ctx,
+                                                          const char* key,
+                                                          const char* label) {
+    if (!ctx.defaults.is_object() || !ctx.defaults.contains(key)) {
+        return std::nullopt;
+    }
+    auto r = ParseEdgeSpec(ctx.defaults[key], label);
+    if (!r) {
+        SetError(ctx, std::string("global default '") + label +
+                          "' must be a number, a [lo,hi] array or a $key");
+        return std::nullopt;
+    }
+    return r;
+}
+
 // A scalar-or-range param value: an integer → {v, v} (RAW, no clamp — the
 // caller decides what -1 means); a 1-2 element integer array → a normalized,
 // negatives-clamped-to-0 range. nullopt on any other shape. Used by Wait
@@ -624,8 +648,17 @@ std::optional<std::pair<int, int>> ParseScalarOrRange(const json& v) {
 //   `*retry`   (int or [lo,hi])  — max re-runs of this step's action when
 //                                its target wait times out, AND after the
 //                                post-failure window (both paths share this
-//                                budget).
-// The two numeric params may be scalars or two-element arrays (uniformly
+//                                budget);
+//   `*response`(int or [lo,hi] MS) — human-like reaction latency applied to a
+//                                ScriptNode ACTION: before the action runs it
+//                                waits `*response` ms, then re-verifies the
+//                                preceding step's `*target` (injected) and its
+//                                own `when` still hold before acting; a regressed
+//                                condition → the action does NOT run (kFailure →
+//                                the Pipeline redoes the precondition). A
+//                                pipeline-level `params.response` default covers
+//                                every action child that sets none.
+// The two numeric params (timeout/retry) may be scalars or two-element arrays (uniformly
 // random in the inclusive range; resolved per step per run). A child's plain
 // `condition` keeps its usual node-guard meaning and is NOT the target. The
 // Pipeline node may itself be guarded, so nesting works.
@@ -638,6 +671,31 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParsePipeline(const json& j, Par
         SetError(ctx, "Pipeline node requires at least one child");
         co_return nullptr;
     }
+    // Pipeline-level `*response` default (params.response) applies to every
+    // action child that doesn't set its own; the bt.init global default is the
+    // next fallback. Resolved lazily per step (ranges rolled Gaussian at the
+    // leaf).
+    Pipeline::EdgeParam def_response = kUnsetEdgeParam();
+    if (j.contains("params") && j["params"].is_object() &&
+        j["params"].contains("response")) {
+        auto r = ParseEdgeSpec(j["params"]["response"], "params.response");
+        if (!r) {
+            SetError(ctx, "Pipeline 'params.response' must be a number, a [lo,hi] array or a $key");
+            co_return nullptr;
+        }
+        def_response = std::move(*r);
+    } else {
+        auto g = GlobalDefaultEdgeParam(ctx, "response", "params.response");
+        if (g) {
+            def_response = std::move(*g);
+        } else if (!ctx.error.empty()) {
+            co_return nullptr;  // malformed bt.init default_response
+        }
+    }
+    // The preceding step's `*target` is injected into the next action as its
+    // re-check condition (the condition whose achievement triggered this
+    // action). Step 0 has no predecessor -> no re-check.
+    std::shared_ptr<NodeCondition> prev_target;
     for (const auto& child_j : j["children"]) {
         if (!child_j.is_object()) {
             SetError(ctx, "Pipeline child must be a JSON object");
@@ -679,28 +737,74 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParsePipeline(const json& j, Par
             }
             retry = std::move(*r);
         }
+        // `*response` lives on the ACTION leaf (ScriptNode), not on the Step:
+        // it delays the action's initiation (human-like reaction latency) and,
+        // after the delay, re-checks the injected preceding `*target` + the
+        // action's own `when` before running. Wire it (plus the injected
+        // re-check) into direct-ScriptNode children here.
+        Pipeline::EdgeParam resp_step = kUnsetEdgeParam();
+        if (child_j.contains("*response")) {
+            auto r = ParseEdgeSpec(child_j["*response"], "*response");
+            if (!r) {
+                SetError(ctx, "Pipeline step '*response' must be a number, a [lo,hi] array or a $key");
+                co_return nullptr;
+            }
+            resp_step = std::move(*r);
+        }
+        if (auto* sn = dynamic_cast<ScriptNode*>(child.get())) {
+            const Pipeline::EdgeParam& re =
+                (resp_step.kind == Pipeline::EdgeParam::Kind::kFixed &&
+                 resp_step.lo < 0)
+                    ? def_response
+                    : resp_step;
+            if (re.kind == Pipeline::EdgeParam::Kind::kFixed) {
+                if (re.lo >= 0) sn->SetActionResponse(re.lo, re.lo);
+            } else if (re.kind == Pipeline::EdgeParam::Kind::kRange) {
+                sn->SetActionResponse(re.lo, re.hi);
+            } else {  // kBbRef: a $key reaction delay is unsupported; disable
+                spdlog::warn("Pipeline step '*response' as a $key is not supported "
+                             "(leaf-based delay); treating as 0");
+            }
+            if (prev_target) sn->SetRecheckCondition(prev_target);
+        }
         node->AddStep(std::move(child), std::move(target), std::move(timeout), std::move(retry));
+        prev_target = target;  // this step's *target gates the next step's action
     }
 
-    // Pipeline-level defaults: params.timeout / params.retry apply to steps
-    // that don't declare their own. Same spec forms, same lazy resolution.
-    if (j.contains("params") && j["params"].is_object()) {
-        if (j["params"].contains("timeout")) {
-            auto r = ParseEdgeSpec(j["params"]["timeout"], "params.timeout");
+    // Pipeline-level defaults: step `*X` > params.X > bt.init global default.
+    // params.timeout/params.retry (or the global ranges when absent) apply to
+    // steps that don't declare their own. Same spec forms, same lazy resolution.
+    const json params_obj =
+        (j.contains("params") && j["params"].is_object()) ? j["params"]
+                                                          : json::object();
+    auto apply_default = [&](const char* pkey, const char* label, auto setter) -> bool {
+        if (params_obj.is_object() && params_obj.contains(pkey)) {
+            auto r = ParseEdgeSpec(params_obj[pkey], label);
             if (!r) {
-                SetError(ctx, "Pipeline 'params.timeout' must be a number, a [lo,hi] array or a $key");
-                co_return nullptr;
+                SetError(ctx, std::string("Pipeline '") + label +
+                                  "' must be a number, a [lo,hi] array or a $key");
+                return false;
             }
-            node->SetDefaultTimeout(std::move(*r));
+            setter(std::move(*r));
+            return true;
         }
-        if (j["params"].contains("retry")) {
-            auto r = ParseEdgeSpec(j["params"]["retry"], "params.retry");
-            if (!r) {
-                SetError(ctx, "Pipeline 'params.retry' must be a number, a [lo,hi] array or a $key");
-                co_return nullptr;
-            }
-            node->SetDefaultRetry(std::move(*r));
+        auto g = GlobalDefaultEdgeParam(ctx, pkey, label);
+        if (g) {
+            setter(std::move(*g));
+        } else if (!ctx.error.empty()) {
+            return false;  // malformed bt.init default
         }
+        return true;
+    };
+    // `json` may be an empty object when the node has no `params`; the helpers
+    // above handle that (GlobalDefaultEdgeParam still applies).
+    if (!apply_default("timeout", "params.timeout",
+                       [&](Pipeline::EdgeParam e) { node->SetDefaultTimeout(std::move(e)); })) {
+        co_return nullptr;
+    }
+    if (!apply_default("retry", "params.retry",
+                       [&](Pipeline::EdgeParam e) { node->SetDefaultRetry(std::move(e)); })) {
+        co_return nullptr;
     }
 
     if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
@@ -1114,6 +1218,7 @@ async_simple::coro::Lazy<ParseResult>
 TreeParser::LoadAndParse(const std::string& root_path,
                          std::shared_ptr<ResourceProvider> provider,
                          nlohmann::json params,
+                         nlohmann::json defaults,
                          std::shared_ptr<Blackboard> blackboard,
                          lua_State* L,
                          std::string registry_path) {
@@ -1164,6 +1269,7 @@ TreeParser::LoadAndParse(const std::string& root_path,
 
     ParseContext ctx;
     ctx.provider = provider;
+    ctx.defaults = std::move(defaults);
 
     auto root = co_await ParseNode(root_j, ctx);
     if (!root) {
@@ -1176,6 +1282,7 @@ TreeParser::LoadAndParse(const std::string& root_path,
 }
 
 ParseResult TreeParser::Parse(const std::string& root_json, nlohmann::json params,
+                              nlohmann::json defaults,
                               std::shared_ptr<Blackboard> blackboard) {
     ParseResult result;
     json root_j;
@@ -1201,6 +1308,7 @@ ParseResult TreeParser::Parse(const std::string& root_json, nlohmann::json param
     ApplyDataResolution(root_j);
 
     ParseContext ctx;  // no provider -> Subtree nodes unsupported
+    ctx.defaults = std::move(defaults);
     auto root = async_simple::coro::syncAwait(ParseNode(root_j, ctx));
     if (!root) {
         result.error = ctx.error.empty() ? "failed to parse tree" : ctx.error;

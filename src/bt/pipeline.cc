@@ -48,7 +48,7 @@ async_simple::coro::Lazy<bool> Pipeline::Init(lua_State* L, LuaRuntime* ctx) {
 // {lo,hi} table rolls. Returns -1 with an error log when the value can't
 // be used (the caller treats -1 as 0 = wait forever / no retry).
 int Pipeline::FinishEdgeParam(const std::optional<LuaValue>& v,
-                              const EdgeParam& p, const char* what) {
+                              const EdgeParam& p, const char* what, bool gaussian) {
     if (!v.has_value()) {
         spdlog::error("Pipeline '{}': {} blackboard key '{}' not set",
                       name(), what, p.key);
@@ -81,8 +81,10 @@ int Pipeline::FinishEdgeParam(const std::optional<LuaValue>& v,
                     int lo = *nums[0], hi = nums[1].value_or(lo);
                     if (lo < 0) lo = 0;
                     if (hi < 0) hi = 0;
-                    return lo <= hi ? RollIntInRange(lo, hi, rng_)
-                                    : RollIntInRange(hi, lo, rng_);
+                    return gaussian ? (lo <= hi ? RollIntInRangeGaussian(lo, hi, rng_)
+                                                : RollIntInRangeGaussian(hi, lo, rng_))
+                                    : (lo <= hi ? RollIntInRange(lo, hi, rng_)
+                                                : RollIntInRange(hi, lo, rng_));
                 }
             } else {
                 lua_pop(L, 1);
@@ -112,7 +114,7 @@ void Pipeline::CancelPendingResolves() {
 bool Pipeline::ResolveStepBudgets(Blackboard& bb, size_t i) {
     bool in_flight = false;
     auto resolve = [&](const EdgeParam& e, const EdgeParam& def, const char* what,
-                       int& cur, PendingValue& pend) {
+                       int& cur, PendingValue& pend, bool gaussian) {
         if (cur >= 0) return;  // already resolved this run
         const EdgeParam& p =
             (e.kind == EdgeParam::Kind::kFixed && e.lo < 0) ? def : e;
@@ -121,17 +123,20 @@ bool Pipeline::ResolveStepBudgets(Blackboard& bb, size_t i) {
             return;
         }
         if (p.kind == EdgeParam::Kind::kRange) {
-            cur = RollIntInRange(p.lo, p.hi, rng_);
+            // *timeout is a human-like reaction window -> Gaussian clumping at
+            // the midpoint; *retry is a count and stays uniform.
+            cur = gaussian ? RollIntInRangeGaussian(p.lo, p.hi, rng_)
+                           : RollIntInRange(p.lo, p.hi, rng_);
             return;
         }
         // kBbRef: read the blackboard fresh for this run.
         auto look = bb.Lookup(p.key);
         switch (look.kind) {
         case BbReadResult::Kind::kValue:
-            cur = FinishEdgeParam(std::move(look.value), p, what);
+            cur = FinishEdgeParam(std::move(look.value), p, what, gaussian);
             break;
         case BbReadResult::Kind::kMissing:
-            cur = FinishEdgeParam(std::nullopt, p, what);
+            cur = FinishEdgeParam(std::nullopt, p, what, gaussian);
             break;
         case BbReadResult::Kind::kProvider: {
             if (!lua_ctx_) {
@@ -156,7 +161,7 @@ bool Pipeline::ResolveStepBudgets(Blackboard& bb, size_t i) {
                 in_flight = true;
             } else {
                 // Synchronous provider completion: the callback fired.
-                int done = FinishEdgeParam(pend.value, pend.src, pend.what);
+                int done = FinishEdgeParam(pend.value, pend.src, pend.what, gaussian);
                 pend = {};
                 cur = done < 0 ? 0 : done;
             }
@@ -166,9 +171,9 @@ bool Pipeline::ResolveStepBudgets(Blackboard& bb, size_t i) {
         if (cur < 0) cur = 0;  // failed ref = wait forever / no retry
     };
     resolve(steps_[i].timeout, def_timeout_, "*timeout", cur_timeout_[i],
-            resolve_timeout_);
+            resolve_timeout_, /*gaussian=*/true);
     resolve(steps_[i].retry, def_retry_, "*retry", cur_retry_[i],
-            resolve_retry_);
+            resolve_retry_, /*gaussian=*/false);
     if (in_flight) {
         phase_ = Phase::kResolve;
         return false;
@@ -397,13 +402,13 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
             const size_t i = current_child_index_;
             if (resolve_timeout_.co != nullptr) {
                 int t = FinishEdgeParam(resolve_timeout_.value, resolve_timeout_.src,
-                                        resolve_timeout_.what);
+                                        resolve_timeout_.what, /*gaussian=*/true);
                 cur_timeout_[i] = t < 0 ? 0 : t;
                 resolve_timeout_ = {};
             }
             if (resolve_retry_.co != nullptr) {
                 int r = FinishEdgeParam(resolve_retry_.value, resolve_retry_.src,
-                                        resolve_retry_.what);
+                                        resolve_retry_.what, /*gaussian=*/false);
                 cur_retry_[i] = r < 0 ? 0 : r;
                 resolve_retry_ = {};
             }

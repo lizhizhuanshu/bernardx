@@ -30,6 +30,22 @@ public:
 
     const std::string& script_path() const { return script_path_; }
 
+    // `*response` (human-like reaction latency, ms): waits this long BEFORE
+    // performing the action on its first tick, then re-checks (see
+    // SetRecheckCondition) that the triggering condition still holds before
+    // actually running. lo==hi fixes the value; lo<hi rolls [lo,hi] per run.
+    // Unset (0,0) = no delay (fully backward compatible).
+    void SetActionResponse(int lo, int hi);
+
+    // External condition (the Pipeline injects the PRECEDING step's `*target`)
+    // re-checked after the `*response` delay. If it (or this action's own
+    // `when` guard) no longer holds when the delay elapses, the action does
+    // NOT run and Tick returns kFailure so the Pipeline re-verifies/redoes the
+    // regressed precondition. null = no re-check (still delays when set).
+    void SetRecheckCondition(std::shared_ptr<NodeCondition> c) {
+        recheck_ = std::move(c);
+    }
+
     async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx) override;
 
     bool is_loaded() const { return host_.is_loaded(); }
@@ -63,6 +79,20 @@ private:
     std::string script_path_;
     nlohmann::json params_json_;
     ArgsMap args_;
+
+    // `*response` reaction-latency gate (see SetActionResponse). Fixed value or
+    // [lo,hi] rolled once per run; cur_response_ms_ is the resolved value for
+    // this run (-1 = unresolved). The delay is consumed the first time the
+    // node is ticked for a given run; recheck_ (the Pipeline-injected preceding
+    // step `*target`) plus this node's own `when` guard are re-verified before
+    // the action actually runs.
+    int response_lo_ms_ = 0;
+    int response_hi_ms_ = 0;
+    std::mt19937 rng_{std::random_device{}()};
+    int cur_response_ms_ = -1;       // resolved per run; -1 = not yet resolved
+    bool response_waiting_ = false;  // a response delay is in progress
+    int64_t response_wait_start_ms_ = 0;
+    std::shared_ptr<NodeCondition> recheck_;  // injected preceding step `*target`
     // Param values that begin with `$` (a blackboard reference). Not in args_;
     // resolved against the blackboard on each Enter. Keyed by the param name.
     std::unordered_map<std::string, BbParamRef> bb_refs_;

@@ -82,6 +82,14 @@ async_simple::coro::Lazy<bool> ScriptNode::Init(lua_State* L, LuaRuntime* ctx) {
         }
         params_json_ = nlohmann::json::object();  // release raw JSON
     }
+    // The injected re-check condition (the Pipeline's preceding step `*target`)
+    // shares the pipeline's own Init, but init here too for standalone use; the
+    // call is idempotent and the pipeline's copy of the same object re-covers it.
+    if (recheck_ != nullptr && !co_await recheck_->Init(L, ctx)) {
+        set_last_error("'" + name() + "': recheck condition init failed: " +
+                       recheck_->last_error());
+        co_return false;
+    }
     co_return true;
 }
 
@@ -250,6 +258,40 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
         return NodeStatus::kFailure;
     }
 
+    // Human-like reaction latency before performing THIS action: wait
+    // `*response` ms, then re-verify the triggering condition still holds
+    // before actually running. Re-check = (the Pipeline-injected preceding
+    // step `*target`) AND (this action's own `when` guard). If either regressed
+    // during the delay, don't act: return kFailure so the Pipeline re-verifies
+    // and redoes the regressed precondition (via the action-failure ->
+    // OnWaitTimeout path) instead of blindly performing a stale action. The
+    // built-in per-tick guard (TickAndRecord) already re-checks `condition_`
+    // every tick, so the own-`when` check below is a belt-and-suspenders pass.
+    if (!active_ && cur_response_ms_ != 0) {
+        if (cur_response_ms_ < 0) {  // first tick of this run: resolve fixed / roll range
+            cur_response_ms_ =
+                (response_lo_ms_ >= 0 && response_hi_ms_ >= response_lo_ms_)
+                    ? RollIntInRangeGaussian(response_lo_ms_, response_hi_ms_, rng_)
+                    : 0;
+        }
+        if (!response_waiting_) {
+            response_waiting_ = true;
+            response_wait_start_ms_ = events.now_ms();
+        }
+        if (cur_response_ms_ > 0 &&
+            events.now_ms() - response_wait_start_ms_ < cur_response_ms_)
+            return NodeStatus::kRunning;  // still reacting
+        response_waiting_ = false;
+        if (recheck_ != nullptr) {
+            NodeStatus rc = recheck_->Eval(bb, events);
+            if (rc == NodeStatus::kRunning) rc = recheck_->last_terminal();
+            if (rc != NodeStatus::kSuccess) return NodeStatus::kFailure;
+        }
+        if (condition_ != nullptr && GuardStatus(bb, events) != NodeStatus::kSuccess)
+            return NodeStatus::kFailure;
+        cur_response_ms_ = 0;  // gate passed; no further delay for this run
+    }
+
     // Check if a yielded call has completed
     if (yielded_co_ != nullptr) {
         if (!has_result_) {
@@ -332,6 +374,11 @@ NodeStatus ScriptNode::Tick(Blackboard& bb, BtEventQueue& events) {
     return HandleScriptResult(result_);
 }
 
+void ScriptNode::SetActionResponse(int lo, int hi) {
+    response_lo_ms_ = lo < 0 ? 0 : lo;
+    response_hi_ms_ = hi < lo ? response_lo_ms_ : hi;
+}
+
 void ScriptNode::Reset() {
     if (yielded_co_ != nullptr) {
         host_.lua_context_->CancelCall(yielded_co_);
@@ -346,6 +393,11 @@ void ScriptNode::Reset() {
         LuaCallMethod(host_.main_L_, host_.refs_.exit_ref, host_.refs_.table_ref, 1);
     }
     active_ = false;
+    // Re-arm the `*response` gate for the next run (re-roll ranges, clear the
+    // in-flight reaction wait). recheck_ intentionally NOT touched — it shares
+    // the Pipeline's preceding-step target, which the pipeline owns.
+    cur_response_ms_ = -1;
+    response_waiting_ = false;
     Leaf::Reset();
 }
 
@@ -368,5 +420,7 @@ void ScriptNode::OnAborted() {
         }
     }
     active_ = false;
+    cur_response_ms_ = -1;
+    response_waiting_ = false;
     Leaf::OnAborted();
 }
