@@ -234,6 +234,7 @@ bool Pipeline::EvaluateTargetAborts(Blackboard& bb, BtEventQueue& events) {
             retries_used_[i] = 0;
             cur_timeout_[i] = -1;
             cur_retry_[i] = -1;
+            pending_action_error_.clear();  // older step's failure no longer pending
             phase_ = Phase::kAct;
             preempted = true;
         }
@@ -322,6 +323,7 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
                 if (!ResolveStepBudgets(bb, current_child_index_)) {
                     return NodeStatus::kRunning;
                 }
+                last_action_failed_ = false;  // target met preempted the action
                 phase_ = Phase::kWait;  // the wait below advances this tick
                 wait_start_ms_ = events.now_ms();
                 continue;  // fall into the wait with the target already met
@@ -330,10 +332,41 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
             NodeStatus s = children_[current_child_index_]->TickAndRecord(bb, events);
             if (s == NodeStatus::kRunning) return NodeStatus::kRunning;
             if (s == NodeStatus::kFailure) {
-                if (!children_[current_child_index_]->last_error().empty()) {
-                    set_last_error(children_[current_child_index_]->last_error());
+                // Two Failure sources — guard short-circuit (TickAndRecord
+                // aborted the action because its abort=Self condition
+                // flipped Failure) vs the action's own Tick returning
+                // Failure. The node's last_tick_was_guard bit discriminates.
+                if (children_[current_child_index_]->last_tick_was_guard()) {
+                    // Guard-failure path: re-evaluate the guard every tick;
+                    // on guard Success re-tick the action the same tick; on
+                    // guard sustained Failure for *timeout ms → Pipeline
+                    // failure. No *retry budget consumed (a guard loss is
+                    // an environmental change, not a step-internal retry).
+                    if (!ResolveStepBudgets(bb, current_child_index_)) {
+                        return NodeStatus::kRunning;  // $key provider still resolving
+                    }
+                    phase_ = Phase::kWaitGuard;
+                    wait_start_ms_ = events.now_ms();
+                    return NodeStatus::kRunning;  // first guard-wait tick
                 }
-                return NodeStatus::kFailure;
+                // Action-failure path: post-failure wait sharing the
+                // *timeout/*retry budget with target-not-met. The *target is
+                // still evaluated every tick (a failed action's side effects
+                // may have met it); for a bare step (no *target) a failed
+                // action reads as not-complete, so it always re-runs or fails
+                // OnWaitTimeout. last_action_failed_ is set BEFORE budget
+                // resolve so it survives a kResolve park.
+                if (!children_[current_child_index_]->last_error().empty()) {
+                    pending_action_error_ =
+                        children_[current_child_index_]->last_error();
+                }
+                last_action_failed_ = true;
+                if (!ResolveStepBudgets(bb, current_child_index_)) {
+                    return NodeStatus::kRunning;
+                }
+                phase_ = Phase::kWait;
+                wait_start_ms_ = events.now_ms();
+                return NodeStatus::kRunning;  // first post-failure tick
             }
             // Action done → wait for this step's target (absent target: met).
             // Budgets first (a provider-backed `$key` resolve parks in
@@ -342,6 +375,11 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
             if (!ResolveStepBudgets(bb, current_child_index_)) {
                 return NodeStatus::kRunning;
             }
+            // If the previous action run failed and we're here because the
+            // retry succeeded, drop the stale error — it's no longer the
+            // pending failure.
+            pending_action_error_.clear();
+            last_action_failed_ = false;  // this action run succeeded
             phase_ = Phase::kWait;
             wait_start_ms_ = events.now_ms();
             // fall through to the wait this tick
@@ -374,38 +412,135 @@ NodeStatus Pipeline::Tick(Blackboard& bb, BtEventQueue& events) {
             // fall through to the wait this tick
         }
 
-        // phase == kWait (only entered after this step's action ran):
-        // evaluate the current step's target.
-        NodeStatus s = EvalTarget(bb, events, current_child_index_);
-        if (s == NodeStatus::kSuccess) {
-            // Target met -> advance past this step and re-scan (skip any
-            // later steps whose targets already hold).
-            ++current_child_index_;
-            if (current_child_index_ >= n) return NodeStatus::kSuccess;
-            phase_ = Phase::kScan;
-            continue;  // scan (and possibly act) this tick
+        // phase == kWait: entered after this step's action ran — whether it
+        // returned Success or Failure (last_action_failed_). Eval the current
+        // step's *target EVERY tick: a "failed" action may still have
+        // produced the target as a side effect, so it's checked the same way
+        // as a successful one. One difference matters for bare steps (no
+        // *target): EvalTarget treats an absent target as met (action
+        // completion IS the target), which is right after a Success but
+        // wrong after a Failure — a failed action is emphatically not
+        // complete, so it must re-run (via OnWaitTimeout) rather than advance.
+        if (phase_ == Phase::kWait) {
+            NodeStatus s;
+            if (last_action_failed_ &&
+                steps_[current_child_index_].target == nullptr) {
+                s = NodeStatus::kFailure;  // failed bare action: not complete
+            } else {
+                s = EvalTarget(bb, events, current_child_index_);
+            }
+            if (s == NodeStatus::kSuccess) {
+                // Target met (possibly by a failed run's side effects) ->
+                // advance past this step and re-scan. The step's pending
+                // failure no longer matters: the goal is achieved.
+                pending_action_error_.clear();
+                ++current_child_index_;
+                if (current_child_index_ >= n) return NodeStatus::kSuccess;
+                phase_ = Phase::kScan;
+                continue;  // scan (and possibly act) this tick
+            }
+            // Running or Failure → target not yet met; check the wall-clock budget.
+            int timeout = cur_timeout_[current_child_index_];
+            if (timeout > 0 && events.now_ms() - wait_start_ms_ >= timeout) {
+                return OnWaitTimeout(bb, events);
+            }
+            return NodeStatus::kRunning;
         }
-        // Running or Failure → target not yet met; check the wall-clock budget.
-        int timeout = cur_timeout_[current_child_index_];
-        if (timeout > 0 && events.now_ms() - wait_start_ms_ >= timeout) {
-            return OnWaitTimeout();
+
+        // phase == kWaitGuard: the node's guard (abort=Self condition)
+        // short-circuited mid-action. Re-evaluate the guard every tick
+        // via Node::GuardStatus (stale-while-running). Guard Success →
+        // fall back to kAct and re-tick the action the same tick (NO
+        // child Reset — the action's pre-abort state is preserved).
+        // Guard held Failure for *timeout ms → Pipeline failure
+        // (no OnWaitTimeout, no *retry consumed, no child Reset).
+        if (phase_ == Phase::kWaitGuard) {
+            NodeStatus g =
+                children_[current_child_index_]->GuardStatus(bb, events);
+            if (g == NodeStatus::kSuccess) {
+                // Guard recovered: re-tick the action this tick. The
+                // action's is_running_/last_tick_status_ were cleared by
+                // the TickAndRecord short-circuit that brought us here, so
+                // the next Tick runs fresh.
+                phase_ = Phase::kAct;
+                continue;  // fall into kAct in this Tick() loop
+            }
+            int timeout = cur_timeout_[current_child_index_];
+            if (timeout > 0 && events.now_ms() - wait_start_ms_ >= timeout) {
+                // Guard held Failure for the full window — fail the
+                // pipeline. No action error to surface (the action itself
+                // never returned Failure; the guard did).
+                const size_t i = current_child_index_;
+                std::string msg = "Pipeline '" + name() + "': step " +
+                                  std::to_string(i) +
+                                  " guard held Failure for " +
+                                  std::to_string(timeout) + "ms";
+                set_last_error(std::move(msg));
+                return NodeStatus::kFailure;
+            }
+            return NodeStatus::kRunning;
         }
-        return NodeStatus::kRunning;
     }
 }
 
-NodeStatus Pipeline::OnWaitTimeout() {
+NodeStatus Pipeline::OnWaitTimeout(Blackboard& bb, BtEventQueue& events) {
     const size_t i = current_child_index_;
+
+    // React to a regressed PRECONDITION before retrying. Each step's *target
+    // is the NEXT step's condition (the pipeline only reached this step
+    // because it held). Its first run is safe — the condition was just
+    // verified to advance — but before re-running the action on a retry we
+    // must confirm the precondition still holds. Walk the prefix from the
+    // nearest predecessor backwards and, if any step's target no longer holds,
+    // redo that step (its own re-run + re-scan will re-establish the whole
+    // chain) instead of blindly retrying against a gone precondition. This is
+    // unconditional on the target's `abort` mode — `abort=LowerPriority` only
+    // additionally enables the per-tick reactive version (EvaluateTargetAborts
+    // resets `current` before this runs, so that path is never re-taken here).
+    for (size_t p = i; p > 0; --p) {
+        NodeCondition* t = steps_[p - 1].target.get();
+        if (t == nullptr) continue;  // bare predecessor: no condition to re-establish
+        if (EffectiveTarget(*t, bb, events) != NodeStatus::kSuccess) {
+            size_t redo = p - 1;
+            spdlog::info("Pipeline '{}': step {} precondition regressed "
+                         "(met->unmet), redoing step {} before retrying step {}",
+                         name(), redo, redo, i);
+            // Abandon the current step's stale wait state and re-enter the
+            // regressed predecessor: fresh act phase, fresh budgets. The redo
+            // is not charged against the current step's *retry counter.
+            CancelPendingResolves();
+            children_[i]->Reset();
+            children_[redo]->Reset();
+            current_child_index_ = redo;
+            retries_used_[redo] = 0;
+            cur_timeout_[redo] = -1;
+            cur_retry_[redo] = -1;
+            pending_action_error_.clear();
+            last_action_failed_ = false;
+            phase_ = Phase::kAct;
+            return NodeStatus::kRunning;
+        }
+    }
+
     // Retry budget exhausted (cur_retry_[i] is resolved: we entered this wait
-    // window first) → the step's target never came.
+    // window first) → the step's target never came, OR the action kept
+    // returning failure across all retries.
     if (retries_used_[i] >= cur_retry_[i]) {
-        set_last_error("Pipeline '" + name() + "': step " + std::to_string(i) +
-                       " target not met after action + retries");
+        std::string msg = "Pipeline '" + name() + "': step " +
+                          std::to_string(i) +
+                          (pending_action_error_.empty()
+                               ? std::string(" target not met after action + retries")
+                               : std::string(" failed after retries: ") + pending_action_error_);
+        set_last_error(std::move(msg));
+        pending_action_error_.clear();
         return NodeStatus::kFailure;
     }
 
     // Re-run this step's action, then wait for its target again (with a
-    // fresh ms budget) on subsequent ticks.
+    // fresh ms budget) on subsequent ticks. The next action run may fail
+    // again — in which case kAct will re-enter kWait with last_action_failed_
+    // set afresh (the retry counter is what actually limits attempts; the
+    // error gets re-captured then).
     ++retries_used_[i];
     children_[i]->Reset();
     phase_ = Phase::kAct;
@@ -421,6 +556,8 @@ void Pipeline::Reset() {
     std::fill(cur_timeout_.begin(), cur_timeout_.end(), -1);  // re-roll next run
     std::fill(cur_retry_.begin(), cur_retry_.end(), -1);
     std::fill(target_prev_.begin(), target_prev_.end(), NodeStatus::kFailure);
+    pending_action_error_.clear();
+    last_action_failed_ = false;
     for (auto& step : steps_) {
         if (step.target) step.target->Reset();
     }
@@ -435,5 +572,7 @@ void Pipeline::OnAborted() {
     std::fill(cur_timeout_.begin(), cur_timeout_.end(), -1);
     std::fill(cur_retry_.begin(), cur_retry_.end(), -1);
     std::fill(target_prev_.begin(), target_prev_.end(), NodeStatus::kFailure);
+    pending_action_error_.clear();
+    last_action_failed_ = false;
     Composite::OnAborted();
 }

@@ -617,9 +617,14 @@ std::optional<std::pair<int, int>> ParseScalarOrRange(const json& v) {
 //                                target already holds is SKIPPED. Absent =
 //                                the action completing IS the target;
 //   `*timeout` (int or [lo,hi] MS) — ms to wait for this step's target after
-//                                the action ran (0 / absent = wait forever);
+//                                the action ran, AND ms to wait after the
+//                                action returns Failure (post-failure window;
+//                                *target still evaluated every tick in both) (0
+//                                / absent = wait forever in BOTH cases);
 //   `*retry`   (int or [lo,hi])  — max re-runs of this step's action when
-//                                its target wait times out.
+//                                its target wait times out, AND after the
+//                                post-failure window (both paths share this
+//                                budget).
 // The two numeric params may be scalars or two-element arrays (uniformly
 // random in the inclusive range; resolved per step per run). A child's plain
 // `condition` keeps its usual node-guard meaning and is NOT the target. The

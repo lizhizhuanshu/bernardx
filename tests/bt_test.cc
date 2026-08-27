@@ -3526,12 +3526,20 @@ TEST(PipelineTest, RunningTargetHoldsPipeline) {
     EXPECT_EQ(a->tick_count, 1);
 }
 
-TEST(PipelineTest, ChildFailureFailsPipeline) {
+TEST(PipelineTest, ChildFailureEntersWaitFailAndFails) {
+    // Action failure alone no longer fails the pipeline: it enters the
+    // post-failure wait window (post-failure kWait) and consumes the *timeout/*retry
+    // budget. With a short timeout and no retry the pipeline still ends in
+    // Failure, but only AFTER the wait window elapses.
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kFailure);
-    pipe.AddChild(std::unique_ptr<MockNode>(a));
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr, /*timeout_ms=*/20, /*retry=*/0);
     Blackboard bb; BtEventQueue ev;
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a failed -> post-failure kWait
+    EXPECT_EQ(a->tick_count, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // 20ms wait -> no retry -> fail
+    EXPECT_FALSE(pipe.last_error().empty());
 }
 
 TEST(PipelineTest, ResetReScans) {
@@ -3727,11 +3735,14 @@ TEST(NodeGuardTest, AsyncRunningUsesLastResult) {
 TEST(PipelineTest, GuardInterruptsActionWhenConditionLost) {
     // With abort=Self on the step's (node-level guard) condition, while the
     // action runs the guard is monitored; if the page is lost (Failure) the
-    // action is aborted and the step fails. The guard is the child's plain
-    // `condition`, NOT its *target.
+    // action is aborted (TickAndRecord short-circuits to kFailure) and the
+    // step enters the kWaitGuard wait window. The pipeline re-evaluates
+    // the guard every tick: if it stays Failure for *timeout ms, Pipeline
+    // fails. *retry budget is NOT consumed (a guard loss is an
+    // environmental change, not a step-internal retry).
     Pipeline pipe(1, "pipe");
     auto* a0 = new MockNode(2, "a0", NodeStatus::kRunning);
-    pipe.AddStep(std::unique_ptr<MockNode>(a0), nullptr, 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a0), nullptr, /*timeout_ms=*/20, /*retry=*/0);
     auto* cond0 = new MockCondition(NodeStatus::kSuccess);
     cond0->set_abort(AbortMode::kSelf);
     pipe.children()[0]->SetCondition(std::shared_ptr<MockCondition>(cond0));
@@ -3739,8 +3750,11 @@ TEST(PipelineTest, GuardInterruptsActionWhenConditionLost) {
     EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 running under its guard
     EXPECT_FALSE(a0->aborted);
     cond0->set_status(NodeStatus::kFailure);             // page lost
-    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // guard interrupts a0 -> step fails
-    EXPECT_TRUE(a0->aborted);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // guard interrupts a0 -> kWaitGuard
+    EXPECT_TRUE(a0->aborted);   // the action WAS cut short
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // 20ms wait -> guard held -> fail
+    EXPECT_NE(pipe.last_error().find("guard held Failure"), std::string::npos);
 }
 
 // --- Pipeline *target reactive abort tests ---
@@ -3861,6 +3875,406 @@ TEST(PipelineTest, TargetLowerPriorityPreemptsOnRegression) {
     int a0_before = a0->total_ticks();
     EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
     EXPECT_GT(a0->total_ticks(), a0_before);  // a0 re-ran
+}
+
+TEST(PipelineTest, RetryRedoesRegressedPrecondition) {
+    // A default (abort=None) *target on step 0 still doubles as step 1's
+    // precondition. When step 1's action fails and its post-failure wait
+    // times out, OnWaitTimeout re-verifies step 0's target BEFORE re-running
+    // step 1's action: a regressed precondition bounces back to redo step 0
+    // instead of blindly retrying step 1 against a gone precondition. (The
+    // LowerPriority variant is covered by TargetLowerPriorityPreemptsOnRegression;
+    // this is the unconditional-fallback behavior independent of the abort mode.)
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new CountingMockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new CountingMockNode(3, "a1", NodeStatus::kFailure);
+    auto* t0 = new MockCondition(NodeStatus::kFailure);  // default abort: kNone
+    pipe.AddStep(std::unique_ptr<MockNode>(a0),
+                 std::shared_ptr<MockCondition>(t0), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1), nullptr,
+                 /*timeout_ms=*/20, /*retry=*/1);
+    Blackboard bb; BtEventQueue ev;
+
+    // a0 runs (t0 unmet), succeeds, waits t0 forever (timeout 0).
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    EXPECT_EQ(a0->total_ticks(), 1);
+    EXPECT_EQ(a1->total_ticks(), 0);
+
+    t0->set_status(NodeStatus::kSuccess);  // t0 met → advance to step 1
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a1 ran, failed → post-failure kWait
+    EXPECT_EQ(a1->total_ticks(), 1);
+
+    t0->set_status(NodeStatus::kFailure);  // step 0 regressed during step 1's wait
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));  // exceed the 20ms wait
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // OnWaitTimeout: redo step 0 (not a1's retry)
+
+    // OnWaitTimeout chose the regressed-precondition branch: step 0 re-runs
+    // (a0's accumulated count survives its Reset) …
+    int a0_before = a0->total_ticks();
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    EXPECT_GT(a0->total_ticks(), a0_before);  // a0 re-ran
+    // … while step 1's action was NOT re-run in place (still 1, pending step 0).
+    EXPECT_EQ(a1->total_ticks(), 1);
+
+    // Once step 0's condition is restored, the pipeline re-establishes it and
+    // returns to step 1 via the normal scan-forward.
+    t0->set_status(NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    EXPECT_EQ(a1->total_ticks(), 2);
+}
+
+// --- Action failure semantics tests ---
+//
+// Pipeline's action-failure path: the action returning kFailure no longer
+// fails the pipeline immediately. Instead the pipeline enters the
+// post-failure wait window (post-failure kWait) — the SAME *timeout/*retry budget as a
+// target-not-met, but target eval is suspended for the full wait. After the
+// budget elapses OnWaitTimeout either re-runs the action (using a retry
+// count) or surfaces the preserved action error as the pipeline failure.
+
+TEST(PipelineTest, ActionFailureRetriesAndSucceeds) {
+    // Action fails the first time, succeeds the second — pipeline succeeds.
+    // The preserved error from the failed run must be dropped once the
+    // retry succeeds. CountingMockNode so the tick count survives the
+    // retry's child Reset().
+    Pipeline pipe(1, "pipe");
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kFailure);
+    a->set_last_error("transient: backend 503");
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 /*timeout_ms=*/20, /*retry=*/1);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a failed -> post-failure kWait
+    EXPECT_EQ(a->total_ticks(), 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // OnWaitTimeout: re-run queued
+    a->set_status(NodeStatus::kSuccess);          // pretend the underlying issue cleared
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kSuccess);  // a re-ran succeeded -> wait no-target -> met
+    EXPECT_EQ(a->total_ticks(), 2);
+    EXPECT_TRUE(pipe.last_error().empty());  // stale error was cleared on success
+}
+
+TEST(PipelineTest, ActionFailureExhaustsRetriesAndFails) {
+    // Action keeps failing across all retries — pipeline fails with the
+    // preserved action error (not the generic "target not met" message).
+    Pipeline pipe(1, "pipe");
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kFailure);
+    a->set_last_error("fatal: lua error in step");
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 /*timeout_ms=*/20, /*retry=*/2);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a failed (1/3)
+    EXPECT_EQ(a->total_ticks(), 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // OnWaitTimeout: re-run queued
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a re-ran, failed (2/3)
+    EXPECT_EQ(a->total_ticks(), 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // OnWaitTimeout: re-run queued
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a re-ran, failed (3/3)
+    EXPECT_EQ(a->total_ticks(), 3);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // retries exhausted
+    EXPECT_NE(pipe.last_error().find("fatal: lua error in step"), std::string::npos);
+}
+
+TEST(PipelineTest, ActionFailureWaitsFullTimeoutBeforeRetry) {
+    // The post-failure wait is a FULL *timeout ms, not a smaller back-off.
+    // Verified by timing: the gap between action #1 tick and action #2 tick
+    // must be >= *timeout (no short-circuit on any sub-time signal).
+    // CountingMockNode so the post-Reset tick count is still measurable.
+    Pipeline pipe(1, "pipe");
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kFailure);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 /*timeout_ms=*/50, /*retry=*/1);
+    Blackboard bb; BtEventQueue ev;
+    auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a failed
+    EXPECT_EQ(a->total_ticks(), 1);
+    // poll until a re-runs (the second tick after OnWaitTimeout) and capture
+    // its wall-clock
+    NodeStatus s = NodeStatus::kRunning;
+    while (s == NodeStatus::kRunning && a->total_ticks() < 2) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        s = TickStamp(pipe, bb, ev);
+    }
+    ASSERT_EQ(a->total_ticks(), 2);
+    int gap = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count());
+    EXPECT_GE(gap, 50);   // waited the full *timeout (allow detection slack on the upper side)
+}
+
+TEST(PipelineTest, ActionFailureWithNoRetryFailsImmediatelyAfterTimeout) {
+    // retry=0 with a short timeout: one failed action -> post-failure kWait ->
+    // *timeout -> OnWaitTimeout -> no retry -> Failure. The pipeline does NOT
+    // succeed (the action never returned Success), and the failure surfaces
+    // after exactly the timeout window.
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kFailure);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr, /*timeout_ms=*/15, /*retry=*/0);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a failed -> post-failure kWait
+    EXPECT_EQ(a->tick_count, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);
+    EXPECT_EQ(a->tick_count, 1);  // no re-run
+}
+
+TEST(PipelineTest, ActionFailureWithDefaultRetryFromPipelineParams) {
+    // A step with no *retry falls back to the pipeline-level default
+    // (params.retry). Verify the default applies to the action-failure
+    // re-run path the same way as the existing target-timeout retry path.
+    Pipeline pipe(1, "pipe");
+    pipe.SetDefaultRetry({Pipeline::EdgeParam::Kind::kFixed, 1, 1, {}});
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kFailure);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 /*timeout_ms=*/20, /*retry=*/-1);  // -1 lo = defer to default
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a failed (1/2)
+    EXPECT_EQ(a->total_ticks(), 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // OnWaitTimeout: re-run queued
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a re-ran, failed (2/2)
+    EXPECT_EQ(a->total_ticks(), 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // default retry budget exhausted
+}
+
+TEST(PipelineTest, ActionFailureWithBbRefTimeout) {
+    // A `$key` bb ref for *timeout: the action failure path uses the same
+    // provider-resolved value as a target-timeout would. The first tick must
+    // park in kResolve while the provider runs; subsequent ticks see the
+    // final budget and use it.
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kFailure);
+    // Build a $key ref manually: EdgeParam kBbRef with key "action_to_ms"
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 Pipeline::EdgeParam{Pipeline::EdgeParam::Kind::kBbRef, 0, 0, "action_to_ms"},
+                 Pipeline::EdgeParam{Pipeline::EdgeParam::Kind::kFixed, 0, 0, {}});
+    Blackboard bb; BtEventQueue ev;
+    // The bb key is NOT set -> FinishEdgeParam logs an error and returns -1
+    // which the caller treats as 0 = wait forever. The pipeline then sits in
+    // post-failure kWait forever. Sanity that it doesn't crash and stays Running.
+    NodeStatus s = NodeStatus::kRunning;
+    int guard = 0;
+    while (s == NodeStatus::kRunning && guard++ < 3) s = TickStamp(pipe, bb, ev);
+    EXPECT_EQ(s, NodeStatus::kRunning);
+    EXPECT_EQ(a->tick_count, 1);  // a only ran once
+}
+
+TEST(PipelineTest, ActionFailureRangeRetryResolvesWithinBounds) {
+    // retry=[1,3]: across runs the number of action re-runs must land in [1,3].
+    // Total action ticks per run = 1 (initial) + reruns. Each rerun only
+    // happens after a *timeout wait, so the test takes a real few hundred ms.
+    const int lo = 1, hi = 3;
+    Pipeline pipe(1, "pipe");
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kFailure);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 /*timeout_lo=*/10, /*timeout_hi=*/10, lo, hi);
+
+    int seen_min = hi, seen_max = lo;
+    for (int run = 0; run < 30; ++run) {
+        pipe.Reset();
+        Blackboard bb; BtEventQueue ev;
+        int before = a->total_ticks();
+        NodeStatus s = NodeStatus::kRunning;
+        while (s == NodeStatus::kRunning) {
+            s = TickStamp(pipe, bb, ev);
+            // let the 10ms wait budget elapse between wait ticks
+            std::this_thread::sleep_for(std::chrono::milliseconds(12));
+        }
+        ASSERT_EQ(s, NodeStatus::kFailure);
+        int reruns = (a->total_ticks() - before) - 1;  // initial + one per re-run
+        ASSERT_GE(reruns, lo);
+        ASSERT_LE(reruns, hi);
+        seen_min = std::min(seen_min, reruns);
+        seen_max = std::max(seen_max, reruns);
+    }
+    EXPECT_EQ(seen_min, lo);
+    EXPECT_EQ(seen_max, hi);
+}
+
+TEST(PipelineTest, ActionFailureResetsChildBetweenRetries) {
+    // OnWaitTimeout re-runs the action by calling Reset() on the child first,
+    // so the child sees a clean slate each retry (matches the target-timeout
+    // retry path). For MockNode, Reset() clears tick_count and aborted; for
+    // real nodes, it re-enters the initial state. After the retry, the
+    // re-run's tick_count is 1 (post-Reset) while total_ticks is 2.
+    Pipeline pipe(1, "pipe");
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kFailure);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 /*timeout_ms=*/20, /*retry=*/1);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a failed (1/2)
+    EXPECT_EQ(a->total_ticks(), 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // OnWaitTimeout: re-run queued
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a re-ran
+    EXPECT_EQ(a->total_ticks(), 2);
+    EXPECT_FALSE(a->aborted);
+}
+
+TEST(PipelineTest, ActionFailureAdvancesWhenTargetBecomesMet) {
+    // post-failure kWait does NOT suspend *target eval: a "failed" action may still
+    // have met the target as a side effect. If the target flips met while
+    // the pipeline waits after an action Failure, it advances — it does NOT
+    // wait out the full *timeout / burn a retry. Step 1 running proves step
+    // 0 advanced past the failure.
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new MockNode(2, "a0", NodeStatus::kFailure);   // always fails
+    auto* a1 = new MockNode(3, "a1", NodeStatus::kRunning);
+    auto* t0 = new MockCondition(NodeStatus::kFailure);       // unmet at run
+    pipe.AddStep(std::unique_ptr<MockNode>(a0),
+                 std::shared_ptr<MockCondition>(t0),
+                 /*timeout_ms=*/200, /*retry=*/3);  // long budget; no retry should burn
+    pipe.AddStep(std::unique_ptr<MockNode>(a1),
+                 std::make_shared<MockCondition>(NodeStatus::kFailure), 0, 0);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a0 failed -> post-failure kWait
+    EXPECT_EQ(a0->tick_count, 1);
+    EXPECT_EQ(a1->tick_count, 0);
+    // While waiting after the failure, the target becomes met (side effect) →
+    // the step advances at once, before any *timeout.
+    t0->set_status(NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a1 now running
+    EXPECT_EQ(a0->tick_count, 1);   // a0 NOT re-run (no retry spent)
+    EXPECT_EQ(a1->tick_count, 1);   // step 1 running
+    EXPECT_TRUE(pipe.last_error().empty());  // a0's failure is forgotten: goal met
+}
+
+TEST(PipelineTest, ActionFailureBareStepDoesNotAdvance) {
+    // A bare step (no *target) whose action returns Failure must NOT advance —
+    // completion IS the target, and the action didn't complete. It waits the
+    // full *timeout then retries/fails, exactly as target-eval would. This
+    // guards against post-failure kWait mistakenly treating an absent target (which
+    // EvalTarget reads as met) as a completed failure.
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kFailure);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 /*timeout_ms=*/15, /*retry=*/0);
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a failed -> post-failure kWait
+    // Even with no *target, a second tick must STILL be waiting (not advance —
+    // the bare-step target "action completion" is unmet while the action fails).
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    EXPECT_EQ(a->tick_count, 1);  // not advanced, not re-run yet
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // *timeout -> no retry -> fail
+    EXPECT_EQ(a->tick_count, 1);
+}
+
+TEST(PipelineTest, GuardFailureReEvaluatesAndRerunsWhenGuardRecovers) {
+    // A sub-node's own guard (abort=Self condition) flipping Failure
+    // mid-action is a distinct path from an action Tick returning Failure:
+    //   - guard short-circuit  → kWaitGuard: re-evaluate the guard every
+    //     tick; on guard Success re-tick the action; on guard sustained
+    //     Failure for *timeout ms → Pipeline failure.
+    //   - *retry budget is NOT consumed by a guard failure.
+    //
+    // This test: action runs, guard flips Failure, then back to Success
+    // BEFORE the *timeout elapses. The action must re-run on the same tick
+    // the guard recovers, with retries_used == 0 (proves the retry budget
+    // was untouched).
+    Pipeline pipe(1, "pipe");
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kRunning);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 /*timeout_ms=*/200, /*retry=*/2);
+    auto* cond = new MockCondition(NodeStatus::kSuccess);
+    cond->set_abort(AbortMode::kSelf);
+    pipe.children()[0]->SetCondition(std::shared_ptr<MockCondition>(cond));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a running under guard
+    EXPECT_EQ(a->total_ticks(), 1);
+    cond->set_status(NodeStatus::kFailure);  // guard lost
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // kWaitGuard entered
+    EXPECT_TRUE(a->aborted);
+    EXPECT_EQ(a->total_ticks(), 1);  // guard loss did NOT re-tick the action
+    // Guard recovers before the *timeout budget.
+    cond->set_status(NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // guard Success → kAct re-tick → a running
+    EXPECT_EQ(a->total_ticks(), 2);  // action re-ran, with no Reset (still Running)
+    // retries_used is implementation detail, but a->tick_count=2 with
+    // *retry=2 and the original *retry* never spent is the load-bearing
+    // assertion: guard failure must not have consumed a retry.
+}
+
+TEST(PipelineTest, GuardFailureHeldTimeoutFailsPipelineDirectly) {
+    // Guard stays Failure for the full *timeout window: Pipeline fails
+    // with a guard-specific message, no *retry burned, no child Reset.
+    // The action's tick_count stays at 1 (initial run only) since the
+    // guard never recovered.
+    Pipeline pipe(1, "pipe");
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kRunning);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 /*timeout_ms=*/20, /*retry=*/3);  // 3 retries but guard must NOT burn any
+    auto* cond = new MockCondition(NodeStatus::kSuccess);
+    cond->set_abort(AbortMode::kSelf);
+    pipe.children()[0]->SetCondition(std::shared_ptr<MockCondition>(cond));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a running
+    EXPECT_EQ(a->total_ticks(), 1);
+    cond->set_status(NodeStatus::kFailure);  // guard lost
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // kWaitGuard
+    EXPECT_TRUE(a->aborted);
+    EXPECT_EQ(a->total_ticks(), 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);  // *timeout elapsed
+    EXPECT_EQ(a->total_ticks(), 1);  // action never re-ran
+    // a->aborted stays true: Tick 2's guard short-circuit invoked
+    // OnAborted on the child (node.h:61), and kWaitGuard's timeout path
+    // does NOT Reset the child (no *retry burned, no *target re-eval —
+    // distinct from OnWaitTimeout's re-Reset-and-retry on the action-fail
+    // path). If Pipeline had Reset the child, aborted would be false.
+    EXPECT_TRUE(a->aborted);
+    EXPECT_NE(pipe.last_error().find("guard held Failure"), std::string::npos);
+    EXPECT_NE(pipe.last_error().find("20ms"), std::string::npos);
+}
+
+TEST(PipelineTest, GuardFailureReEntryAtEachTick) {
+    // The kWaitGuard block re-evaluates the guard EVERY tick (not just on
+    // the first tick after the loss). Verify by holding the guard Failure
+    // for 4 ticks, then flipping to Success — the action re-runs the
+    // SAME tick the guard recovers (no need to wait for the next tick).
+    Pipeline pipe(1, "pipe");
+    auto* a = new CountingMockNode(2, "a", NodeStatus::kRunning);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 /*timeout_ms=*/200, /*retry=*/0);
+    auto* cond = new MockCondition(NodeStatus::kSuccess);
+    cond->set_abort(AbortMode::kSelf);
+    pipe.children()[0]->SetCondition(std::shared_ptr<MockCondition>(cond));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a running
+    EXPECT_EQ(a->total_ticks(), 1);
+    cond->set_status(NodeStatus::kFailure);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // kWaitGuard tick 1
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // kWaitGuard tick 2
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // kWaitGuard tick 3
+    EXPECT_EQ(a->total_ticks(), 1);  // still no re-tick
+    cond->set_status(NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // guard Success → re-tick this tick
+    EXPECT_EQ(a->total_ticks(), 2);
+}
+
+TEST(PipelineTest, GuardFailureTimeoutZeroWaitsForever) {
+    // *timeout=0 (or absent) means wait forever. With the guard held
+    // Failure the pipeline sits in kWaitGuard indefinitely — verify the
+    // pipeline stays Running across many ticks (we bail out manually).
+    Pipeline pipe(1, "pipe");
+    auto* a = new MockNode(2, "a", NodeStatus::kRunning);
+    pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
+                 /*timeout_ms=*/0, /*retry=*/0);
+    auto* cond = new MockCondition(NodeStatus::kSuccess);
+    cond->set_abort(AbortMode::kSelf);
+    pipe.children()[0]->SetCondition(std::shared_ptr<MockCondition>(cond));
+    Blackboard bb; BtEventQueue ev;
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a running
+    cond->set_status(NodeStatus::kFailure);                     // guard lost
+    for (int i = 0; i < 20; ++i) {
+        EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    }
+    // Sanity that no Pipeline state corruption: a still has tick_count=1
+    // (no re-runs during the forever-wait).
+    EXPECT_EQ(a->tick_count, 1);
+    EXPECT_TRUE(pipe.last_error().empty());
 }
 
 TEST(AbortTest, LowerPriorityPreemptsRunningSibling) {
@@ -4128,7 +4542,11 @@ TEST_F(ScriptNodeIntegrationTest, E2E_TargetLowerPriorityPreemptsOnRegression) {
 // a "still on form page" guard that decays. When the page disappears mid-fill,
 // the guard aborts the action and the Pipeline fails.
 TEST_F(ScriptNodeIntegrationTest, E2E_SelfAbortInterruptsLongAction) {
-    PutRoot(R"({"type":"Pipeline","children":[)"
+    // With the new action-failure semantics, an interrupted action goes
+    // through the post-failure wait window. Give the step a small
+    // *timeout/*retry so the pipeline actually surfaces the failure instead
+    // of waiting forever in post-failure kWait.
+    PutRoot(R"({"type":"Pipeline","params":{"timeout":40,"retry":0},"children":[)"
             R"({"type":"Script","source":"scripts/e2e_run.lua","params":{"ticks":10,"exit_key":"form_exit"},)"
             R"("condition":{"type":"Script","source":"scripts/e2e_decay.lua","params":{"hold":3},"abort":"Self"}}]})");
 

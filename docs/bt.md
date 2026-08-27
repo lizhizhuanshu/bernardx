@@ -106,7 +106,7 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 |------|------|---------|------|
 | `Selector` | 复合 | — | 依次 tick，首个 Success 即 Success（OR） |
 | `Sequence` | 复合 | — | 依次 tick，首个 Failure 即 Failure（AND） |
-| `Pipeline` | 复合 | 子节点 `*target`/`*timeout`/`*retry` | 跳过已完成步骤 + 每步"动作→等目标→超时重跑"的自动化流水线（见下） |
+| `Pipeline` | 复合 | 子节点 `*target`/`*timeout`/`*retry` | 跳过已完成步骤 + 每步"动作→等目标→超时重跑（动作失败也走同一套预算）"的自动化流水线（见下） |
 | `Parallel` | 复合 | `params` | 并行所有子节点，策略控制结果 |
 | `RandomSelector` / `RandomSequence` | 复合 | — | 同 Selector/Sequence，每次 Reset 后随机排列子节点顺序 |
 | `Script` | 叶子 | `source`, `params` | 执行 Lua 脚本 |
@@ -143,8 +143,12 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 执行：
 
 - **跳过已完成（断点续传）** — 自上而下求值各步 `*target`：成立即跳过该步（动作不跑）；扫到 Running 则整条流水线 Running、下 tick 续扫；停在**首个不成立**的步并执行其动作。**全部成立 → 整条流水线立即 Success**。缺省 `*target` 的步不会被跳过（无从判断已完成），动作跑完即视为达成。
-- **跑动作** — tick 当前步动作（可跨多个 tick）；动作 Success → 进入本步的等待；动作 Failure → Pipeline failure。
-- **等本步 target（带超时+重跑）** — 动作完成后每 tick 求值本步 `*target`：成立 → 前进到下一步（再次跳过已完成的后续步）；不成立 → 记为等待，墙钟时长达到 `*timeout` 毫秒即超时。超时后：若 `*retry` 还有余额，**Reset + 重跑本步动作**、随后重新等待（重置毫秒预算）；`*retry` 耗尽仍不成立 → Pipeline failure。
+- **跑动作** — tick 当前步动作（可跨多个 tick）。三态出口，其中 Failure 有**两个来源**、走**两条不同的等路**：Success/Failure 进来的通道由动作自己的 `Tick()` 决定；guard Failure 则是动作节点的 `abort=Self` 条件在动作中途翻转失败，`TickAndRecord` 短路返回失败（动作的 `OnAborted` 触发，但**不重置条件**——kWaitGuard 每 tick 重求值同一个条件来检测恢复）。
+  - **Success** → 进入本步的等待（target eval 启动，下一节）。
+  - **动作 Failure** → 进入**失败后等待窗口**（与前一条 Success 走**同一相位** kWait，仅 `last_action_failed_` 记档）：不立即 Pipeline failure，而是同 `*timeout` 毫秒的等待。**无论动作成功还是失败，只要动作执行过，就要每 tick 继续求值 `*target`**——失败动作的副作用也可能让 target 成立，成立即照常前进；仅缺省 `*target`（裸步）的失败动作视为未完成（动作失败绝非完成），墙钟到点后走超时重试/失败路径（同 target 超时）。如此"动作失败"与"动作成功但 target 未达"共用同一套 `*retry` 预算，且都以"target 是否成立"为准，行为可预测。
+  - **guard Failure**（动作节点的 `abort=Self` 条件中途失败）→ 进入 **guard 等路**（kWaitGuard）：与动作失败不同——**每 tick 重求值该条件**，一旦恢复（Success）**同一 tick 重跑动作**；若条件持续 Failure 达 `*timeout` 毫秒 → Pipeline failure。**不消耗 `*retry` 预算**（guard 丢失是环境变化，如页面丢失/弹窗出现，区别于动作内部的重试）、不 Reset 子节点。
+  - **Running** → Pipeline 仍 Running。
+- **等本步 target（带超时+重跑）** — 动作完成后每 tick 求值本步 `*target`：成立 → 前进到下一步（再次跳过已完成的后续步）；不成立 → 记为等待，墙钟时长达到 `*timeout` 毫秒即超时。超时后：若 `*retry` 还有余额，**Reset + 重跑本步动作**、随后重新等待（重置毫秒预算）；`*retry` 耗尽仍不成立 → Pipeline failure。失败后等待窗口超时走的是**同一路径**——动作成功与失败都**每 tick 求值 `*target`**，成立即前进，区别只在于：裸步（缺省 `*target`）的失败动作视为未完成、不能靠"动作完成即目标"糊弄过去。若动作带了 `last_error`，Pipeline 终态错误会包含它，方便定位是动作本身挂掉还是 target 一直未达。
 
 当每个 `*target` 表示一个独立的页面/状态时，"跳过已成立"= 断点续传——落在中间页就从下一个未完成步接着做；超时+重跑本步动作则覆盖"动作再触发一次，好让目标页面出现"的常见自动化重试。
 
@@ -333,5 +337,5 @@ return M
 
 0. **盖时间戳** — 引擎在 tick 开始读一次单调时钟缓存进 per-tick 上下文；节点（Wait、Pipeline 的 `*timeout` 预算）统一读该缓存时间，同 tick 内看到同一时刻、不再各自调时钟
 1. **响应式中断评估** — 扫描各 condition（`LowerPriority`/`Both`），false→true 翻转时抢占正在运行的低优先级兄弟分支（`Self` 中断在 tick 树时由各节点自行处理）
-2. **Tick 树** — 从根节点执行；复合节点对每个子节点先门控（condition），再 tick。`Pipeline` 是 tick 驱动状态机：先跳过 `*target` 已成立的步骤，之后每步"跑动作 → 按 `*timeout` 等 `*target` 成立、超时按 `*retry` 重跑本步动作"
+2. **Tick 树** — 从根节点执行；复合节点对每个子节点先门控（condition），再 tick。`Pipeline` 是 tick 驱动状态机：先跳过 `*target` 已成立的步骤，之后每步"跑动作 → 按 `*timeout` 等 `*target` 成立、超时按 `*retry` 重跑本步动作；动作返回 Failure 时进入同 `*timeout`/`*retry` 预算的失败后等待窗口（`*target` 仍每 tick 求值，成立也照常前进），预算耗尽才 Pipeline failure"
 3. **树完成时重置** — 返回 success/failure 时重置树（清空复合节点游标、`Pipeline` 扫描状态、各节点条件状态、中断监视缓存）

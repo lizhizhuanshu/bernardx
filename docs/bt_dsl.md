@@ -49,6 +49,10 @@ dispatch: choose:
   每轮重摇）——步级自愈数值由用户黑板控制（约定预设键 `common_action_retry`/`common_action_timeout`
   = 常规 UI 步、`common_network_retry`/`common_network_timeout` = launch_app/页面切换），树里只留引用：
   `task_x[step_retry=@common_action_retry, step_timeout=@common_action_timeout]: # 目标`。
+- **动作失败也吃这套预算**：步动作返回 Failure 时 Pipeline 不立即失败，而是进入同 `*timeout` ms 的
+  失败后等待窗口——**无论动作成败，只要执行过 `*target` 仍每 tick 求值**（失败副作用也可能达成目标），
+  超时后再走 `*retry` 重跑或终结。`timeout=0`/缺省 = 无限等
+  （无 budget，失败后永不终结）——若希望"动作挂掉能快速失败"必须显式给 `*timeout`。
 - 行尾 `# 注释` → 节点 `description`。
 
 ### 条件表达式（cexpr）

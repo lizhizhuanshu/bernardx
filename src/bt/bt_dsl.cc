@@ -1370,6 +1370,9 @@ private:
 
     // 步级边缘参数：*target(until) + *retry/*timeout(mods)。容器行(pipeline=true)
     // 的 mods 写入 Pipeline 级缺省 params.retry/timeout（由 CompileNode 处理），不重复发 * 字段。
+    // 引擎语义：动作返回 Failure 走同 *timeout/*retry 预算的失败后等待窗口
+    // （*target 仍每 tick 求值，成立即照常前进），与 target 未达路径共用一套
+    // budget（见 pipeline.h）。
     void ApplyEdges(const AstNode& node, ojson& target, bool pipeline) {
         if (node.until) target["*target"] = CondJson(*node.until, node.line_no);
         if (pipeline) return;

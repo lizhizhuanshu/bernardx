@@ -26,14 +26,43 @@ extern "C" {
 //      SKIP every step whose target already holds (the work is done). Start
 //      at the first step whose target is not met — its action runs. If every
 //      target holds, the whole pipeline succeeds immediately.
-//   2. The current step's action runs (possibly several ticks). When the
-//      action completes, WAIT for its target to become met (the target may
-//      already have flipped mid-run — then advance at once).
+//   2. The current step's action runs (possibly several ticks). The action
+//      can return kFailure through TWO distinct mechanisms which the
+//      pipeline disambiguates via Node::last_tick_was_guard (set by
+//      TickAndRecord's guard short-circuit in node.h, cleared on every
+//      action Tick):
+//      - action Success → enter kWait for its target (last_action_failed_ =
+//        false; the target may have flipped mid-run — then advance at once);
+//      - action returned kFailure (last_tick_was_guard == false) → enter the
+//        SAME kWait phase with last_action_failed_ = true — a post-failure
+//        window sharing the *timeout/*retry budget with target-not-met. The
+//        *target is still evaluated EVERY tick (a failed action's side
+//        effects may have met it → advance at once). Only a bare step (no
+//        *target) with last_action_failed_ reads as not-complete, so it must
+//        re-run/fail via OnWaitTimeout;
+//      - guard short-circuited kFailure (last_tick_was_guard == true) →
+//        enter kWaitGuard. Re-evaluate the guard every tick; on guard
+//        Success fall back to kAct and re-tick the action the same tick;
+//        on guard still Failure for *timeout ms → pipeline failure. The
+//        *retry budget is NOT consumed — a guard loss is an
+//        environmental change (page lost, popup appeared), distinct from
+//        a step-internal retry; re-running the action is gated by the
+//        guard, not by retries;
+//      - action running → return Running.
 //   3. Target met → advance to the next step (re-scan: later steps whose
 //      targets already hold are skipped the same way).
-//   4. Waiting exceeds `*timeout` ms → re-run the action (Reset + tick
-//      again), up to `*retry` times; still unmet after the budget is spent
-//      → pipeline failure.
+//   4. The single kWait phase re-evaluates the *target every tick, whether
+//      the action succeeded or failed. The ONE difference the
+//      last_action_failed_ bit makes is bare-step handling: a failed bare
+//      action reads as not-complete, so it can't advance on the absent-target
+//      shortcut. When the wall-clock `*timeout` exceeds, it goes through
+//      OnWaitTimeout(): if `*retry` budget remains, Reset + re-run the action
+//      (setting last_action_failed_ afresh on its next exit); if exhausted →
+//      pipeline failure.
+//      A guard failure is different: kWaitGuard re-evaluates the guard every
+//      tick and never goes through OnWaitTimeout — guard Success returns to
+//      kAct, sustained guard Failure fails the pipeline directly without
+//      touching the *retry counter or Reset()'ing the child.
 //
 // Each child carries three Pipeline edge params (the `*` prefix marks
 // them as pipeline edge params the node itself ignores):
@@ -63,6 +92,12 @@ extern "C" {
 //   LowerPriority — an earlier step's target flipping met→unmet preempts
 //                   whatever later step is running and jumps back to redo
 //                   the regressed precondition step.
+//
+// Independently of `abort`, EVERY step's *target doubles as the NEXT step's
+// condition, so the retry path (OnWaitTimeout) re-verifies the nearest
+// regressed predecessor before re-running a step's action, and redoes it —
+// without needing `abort=LowerPriority` (which only adds the per-tick
+// reactive preemption).
 class Pipeline : public Composite {
 public:
     // A `*timeout`/`*retry` value, kept as its RAW description and resolved
@@ -133,13 +168,32 @@ public:
     async_simple::coro::Lazy<bool> Init(lua_State* L, LuaRuntime* ctx) override;
 
 private:
-    enum class Phase { kScan, kAct, kResolve, kWait };
+    enum class Phase {
+        kScan,        // skip steps whose target already holds
+        kAct,         // tick the current step's action
+        kResolve,     // waiting for $key provider reads of *timeout/*retry
+        kWait,        // waiting after the action ran — success or failure —
+                      // for its *target. Eval'd EVERY tick (a failed action's
+                      // side effects may have met it): met → advance; else
+                      // OnWaitTimeout on timeout. A bare step (no *target)
+                      // whose action FAILED reads as not-complete (see
+                      // last_action_failed_), since a failed action never is.
+        kWaitGuard,   // waiting after the guard (abort=Self condition)
+                      // short-circuited mid-action. Re-evaluates the guard
+                      // every tick: guard Success → fall back to kAct and
+                      // re-tick the action; guard Failure sustained for
+                      // *timeout ms → Pipeline failure. Does NOT consume
+                      // the *retry budget (a guard failure is an
+                      // environmental change, not a step-internal retry).
+    };
 
     // Evaluate step i's target: absent target counts as met.
     NodeStatus EvalTarget(Blackboard& bb, BtEventQueue& events, size_t i);
     // Called when the wait for the current step's target exceeds its
-    // `*timeout` ms budget. Re-runs the action or fails.
-    NodeStatus OnWaitTimeout();
+    // `*timeout` ms budget. Re-verifies the nearest regressed predecessor's
+    // target (this step's precondition) first and redoes it if it regressed;
+    // otherwise re-runs the action or fails.
+    NodeStatus OnWaitTimeout(Blackboard& bb, BtEventQueue& events);
     // Resolve this step's timeout/retry for the CURRENT run when it enters
     // its wait window. Fixed/range params resolve inline; a `$key` ref
     // reads the blackboard — a PROVIDER-served read launches the
@@ -202,6 +256,17 @@ private:
     PendingValue resolve_timeout_;   // kResolve in-flight *timeout read
     PendingValue resolve_retry_;     // kResolve in-flight *retry read
     int64_t wait_start_ms_ = 0;  // tick-time (cached) when the current wait window began
+    // For the single kWait phase: did the run that landed us here terminate
+    // in Failure? A bare step (no *target) with this true reads as
+    // not-complete — a failed action can't advance on the "action completion
+    // IS the target" shortcut; it must re-run/fail via OnWaitTimeout. Set at
+    // each kAct exit (before budget resolve, so it survives kResolve);
+    // it is DATA about the last run, not a control-flow branch.
+    bool last_action_failed_ = false;
     bool started_ = false;           // initial scan phase complete
     Phase phase_ = Phase::kScan;
+    // Preserve the child's last_error through the post-failure wait window
+    // (so OnWaitTimeout can surface it as the pipeline error if the retry
+    // budget is exhausted). Cleared on Reset / OnAborted / successful retry.
+    std::string pending_action_error_;
 };
