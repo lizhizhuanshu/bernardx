@@ -2017,11 +2017,361 @@ TEST_F(ScriptNodeIntegrationTest, PipelineEdgeParamRereadsProviderPerRun) {
     EXPECT_EQ(*st, "timeout");  // attempt 2 re-resolved to 0 = wait forever
 }
 
+// --- Pipeline retry-succeeds E2E (real script lifecycle) ---
+//
+// These drive the FULL bt.init/bt.exec stack with real ScriptNodes and real
+// ScriptCondition *targets, so the Enter/Reset/active_/last_terminal_ lifecy-
+// cles are exercised the way the worker runs them. A retry that "impossible to
+// succeed" in the produced sense would surface here as an unexpected "failure".
+
+// fail_then_ok fails its first Tick then always succeeds. With *retry the
+// step's action MUST re-run via OnWaitTimeout and the pipeline succeed.
+TEST_F(ScriptNodeIntegrationTest, E2E_BareStepRetrySucceeds) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/fail_then_ok.lua",)"
+            R"("*timeout":30,"*retry":2}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local ok, err = bt.init({root = "res://root.json"})
+        if not ok then return false, err end
+        local status = bt.exec({interval = 5, max_step = 150})
+        return true, status
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_TRUE(r.values[0] == LuaValue(true));
+    auto* st = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(*st, "success");
+}
+
+// Two real steps. Step 0's *target is cond_truthy (met immediately -> step 0
+// is skipped), and it is injected as step 1's `recheck_`. Step 1's action is
+// fail_then_ok with a *response delay so the recheck/*response* gate runs.
+// The retry re-runs step 1's action; the injected recheck_ shares step 0's
+// target object, so this also stresses the shared-condition + response path.
+TEST_F(ScriptNodeIntegrationTest, E2E_ResponseRecheckRetrySucceeds) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/no_args.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/cond_truthy.lua"}},)"
+            R"({"type":"Script","source":"scripts/fail_then_ok.lua",)"
+            R"("*response":20,"*timeout":30,"*retry":2}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local ok, err = bt.init({root = "res://root.json"})
+        if not ok then return false, err end
+        local status = bt.exec({interval = 5, max_step = 300})
+        return true, status
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_TRUE(r.values[0] == LuaValue(true));
+    auto* st = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(*st, "success");
+}
+
 // --- Pipeline composite tests ---
 //
 // (Pipeline tests are rewritten for the *target semantics: a step's action
 // runs while its target is NOT met; steps whose targets already hold are
 // skipped. See the Pipeline + NodeCondition test sections.)
+
+// RETRY MUST RE-TICK *target. The action's FIRST run returns success but does
+// NOT achieve the target, so the step times out and OnWaitTimeout re-runs it.
+// The SECOND run (after Reset) sets bb.done=true. If the pipeline failed to
+// re-tick the *target after the retry, `done` would never be observed and the
+// step would exhaust its retries and FAIL. A correct engine re-ticks the
+// target each kWait tick, sees `done`, and advances -> success.
+TEST_F(ScriptNodeIntegrationTest, E2E_RetryReTicksTargetAndSucceeds) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/retry_achieve.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/retry_target.lua"},)"
+            R"("*timeout":30,"*retry":1}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local ok, err = bt.init({root = "res://root.json"})
+        if not ok then return false, err end
+        local status = bt.exec({interval = 5, max_step = 120})
+        return true, status
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_TRUE(r.values[0] == LuaValue(true));
+    auto* st = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(st, nullptr);
+    EXPECT_EQ(*st, "success");
+    // The action re-ran exactly once (2 total runs), and `done` got set.
+    EXPECT_EQ(*blackboard->Get("retry_achieve_count"), LuaValue(static_cast<int64_t>(2)));
+    EXPECT_EQ(*blackboard->Get("done"), LuaValue(true));
+}
+
+// REGRESSION: a flaky step later in a multi-step navigation must retry ITSELF,
+// not bounce back to redo the first step. Step 0's *target page==A is expected
+// to be "regressed" (we navigated away to B) — it is NOT a real precondition
+// regression for step 2. The OnWaitTimeout precondition loop used to walk the
+// ENTIRE prefix and redo the first step whose target didn't still hold, so a
+// flaky step 2 kept redoing step 0 forever, never consuming step 2's *retry
+// budget (a hang). Correct behavior: step 2 exhausts its *retry and the
+// pipeline FAILS cleanly.
+TEST_F(ScriptNodeIntegrationTest, E2E_StepRetryDoesNotRedoEarlierStepsOnNavigation) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"A"},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"A"}}},)"
+            R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"B"},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"B"}}},)"
+            R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"C","flaky":999},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"C"}},"*timeout":30,"*retry":1}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 5, max_step = 400})
+        return status, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    // step 2 must exhaust its retry and FAIL — NOT hang (redo step 0 forever)
+    // until max_step ("timeout"). A "timeout" here means the precondition-redo
+    // runaway swallowed step 2's retry budget.
+    EXPECT_EQ(*s, "failure");
+}
+
+// REGRESSION (unbounded redo bounce): step 1's action PERSISTENTLY breaks its
+// own precondition — it navigates away from step 0's page, then fails, every
+// run. The precondition redo is charged to step 1's *retry (2 here): two
+// redos drain the budget and the third regression FAILS the pipeline. Before
+// the charge (and with the scan re-entry recharging the budget every cycle)
+// this bounced redo↔retry forever and only the run's max_step ended it.
+TEST_F(ScriptNodeIntegrationTest, E2E_PersistentPreconditionBreakIsBounded) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"A"},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"A"}}},)"
+            R"({"type":"Script","source":"scripts/e2e_nav_fail.lua","params":{"to":"B"},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"C"}},)"
+            R"("*timeout":20,"*retry":2}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 5, max_step = 300})
+        return status, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    // Bounded: the redo budget drains and the pipeline FAILS — NOT "timeout"
+    // (bouncing until max_step with the budget recharged every cycle).
+    EXPECT_EQ(*s, "failure");
+    auto* err = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(err, nullptr);
+    EXPECT_NE(err->find("precondition regressed"), std::string::npos);
+}
+
+// REGRESSION: a step whose action fails (here a `when` guard false) and that has
+// NO *timeout / *retry / pipeline default must FAIL cleanly, not hang. Step
+// 0728's `save_local_settings: when count '.conf'==2 set ...` compiles to a
+// Pipeline step whose child is Sequence[guard, set-body]; when the guard reads
+// unmet the Sequence (and thus the step) fails. With no timeout budget, the
+// post-failure kWait's `timeout > 0` gate could never fire OnWaitTimeout, so the
+// pipeline parked in kWait forever (only the run's max-step killed it) — never
+// retrying, never failing, never re-evaluating the guard. A correct engine
+// resolves retry-or-fail at once: with no retry budget it FAILS.
+TEST_F(ScriptNodeIntegrationTest, E2E_GuardFailWithoutTimeoutFailsNotHangs) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Sequence","name":"save_local_settings","children":[)"
+            R"({"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"Z"}},)"
+            R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"done","value":true}})"
+            "]}]}");
+    blackboard->Set("page", LuaValue(std::string("A")));  // guard page==Z never met
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 5, max_step = 300})
+        return status, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    // "failure" (guard fail) — NOT "timeout" (stuck until max_step) and NOT
+    // "success" (the body must never run while the guard is false).
+    EXPECT_EQ(*s, "failure");
+    EXPECT_FALSE(blackboard->Get("done").has_value());  // guard false → body never ran
+}
+
+// REGRESSION (user report: "first action fails, the retry never happens,
+// stuck until the run's timeout"): a FAILED action with no positive *timeout
+// budget must resolve via OnWaitTimeout (retry, then fail), NOT park in the
+// post-failure kWait forever. The earlier fix only covered bare steps (no
+// *target); a step WITH a *target hung the same way - its retry budget was
+// never consumed and only the run's max_step killed it.
+TEST_F(ScriptNodeIntegrationTest, E2E_FailedActionWithTargetNoTimeoutFailsNotHangs) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/returns_failure.lua",)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"Z"}},)"
+            R"("*retry":2}]})");
+    blackboard->Set("page", LuaValue(std::string("A")));  // target never met
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 5, max_step = 300})
+        return status, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    // FAILS cleanly after exhausting *retry - NOT "timeout" (stuck until
+    // max_step with the retry budget never consumed).
+    EXPECT_EQ(*s, "failure");
+    EXPECT_NE(r.values[1], LuaValue(std::string("")));
+}
+
+// REGRESSION (kResolve destination loss): a step whose GUARD short-circuits
+// while its *timeout is a provider-backed $key parks in kResolve for the
+// provider's sleep. The completion must land in kWaitGuard — the guard's
+// wait window — NOT in kWait: falling into kWait let this BARE step (no
+// *target) read as complete ("absent target = met") and the pipeline
+// "succeeded" without the action ever running.
+TEST_F(ScriptNodeIntegrationTest, E2E_GuardParkWithProviderBudgetFailsNotFakeCompletes) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","name":"act","source":"scripts/e2e_set.lua","params":{"key":"done","value":true},)"
+            R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"Z"},"abort":"Self"},)"
+            R"("*timeout":"$tmo"}]})");
+    blackboard->Set("page", LuaValue(std::string("A")));  // guard page==Z never met
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set_provider("tmo", {get = function() sleep(20); return 30 end})
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 5, max_step = 200})
+        return status, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    // kWaitGuard semantics: the guard stays false, so the 30ms budget fails
+    // the pipeline. (Pre-fix: "success" — the parked completion fell into
+    // kWait and the bare step advanced without its action running.)
+    EXPECT_EQ(*s, "failure");
+    auto* err = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(err, nullptr);
+    EXPECT_NE(err->find("guard"), std::string::npos);
+    EXPECT_FALSE(blackboard->Get("done").has_value());  // action never ran
+}
+
+// The happy twin of the test above: the guard RECOVERS while the budget
+// resolve is parked (the provider's get sets the page as a side effect), so
+// the completion lands in kWaitGuard, sees the recovered guard, falls back
+// to kAct and the action runs. Distinguishes real completion (done set) from
+// the pre-fix fake advance (bare step skipped over without running).
+TEST_F(ScriptNodeIntegrationTest, E2E_GuardRecoversDuringProviderBudgetPark) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","name":"act","source":"scripts/e2e_set.lua","params":{"key":"done","value":true},)"
+            R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"Z"},"abort":"Self"},)"
+            R"("*timeout":"$tmo"}]})");
+    blackboard->Set("page", LuaValue(std::string("A")));  // guard page==Z initially unmet
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        bb.set_provider("tmo", {get = function() sleep(20); bb.set("page", "Z"); return 30 end})
+        bt.init({root = "res://root.json", debug = true})
+        local status, err = bt.exec({interval = 5, max_step = 200})
+        return status, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    auto* e2 = std::get_if<std::string>(&r.values[1]);
+    ASSERT_NE(e2, nullptr);
+    EXPECT_EQ(*s, "success") << "err=" << *e2;
+    // The action REALLY ran after the guard recovered (pre-fix fake advance
+    // also reported "success" but never set `done`).
+    ASSERT_TRUE(blackboard->Get("done").has_value());
+    EXPECT_EQ(*blackboard->Get("done"), LuaValue(true));
+}
+
+
+// REGRESSION (same report): first action FAILS once, *retry re-runs it, and
+// the pipeline must then ADVANCE to the second step's action (a retry that
+// re-runs but never lets the pipeline progress is the same user-visible hang).
+TEST_F(ScriptNodeIntegrationTest, E2E_FailedActionRetriesThenAdvancesToNextStep) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/fail_then_ok.lua","*timeout":30,"*retry":2},)"
+            R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"done","value":true}}]})");
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 5, max_step = 300})
+        return status, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(*s, "success");
+    EXPECT_EQ(*blackboard->Get("done"), LuaValue(true));  // second step's action ran
+    EXPECT_EQ(*blackboard->Get("fail_then_ok_runs"), LuaValue(static_cast<int64_t>(2)));
+}
+
+// REGRESSION: bt.init global defaults (default_timeout/default_retry) must
+// reach Pipeline steps that declare no *timeout/*retry of their own. bt_init
+// used to store them under "default_X" keys while TreeParser's fallback
+// looked up the bare "X" - a key mismatch that silently dropped the whole
+// global layer (steps with no budget then waited forever, max_step "timeout").
+// Action succeeds every run (goto flaky=999 never navigates), target never
+// met: with defaults the step must wait ~60-100ms, retry 2-3 times, then FAIL.
+TEST_F(ScriptNodeIntegrationTest, E2E_BtInitGlobalDefaultsApplyToSteps) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/e2e_goto.lua","params":{"to":"X","flaky":999},)"
+            R"("*target":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"Z"}}}]})");
+    blackboard->Set("page", LuaValue(std::string("A")));  // target never met
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json",
+                 default_timeout = {60, 100},
+                 default_retry = {2, 3}})
+        local status, err = bt.exec({interval = 5, max_step = 400})
+        return status, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    // NOT "timeout": the global default_timeout bounded the wait and the
+    // pipeline resolved via retry-exhaustion instead of hanging to max_step.
+    EXPECT_EQ(*s, "failure");
+    // 1 initial run + retry in [2,3] re-runs.
+    auto runs = blackboard->Get("goto_X");
+    ASSERT_TRUE(runs.has_value());
+    int64_t n = std::get<int64_t>(*runs);
+    EXPECT_GE(n, 3);
+    EXPECT_LE(n, 4);
+}
+
+// REGRESSION (DSL `when` shape): a `when` guard compiles to the node's
+// `condition` slot (abort=None); on a Pipeline step ScriptNode consults it on
+// the first tick of each run (response gate). Guard never met + no budget ->
+// must fail cleanly, not hang until max_step.
+
+TEST_F(ScriptNodeIntegrationTest, E2E_WhenCondSlotNoBudgetFailsNotHangs) {
+    PutRoot(R"({"type":"Pipeline","children":[)"
+            R"({"type":"Script","source":"scripts/e2e_set.lua","params":{"key":"done","value":true},)"
+            R"("condition":{"type":"Script","source":"scripts/e2e_when.lua","params":{"key":"page","value":"Z"}}}]})");
+    blackboard->Set("page", LuaValue(std::string("A")));  // guard page==Z never met
+    auto r = AWAIT_BT(rt->RunScript(R"(
+        local bt = require('bt')
+        bt.init({root = "res://root.json"})
+        local status, err = bt.exec({interval = 5, max_step = 300})
+        return status, err
+    )"));
+    ASSERT_EQ(r.status, LUA_OK);
+    ASSERT_EQ(r.values.size(), 2u);
+    auto* s = std::get_if<std::string>(&r.values[0]);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(*s, "failure");
+    EXPECT_FALSE(blackboard->Get("done").has_value());  // guard false -> body never ran
+}
 
 // --- bt lifecycle exec() max_step / timeout / interval Tests ---
 
@@ -4050,6 +4400,58 @@ TEST(PipelineTest, RetryRedoesRegressedPrecondition) {
     EXPECT_EQ(a1->total_ticks(), 2);
 }
 
+TEST(PipelineTest, PreconditionRedoIsChargedToRetryBudget) {
+    // A step whose failed action PERSISTENTLY breaks its own precondition
+    // (its side effects navigate away from the predecessor's page, then it
+    // errors) must terminate, not bounce redo↔retry forever. The redo draws
+    // from the step's *retry budget — here 1 — so: first regression consumes
+    // the budget on a redo, and the SECOND regression fails the pipeline.
+    // (Pre-charge semantics: the redo was free AND the scan re-entry
+    // recharged the budget each cycle — an unbounded loop only the run's
+    // max-step could end.)
+    Pipeline pipe(1, "pipe");
+    auto* a0 = new CountingMockNode(2, "a0", NodeStatus::kSuccess);
+    auto* a1 = new CountingMockNode(3, "a1", NodeStatus::kFailure);
+    auto* t0 = new MockCondition(NodeStatus::kFailure);   // step 0's *target
+    auto* t1 = new MockCondition(NodeStatus::kFailure);   // step 1's *target (never met)
+    pipe.AddStep(std::unique_ptr<MockNode>(a0),
+                 std::shared_ptr<MockCondition>(t0), 0, 0);
+    pipe.AddStep(std::unique_ptr<MockNode>(a1),
+                 std::shared_ptr<MockCondition>(t1),
+                 /*timeout_ms=*/20, /*retry=*/1);
+    Blackboard bb; BtEventQueue ev;
+
+    // Step 0 runs; waits for t0 (no budget — success wait, by design).
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    t0->set_status(NodeStatus::kSuccess);                // advance to step 1
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a1 failed → post-failure kWait
+
+    // Regression #1 (a1's side effect broke the precondition): after the
+    // 20ms wait, OnWaitTimeout redoes step 0 — charged (budget 1 → 0 left).
+    t0->set_status(NodeStatus::kFailure);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // redo step 0
+
+    // The redo re-establishes the precondition; step 1 re-runs and fails
+    // again (its target still unmet).
+    t0->set_status(NodeStatus::kSuccess);
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    EXPECT_EQ(a1->total_ticks(), 2);
+
+    // Regression #2 — budget exhausted: the pipeline FAILS with an
+    // actionable error instead of looping (drive a bounded number of ticks;
+    // the old semantics would still be Running here, forever).
+    t0->set_status(NodeStatus::kFailure);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    NodeStatus st = NodeStatus::kRunning;
+    for (int i = 0; i < 10 && st == NodeStatus::kRunning; ++i) {
+        st = TickStamp(pipe, bb, ev);
+    }
+    EXPECT_EQ(st, NodeStatus::kFailure);
+    EXPECT_NE(pipe.last_error().find("precondition regressed and *retry budget exhausted"),
+              std::string::npos);
+}
+
 // --- Action failure semantics tests ---
 //
 // Pipeline's action-failure path: the action returning kFailure no longer
@@ -4179,12 +4581,14 @@ TEST(PipelineTest, ActionFailureWithBbRefTimeout) {
                  Pipeline::EdgeParam{Pipeline::EdgeParam::Kind::kFixed, 0, 0, {}});
     Blackboard bb; BtEventQueue ev;
     // The bb key is NOT set -> FinishEdgeParam logs an error and returns -1
-    // which the caller treats as 0 = wait forever. The pipeline then sits in
-    // post-failure kWait forever. Sanity that it doesn't crash and stays Running.
+    // which the caller treats as 0. A bare step that failed with no effective
+    // timeout must terminate via OnWaitTimeout -> Failure instead of parking
+    // in kWait forever (the save_local_settings hang). It must not crash and
+    // must not re-run the action.
     NodeStatus s = NodeStatus::kRunning;
     int guard = 0;
     while (s == NodeStatus::kRunning && guard++ < 3) s = TickStamp(pipe, bb, ev);
-    EXPECT_EQ(s, NodeStatus::kRunning);
+    EXPECT_EQ(s, NodeStatus::kFailure);
     EXPECT_EQ(a->tick_count, 1);  // a only ran once
 }
 
@@ -4381,10 +4785,11 @@ TEST(PipelineTest, GuardFailureReEntryAtEachTick) {
     EXPECT_EQ(a->total_ticks(), 2);
 }
 
-TEST(PipelineTest, GuardFailureTimeoutZeroWaitsForever) {
-    // *timeout=0 (or absent) means wait forever. With the guard held
-    // Failure the pipeline sits in kWaitGuard indefinitely — verify the
-    // pipeline stays Running across many ticks (we bail out manually).
+TEST(PipelineTest, GuardFailureTimeoutZeroFailsFast) {
+    // *timeout=0 (or absent) carries no recovery window: a guard held
+    // Failure must NOT park the pipeline in kWaitGuard indefinitely (the
+    // same silent hang the failed-action fast-resolve rule closes). The
+    // guard gets its re-check, then the pipeline fails at once.
     Pipeline pipe(1, "pipe");
     auto* a = new MockNode(2, "a", NodeStatus::kRunning);
     pipe.AddStep(std::unique_ptr<MockNode>(a), nullptr,
@@ -4395,13 +4800,15 @@ TEST(PipelineTest, GuardFailureTimeoutZeroWaitsForever) {
     Blackboard bb; BtEventQueue ev;
     EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);  // a running
     cond->set_status(NodeStatus::kFailure);                     // guard lost
-    for (int i = 0; i < 20; ++i) {
-        EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
-    }
-    // Sanity that no Pipeline state corruption: a still has tick_count=1
-    // (no re-runs during the forever-wait).
+    // Guard short-circuit tick → enters kWaitGuard (Running)…
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kRunning);
+    // …then the first re-check still reads Failure, and with no budget there
+    // is no window to wait out: fail NOW, not after max_step.
+    EXPECT_EQ(TickStamp(pipe, bb, ev), NodeStatus::kFailure);
+    EXPECT_NE(pipe.last_error().find("guard lost with no *timeout budget"),
+              std::string::npos);
+    // No re-run happened (guard-wait never re-ticks the action).
     EXPECT_EQ(a->tick_count, 1);
-    EXPECT_TRUE(pipe.last_error().empty());
 }
 
 TEST(AbortTest, LowerPriorityPreemptsRunningSibling) {

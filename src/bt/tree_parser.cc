@@ -807,6 +807,32 @@ async_simple::coro::Lazy<std::unique_ptr<Node>> ParsePipeline(const json& j, Par
         co_return nullptr;
     }
 
+    // Footgun lint: a step that declares `*retry` but no `*timeout` (and no
+    // params.timeout / bt.init default_timeout) can still hang. *retry fires
+    // only from OnWaitTimeout, which for a SUCCESSFUL action needs a positive
+    // timeout to expire; with no budget the post-success wait for an unmet
+    // *target is unbounded (wait-forever semantics) and the retry budget is
+    // dead config. (A FAILED action with no budget resolves via OnWaitTimeout
+    // immediately.) Warn at parse time so the misconfiguration surfaces before
+    // it eats a device run.
+    const auto& def_to = node->timeout_default();
+    const bool def_timeout_unset =
+        def_to.kind == Pipeline::EdgeParam::Kind::kFixed && def_to.lo < 0;
+    if (def_timeout_unset) {
+        for (const auto& child_j : j["children"]) {
+            if (child_j.is_object() && child_j.contains("*retry") &&
+                !child_j.contains("*timeout") && child_j.contains("*target")) {
+                std::string step_name = child_j.value("name", std::string("<unnamed>"));
+                spdlog::warn("Pipeline '{}': step '{}' declares *retry without "
+                             "*timeout; if its action succeeds but the *target "
+                             "stays unmet, the step waits forever and the retry "
+                             "budget never fires. Add *timeout (or params.timeout "
+                             "/ bt.init default_timeout).",
+                             name, step_name);
+            }
+        }
+    }
+
     if (!co_await ApplyCondition(j, node.get(), ctx)) co_return nullptr;
     ReadDescription(j, node.get());
     co_return node;

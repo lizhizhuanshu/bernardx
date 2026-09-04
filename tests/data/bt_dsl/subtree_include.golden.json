@@ -48,31 +48,23 @@
       "description": "Template:无参"
     },
     {
-      "type": "Sequence",
+      "type": "Template",
       "name": "guarded",
-      "children": [
-        {
-          "type": "Inverter",
-          "name": "guarded_when",
-          "child": {
-            "type": "Script",
-            "name": "guarded_when_n",
-            "source": "conds/see.lua",
-            "params": {
-              "by": "class_chain",
-              "desc": "**/Ad"
-            }
-          }
-        },
-        {
-          "type": "Template",
-          "name": "guarded_body",
-          "source": "res://bt/subtrees/ime_input.json",
+      "source": "res://bt/subtrees/ime_input.json",
+      "params": {
+        "text": "x"
+      },
+      "condition": {
+        "type": "Not",
+        "child": {
+          "type": "Script",
+          "source": "conds/see.lua",
           "params": {
-            "text": "x"
+            "by": "class_chain",
+            "desc": "**/Ad"
           }
         }
-      ],
+      },
       "description": "when 守卫 → Sequence 前缀"
     },
     {

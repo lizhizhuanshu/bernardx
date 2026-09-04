@@ -55,14 +55,18 @@ extern "C" {
 //      the action succeeded or failed. The ONE difference the
 //      last_action_failed_ bit makes is bare-step handling: a failed bare
 //      action reads as not-complete, so it can't advance on the absent-target
-//      shortcut. When the wall-clock `*timeout` exceeds, it goes through
+//      shortcut. When the wall-clock `*timeout` exceeds — or immediately
+//      when a FAILED action has no positive timeout budget (unset/0: an
+//      unbounded wait can never resolve it) — it goes through
 //      OnWaitTimeout(): if `*retry` budget remains, Reset + re-run the action
 //      (setting last_action_failed_ afresh on its next exit); if exhausted →
 //      pipeline failure.
 //      A guard failure is different: kWaitGuard re-evaluates the guard every
 //      tick and never goes through OnWaitTimeout — guard Success returns to
 //      kAct, sustained guard Failure fails the pipeline directly without
-//      touching the *retry counter or Reset()'ing the child.
+//      touching the *retry counter or Reset()'ing the child. With no
+//      positive *timeout budget the guard gets its re-checks this one
+//      window-less: fail at once (no unbounded guard wait).
 //
 // Each child carries three Pipeline edge params (the `*` prefix marks
 // them as pipeline edge params the node itself ignores):
@@ -73,7 +77,13 @@ extern "C" {
 //                                this step's target after an action run
 //                                (0 = wait forever);
 //   `*retry`   (int or [lo,hi])  — max times to re-run this step's action
-//                                when its target wait times out.
+//                                when its target wait times out. A
+//                                precondition-regressed REDO (below) draws
+//                                from the same budget — both are restarts of
+//                                the step's attempt, and the budget spans the
+//                                whole run (only Reset()/OnAborted() clear
+//                                it; re-entering a step mid-run does NOT
+//                                recharge it).
 //
 // `*timeout`/`*retry` may be a single integer (fixed) or a two-element
 // `[lo, hi]` array (uniformly random, inclusive). The pipeline rolls ONE
@@ -94,10 +104,12 @@ extern "C" {
 //                   the regressed precondition step.
 //
 // Independently of `abort`, EVERY step's *target doubles as the NEXT step's
-// condition, so the retry path (OnWaitTimeout) re-verifies the nearest
+// condition, so the retry path (OnWaitTimeout) re-verifies the IMMEDIATE
 // regressed predecessor before re-running a step's action, and redoes it —
-// without needing `abort=LowerPriority` (which only adds the per-tick
-// reactive preemption).
+// charged to the current step's *retry budget (failing when exhausted), so a
+// persistently broken precondition ends the run instead of bouncing
+// redo↔retry forever. No `abort=LowerPriority` needed for this (that only
+// adds the per-tick reactive preemption).
 class Pipeline : public Composite {
 public:
     // A `*timeout`/`*retry` value, kept as its RAW description and resolved
@@ -186,18 +198,31 @@ private:
                       // short-circuited mid-action. Re-evaluates the guard
                       // every tick: guard Success → fall back to kAct and
                       // re-tick the action; guard Failure sustained for
-                      // *timeout ms → Pipeline failure. Does NOT consume
-                      // the *retry budget (a guard failure is an
-                      // environmental change, not a step-internal retry).
+                      // *timeout ms → Pipeline failure — and AT ONCE when
+                      // there is no positive timeout budget (unset/0: no
+                      // window to wait out, no unbounded guard wait). Does
+                      // NOT consume the *retry budget (a guard failure is
+                      // an environmental change, not a step-internal retry).
     };
 
     // Evaluate step i's target: absent target counts as met.
     NodeStatus EvalTarget(Blackboard& bb, BtEventQueue& events, size_t i);
     // Called when the wait for the current step's target exceeds its
-    // `*timeout` ms budget. Re-verifies the nearest regressed predecessor's
-    // target (this step's precondition) first and redoes it if it regressed;
-    // otherwise re-runs the action or fails.
+    // `*timeout` ms budget (or at once for a FAILED action with no positive
+    // budget). Re-verifies the immediate regressed predecessor's target
+    // (this step's precondition) first and redoes it — charged to this
+    // step's *retry budget — if it regressed; otherwise re-runs the action
+    // or fails.
     NodeStatus OnWaitTimeout(Blackboard& bb, BtEventQueue& events);
+    // (Re-)enter step `i` in kAct with fresh wait state: cancel stale budget
+    // resolves, roll fresh cur_* budgets, drop stale failure bookkeeping.
+    // The *retry counters are deliberately NOT touched — a step's retry
+    // budget spans the whole RUN (only Reset()/OnAborted() clear it), so a
+    // mid-run bounce back to a step cannot recharge it (that recharge is
+    // what let a persistent precondition regression loop forever). Call
+    // sites add their own child cleanup (OnAborted for an in-flight
+    // interrupt, Reset for an abandoned step) around this.
+    void EnterStepAct(size_t i);
     // Resolve this step's timeout/retry for the CURRENT run when it enters
     // its wait window. Fixed/range params resolve inline; a `$key` ref
     // reads the blackboard — a PROVIDER-served read launches the
@@ -246,7 +271,10 @@ private:
     };
 
     std::vector<Step> steps_;        // parallel to children_
-    std::vector<int> retries_used_;  // action re-runs used per step
+    std::vector<int> retries_used_;  // re-run + precondition-redo charges per
+                                     // step THIS run (cleared only by
+                                     // Reset()/OnAborted(); re-entry does
+                                     // NOT recharge — see EnterStepAct)
     std::vector<int> cur_timeout_;   // resolved timeout per step (-1 = unresolved this run)
     std::vector<int> cur_retry_;     // resolved retry per step (-1 = unresolved this run)
     EdgeParam def_timeout_;          // params.timeout default for unset steps
@@ -260,11 +288,19 @@ private:
     PendingValue resolve_timeout_;   // kResolve in-flight *timeout read
     PendingValue resolve_retry_;     // kResolve in-flight *retry read
     int64_t wait_start_ms_ = 0;  // tick-time (cached) when the current wait window began
+    // Where kResolve lands once the budgets are final — the kAct exit's
+    // intended destination (kWait, or kWaitGuard for a guard short-circuit).
+    // Recorded BEFORE ResolveStepBudgets parks so it survives the park;
+    // before this existed the completion always fell into kWait, losing the
+    // guard destination (a guard-lost step then consumed *retry — or worse,
+    // a bare step "completed" without its action ever running).
+    Phase post_resolve_phase_ = Phase::kWait;
     // For the single kWait phase: did the run that landed us here terminate
     // in Failure? A bare step (no *target) with this true reads as
     // not-complete — a failed action can't advance on the "action completion
     // IS the target" shortcut; it must re-run/fail via OnWaitTimeout. Set at
-    // each kAct exit (before budget resolve, so it survives kResolve);
+    // EVERY kAct exit path — success, failure, Self-abort, guard — BEFORE
+    // any budget resolve parks in kResolve, so it survives the park;
     // it is DATA about the last run, not a control-flow branch.
     bool last_action_failed_ = false;
     bool started_ = false;           // initial scan phase complete

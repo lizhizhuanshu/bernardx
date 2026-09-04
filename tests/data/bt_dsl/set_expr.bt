@@ -1,0 +1,12 @@
+set_expr: # set 值算术表达式全家福
+  let step = 2
+  s1: set count = 0
+  s2: set count = @count + 1
+  s3: set x = (@count + 1) * $step % 3 - @count / 2
+  s4: set y = @a + @a * @b - @c
+  s5: set z = -@count + 2 ^ 3
+  s6: set w = @count -1
+  s7: set page = "home"
+  s8: set dst = @src
+  s9: set n = -5
+  s10: set count = nil

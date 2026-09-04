@@ -20,32 +20,24 @@
       "description": "任务导向:until=目标态(*target)"
     },
     {
-      "type": "Sequence",
+      "type": "Script",
       "name": "step_b",
-      "children": [
-        {
-          "type": "Inverter",
-          "name": "step_b_when",
-          "child": {
-            "type": "Script",
-            "name": "step_b_when_n",
-            "source": "conds/see.lua",
-            "params": {
-              "by": "class_chain",
-              "desc": "**/Ad"
-            }
-          }
-        },
-        {
+      "source": "actions/click.lua",
+      "params": {
+        "desc": "**/B",
+        "by": "class_chain"
+      },
+      "condition": {
+        "type": "Not",
+        "child": {
           "type": "Script",
-          "name": "step_b_body",
-          "source": "actions/click.lua",
+          "source": "conds/see.lua",
           "params": {
-            "desc": "**/B",
-            "by": "class_chain"
+            "by": "class_chain",
+            "desc": "**/Ad"
           }
         }
-      ],
+      },
       "*target": {
         "type": "Script",
         "source": "conds/see.lua",

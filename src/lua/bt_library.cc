@@ -213,6 +213,9 @@ int bt_init(lua_State* L) {
     // verb registry — only meaningful for `.bt` roots.
     std::string registry_path = ReadStringOpt(L, 1, "registry");
     bool trace_paths = ReadBoolOpt(L, 1, "trace_paths", true);
+    // debug=true: print the active tick path(s) on every tick while the tree
+    // runs, so path progression/switches are visible in the log immediately.
+    bool debug = ReadBoolOpt(L, 1, "debug", false);
 
     // Global default ranges for `*timeout` / `*retry` / `*response`, applied
     // as the BOTTOM fallback in every Pipeline/action when neither the step nor
@@ -221,20 +224,23 @@ int bt_init(lua_State* L) {
     // left unset and the per-step/params value (or 0) applies).
     nlohmann::json defaults = nlohmann::json::object();
     {
-        auto read_default = [&](const char* name) {
-            lua_getfield(L, 1, name);
+        // The bt.init FIELD is `default_X`, but TreeParser's
+        // GlobalDefaultEdgeParam looks up the bare `X` (matching the pipeline
+        // `params.X` layer). Read `default_X`, store under `X`.
+        auto read_default = [&](const char* field, const char* key) {
+            lua_getfield(L, 1, field);
             if (lua_isinteger(L, -1)) {
-                defaults[name] = lua_tointeger(L, -1);
+                defaults[key] = lua_tointeger(L, -1);
             } else if (lua_istable(L, -1)) {
-                defaults[name] = LuaToJson(L, -1);  // a [lo,hi] array
+                defaults[key] = LuaToJson(L, -1);  // a [lo,hi] array
             } else if (lua_isstring(L, -1)) {
-                defaults[name] = lua_tostring(L, -1);  // a "$key" ref
+                defaults[key] = lua_tostring(L, -1);  // a "$key" ref
             }
             lua_pop(L, 1);
         };
-        read_default("default_timeout");
-        read_default("default_retry");
-        read_default("default_response");
+        read_default("default_timeout", "timeout");
+        read_default("default_retry", "retry");
+        read_default("default_response", "response");
     }
     if (defaults.empty()) defaults = nlohmann::json::object();
 
@@ -254,6 +260,7 @@ int bt_init(lua_State* L) {
     engine->Stop();
     engine->ClearOutcome();
     engine->clear_await_handle();
+    engine->SetDebug(debug);
 
     auto handle = rt_ctx->PreYield(L);
     uint64_t gen = engine->generation();

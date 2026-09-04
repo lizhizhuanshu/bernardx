@@ -59,6 +59,14 @@ public:
     const PathTracer& path_tracer() const { return tracer_; }
     void SetTracing(bool on) { tracer_.set_tracing(on); }
 
+    // Live tick-path debug logging. When true, TickOnce prints the active
+    // path(s) for every tick via spdlog, so a run can be followed as it
+    // advances/switches without waiting for a post-mortem report. Also raises
+    // the default logger to info+ and flushes per line, so the traces are
+    // visible even if the host capped the level or buffers piped output.
+    void SetDebug(bool on);
+    bool debug() const { return debug_; }
+
     // --- Lifecycle state machine (driven by bt_library; engine holds data) ---
     enum class BtState { kIdle, kReady, kRunning, kPaused, kSuccess, kFailure };
     struct RunOutcome { bool done = false; std::string status; std::string error; };
@@ -93,6 +101,9 @@ public:
 
 private:
     void ResetTree();
+    // Log the active path(s) of the just-finished tick (debug_ only).
+    void LogActivePaths(const std::vector<std::vector<Node*>>& paths,
+                        NodeStatus root_status);
     // Reactive abort (LowerPriority / Both): walk the tree, evaluate guard
     // conditions, and on a false→true flip preempt the currently-running
     // lower-priority branch. Self abort is handled per-node in Node::TickAndRecord.
@@ -112,6 +123,7 @@ private:
     void CollectActivePaths(Node* node, std::vector<std::vector<Node*>>& out);
 
     std::unique_ptr<Node> root_;
+    bool debug_ = false;
     std::shared_ptr<Blackboard> blackboard_;
     std::unordered_map<Node*, NodeStatus> cond_state_;  // prev effective status (flip detection)
 

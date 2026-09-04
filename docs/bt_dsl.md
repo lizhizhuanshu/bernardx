@@ -26,6 +26,7 @@ settle: wait [200,400]ms                     # Wait
 mark: set page = "home"                      # Set（黑板写）
 copy: set dst = @src                         # Set 黑板拷贝（@键 = 运行期引用）
 clear: set page = nil                        # Set 删键（nil = 清理语义，Has->false）
+inc: set count = @count + 1                  # Set 算术形态（Script bb_calc，@键运行期取值）
 login: use login_flow(user="alice")          # Subtree(res://bt/subtrees/login_flow.json)
 fill: include ime_input(text="hi")           # Template(解析期就地展开,缺参硬错误)
 scroll_find: repeat until see "**/List" max 5 interval [800,1200]ms:
@@ -73,6 +74,15 @@ dispatch: choose:
 - `@name` = **运行期黑板键**（动作参数 / set 值 / 位置主参 / 自定义条件 `k=v` 参数可用，编译为
   引擎 `"$name"` 注入契约；内建条件（see/attr/count/bb）的比较值位不接受——运行期注入回字符串
   会破坏数值比较）。
+
+### set 值算术表达式
+
+`set count = @count + 1`：`+ - * / % ^` 与括号、一元负号（优先级同 Lua，`-2^2` = `-(2^2)`；
+运算符两侧留空格，`@a+1` 会被词法并成一个名字）。操作数 = 数字 / `$let`（须数字常量，编译期
+内联）/ `@黑板键`（去重占槽 `n0..`，每次运行经 ScriptNode `$key` 参数解析取最新值，含异步
+提供器）。编译为 `Script(actions/bb_calc.lua)`：Lua 求值后 `bb.set` 写回；**缺键操作数 →
+脚本运行时错误 → 该步诚实失败**（计数器类先 `set count = 0` 初始化）。裸操作数（无运算符）
+保持经典 Set 形态，旧树零扰动。
 
 ### 数据流（auto_bind）
 

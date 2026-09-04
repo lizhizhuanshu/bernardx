@@ -28,67 +28,50 @@
       }
     },
     {
-      "type": "Sequence",
+      "type": "Wait",
       "name": "g2",
-      "children": [
-        {
-          "type": "Selector",
-          "name": "g2_when",
-          "children": [
-            {
-              "type": "Script",
-              "name": "g2_when_0",
-              "source": "conds/see.lua",
-              "params": {
-                "by": "class_chain",
-                "desc": "**/A"
-              }
-            },
-            {
-              "type": "Script",
-              "name": "g2_when_1",
-              "source": "conds/see.lua",
-              "params": {
-                "by": "class_chain",
-                "desc": "**/B"
-              }
+      "params": {
+        "timeout": 100
+      },
+      "condition": {
+        "type": "Or",
+        "children": [
+          {
+            "type": "Script",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/A"
             }
-          ]
-        },
-        {
-          "type": "Wait",
-          "name": "g2_body",
-          "params": {
-            "timeout": 100
+          },
+          {
+            "type": "Script",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/B"
+            }
           }
-        }
-      ]
+        ]
+      }
     },
     {
-      "type": "Sequence",
+      "type": "Script",
       "name": "g3",
-      "children": [
-        {
-          "type": "Inverter",
-          "name": "g3_when",
-          "child": {
-            "type": "Script",
-            "name": "g3_when_n",
-            "source": "conds/in_app.lua",
-            "params": {
-              "package_name": "com.x"
-            }
-          }
-        },
-        {
+      "source": "actions/open_app.lua",
+      "params": {
+        "package_name": "com.x"
+      },
+      "condition": {
+        "type": "Not",
+        "child": {
           "type": "Script",
-          "name": "g3_body",
-          "source": "actions/open_app.lua",
+          "source": "conds/in_app.lua",
           "params": {
             "package_name": "com.x"
           }
         }
-      ],
+      },
       "*target": {
         "type": "Script",
         "source": "conds/in_app.lua",
@@ -120,51 +103,42 @@
       }
     },
     {
-      "type": "Sequence",
+      "type": "Pipeline",
       "name": "g5",
       "children": [
         {
-          "type": "Sequence",
-          "name": "g5_when",
-          "children": [
-            {
-              "type": "Script",
-              "name": "g5_when_0",
-              "source": "conds/see.lua",
-              "params": {
-                "by": "class_chain",
-                "desc": "**/X"
-              }
-            },
-            {
-              "type": "Script",
-              "name": "g5_when_1",
-              "source": "conds/node_target_count.lua",
-              "params": {
-                "by": "class_chain",
-                "desc": "**/Y",
-                "op": ">=",
-                "value": 2
-              }
-            }
-          ]
-        },
-        {
-          "type": "Pipeline",
-          "name": "g5_body",
-          "children": [
-            {
-              "type": "Script",
-              "name": "i1",
-              "source": "actions/ime_action.lua",
-              "params": {
-                "action": "input",
-                "value": "hi"
-              }
-            }
-          ]
+          "type": "Script",
+          "name": "i1",
+          "source": "actions/ime_action.lua",
+          "params": {
+            "action": "input",
+            "value": "hi"
+          }
         }
-      ]
+      ],
+      "condition": {
+        "type": "And",
+        "children": [
+          {
+            "type": "Script",
+            "source": "conds/see.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/X"
+            }
+          },
+          {
+            "type": "Script",
+            "source": "conds/node_target_count.lua",
+            "params": {
+              "by": "class_chain",
+              "desc": "**/Y",
+              "op": ">=",
+              "value": 2
+            }
+          }
+        ]
+      }
     },
     {
       "type": "Pipeline",

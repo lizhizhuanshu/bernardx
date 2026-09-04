@@ -31,6 +31,10 @@ local bt = require('bt')
 | `params` | table | 否 | 根模板参数：把根 JSON 里任意字符串字段的 `{{key}}` 占位符按值替换（规则同[子树参数透传](#子树参数透传)：整值占位保留类型、片段占位按文本插值、未知 key 留字面量并告警）。不传则根按原样加载；`.bt` 根编译**之后**同样适用 |
 | `registry` | string | 否 | `.bt` 根的动词注册表路径（同 `root` 的解析规则），**整体替换**内嵌默认词表（见 [DSL (.bt)](bt_dsl.md)）。JSON 根忽略此字段 |
 | `trace_paths` | bool | 否 | 采集路径数据（默认 `true`） |
+| `debug` | bool | 否 | `true` 时每个 tick 用日志实时打印活跃路径，便于排查（默认 `false`） |
+| `default_timeout` | int / [lo,hi] / "$key" | 否 | 树级全局 `*timeout` 兜底（ms）。三层回落：步级 `*timeout` > Pipeline `params.timeout` > 此值。强烈建议设置——未设 timeout 的步骤在「动作成功但 *target 一直不满足」时无限等待 |
+| `default_retry` | int / [lo,hi] / "$key" | 否 | 树级全局 `*retry` 兜底（次数），三层回落同上 |
+| `default_response` | int / [lo,hi] | 否 | 树级全局 `*response` 兜底（ms，动作前人类反应延迟），三层回落同上（Pipeline 子动作上生效；`$key` 形态不支持） |
 
 `bt.exec`：
 
@@ -138,17 +142,17 @@ Script 与条件的 **Lua 脚本**仍由 `source` 指定，经 `CodeProvider` �
 |------|------|------|
 | `*target` | object（条件） | 该步的**目标状态**（见[条件](#条件)）："这步做完时应当成立"。**已成立 → 该步跳过**（工作已完成）；不成立 → 执行本步动作。可选，缺省 = 动作完成即目标（该步不会被跳过，动作跑完即过）。条件对象上可写 `abort` 字段（`Self`/`LowerPriority`/`Both`）开启**响应式中断**——guard 的镜像语义（对 target，"**成立**"才是事件）：`Self` = 动作运行期间 target 成立 → 中断动作、跳过剩余工作立即前进；`LowerPriority` = 后续步运行期间**更早**步的 target 成立→不成立翻转（前置回退，如中途被登出）→ 打断当前工作回跳重做该步；`Both` = 两者 |
 | `*timeout` | int、`[lo,hi]` 或 `"$key"` (**毫秒**) | 本步动作跑完后等待 `*target` 成立的墙钟预算；数组形式表示闭区间内**均匀随机**；0/缺省 = 无限等（缺省时若 Pipeline 定义了 `params.timeout` 则用该默认值）。**分配时机是本步每次进入等待窗口时**（Reset 后的每轮运行重新分配）：`[lo,hi]` 重摇、`"$key"` 黑板引用活读（provider 活调，值可为整数或 `{lo,hi}` 表）。引用解析失败（缺键/类型错）记日志并按 0 处理（= 无限等），不报解析错误。`"$key"` 是**异步提供器**时 Pipeline 先停在解析相位（Running）直到值到齐，**等待预算的时钟从解析完成时起算** |
-| `*retry` | int、`[lo,hi]` 或 `"$key"` | 等待本步 `*target` 超时后，**重跑本步动作**的最大次数；同样支持 `[lo,hi]` 范围随机与 `"$key"` 黑板引用，缺省时回退 `params.retry`，分配时机同上 |
+| `*retry` | int、`[lo,hi]` 或 `"$key"` | 等待本步 `*target` 超时后，**重跑本步动作**的最大次数；**前置回退重做**（见下"等本步 target"）同样从该预算扣减——重做与重跑都是"本步尝试的重启"，二者合计不超过 `*retry` 次，保证持续破坏前置的步骤最终失败而非无限回弹。预算按**每轮运行**（Reset/中止后）计，运行中途回跳到某步**不重置**其已用次数。同样支持 `[lo,hi]` 范围随机与 `"$key"` 黑板引用，缺省时回退 `params.retry`，分配时机同上 |
 
 执行：
 
 - **跳过已完成（断点续传）** — 自上而下求值各步 `*target`：成立即跳过该步（动作不跑）；扫到 Running 则整条流水线 Running、下 tick 续扫；停在**首个不成立**的步并执行其动作。**全部成立 → 整条流水线立即 Success**。缺省 `*target` 的步不会被跳过（无从判断已完成），动作跑完即视为达成。
 - **跑动作** — tick 当前步动作（可跨多个 tick）。三态出口，其中 Failure 有**两个来源**、走**两条不同的等路**：Success/Failure 进来的通道由动作自己的 `Tick()` 决定；guard Failure 则是动作节点的 `abort=Self` 条件在动作中途翻转失败，`TickAndRecord` 短路返回失败（动作的 `OnAborted` 触发，但**不重置条件**——kWaitGuard 每 tick 重求值同一个条件来检测恢复）。
   - **Success** → 进入本步的等待（target eval 启动，下一节）。
-  - **动作 Failure** → 进入**失败后等待窗口**（与前一条 Success 走**同一相位** kWait，仅 `last_action_failed_` 记档）：不立即 Pipeline failure，而是同 `*timeout` 毫秒的等待。**无论动作成功还是失败，只要动作执行过，就要每 tick 继续求值 `*target`**——失败动作的副作用也可能让 target 成立，成立即照常前进；仅缺省 `*target`（裸步）的失败动作视为未完成（动作失败绝非完成），墙钟到点后走超时重试/失败路径（同 target 超时）。如此"动作失败"与"动作成功但 target 未达"共用同一套 `*retry` 预算，且都以"target 是否成立"为准，行为可预测。
-  - **guard Failure**（动作节点的 `abort=Self` 条件中途失败）→ 进入 **guard 等路**（kWaitGuard）：与动作失败不同——**每 tick 重求值该条件**，一旦恢复（Success）**同一 tick 重跑动作**；若条件持续 Failure 达 `*timeout` 毫秒 → Pipeline failure。**不消耗 `*retry` 预算**（guard 丢失是环境变化，如页面丢失/弹窗出现，区别于动作内部的重试）、不 Reset 子节点。
+  - **动作 Failure** → 进入**失败后等待窗口**（与前一条 Success 走**同一相位** kWait，仅 `last_action_failed_` 记档）：不立即 Pipeline failure，而是同 `*timeout` 毫秒的等待。**无论动作成功还是失败，只要动作执行过，就要每 tick 继续求值 `*target`**——失败动作的副作用也可能让 target 成立，成立即照常前进；仅缺省 `*target`（裸步）的失败动作视为未完成（动作失败绝非完成），墙钟到点后走超时重试/失败路径（同 target 超时）；**无 `*timeout` 预算（0/缺省）的失败动作不等墙钟、当 tick 立即走超时路径**——无限等的窗口对已失败的动作没有任何收益，只会把卡死拖到整轮 max_step。如此"动作失败"与"动作成功但 target 未达"共用同一套 `*retry` 预算，且都以"target 是否成立"为准，行为可预测。
+  - **guard Failure**（动作节点的 `abort=Self` 条件中途失败）→ 进入 **guard 等路**（kWaitGuard）：与动作失败不同——**每 tick 重求值该条件**，一旦恢复（Success）**同一 tick 重跑动作**；若条件持续 Failure 达 `*timeout` 毫秒 → Pipeline failure（**无 `*timeout` 预算时复查一次仍失败即立刻 failure**，不无限等恢复）。**不消耗 `*retry` 预算**（guard 丢失是环境变化，如页面丢失/弹窗出现，区别于动作内部的重试）、不 Reset 子节点。
   - **Running** → Pipeline 仍 Running。
-- **等本步 target（带超时+重跑）** — 动作完成后每 tick 求值本步 `*target`：成立 → 前进到下一步（再次跳过已完成的后续步）；不成立 → 记为等待，墙钟时长达到 `*timeout` 毫秒即超时。超时后：若 `*retry` 还有余额，**Reset + 重跑本步动作**、随后重新等待（重置毫秒预算）；`*retry` 耗尽仍不成立 → Pipeline failure。失败后等待窗口超时走的是**同一路径**——动作成功与失败都**每 tick 求值 `*target`**，成立即前进，区别只在于：裸步（缺省 `*target`）的失败动作视为未完成、不能靠"动作完成即目标"糊弄过去。若动作带了 `last_error`，Pipeline 终态错误会包含它，方便定位是动作本身挂掉还是 target 一直未达。
+- **等本步 target（带超时+重跑）** — 动作完成后每 tick 求值本步 `*target`：成立 → 前进到下一步（再次跳过已完成的后续步）；不成立 → 记为等待，墙钟时长达到 `*timeout` 毫秒即超时。超时后**先校验前置**：本步之所以能执行，是因为上一步的 `*target`（即本步的直接前置条件）在前进时成立；若它已回归不成立（如被登出、页面被弹走），**回退重做上一步**（从本步 `*retry` 预算扣一次；重做步自己的重跑 + 后续扫描重新建立整条链）而不是盲目重试一个前置已丢的步骤。只查**直接前驱**——导航式流水线里每步动作都会离开更早的页面，那些步骤的 target 回归是预期而非故障，全前缀扫描会把每次重试弹回第一步（死循环）。前置校验通过或 `*retry` 还有余额时，**Reset + 重跑本步动作**、随后重新等待（重置毫秒预算）；`*retry` 耗尽（含被重做扣完）仍不成立 → Pipeline failure（错误信息区分"前置回归耗尽预算"与"target 未达"）。失败后等待窗口超时走的是**同一路径**——动作成功与失败都**每 tick 求值 `*target`**，成立即前进，区别只在于：裸步（缺省 `*target`）的失败动作视为未完成、不能靠"动作完成即目标"糊弄过去。若动作带了 `last_error`，Pipeline 终态错误会包含它，方便定位是动作本身挂掉还是 target 一直未达。
 
 当每个 `*target` 表示一个独立的页面/状态时，"跳过已成立"= 断点续传——落在中间页就从下一个未完成步接着做；超时+重跑本步动作则覆盖"动作再触发一次，好让目标页面出现"的常见自动化重试。
 
@@ -326,7 +330,7 @@ return M
 
 ## 路径记录
 
-每个 tick 记录**活跃路径**（root → 当前叶子），相同路径合并计数；事后回溯"树走了哪条路、多久、为何切换"，定位卡死或异常切换。`trace_paths` 默认 `true`（在 `bt.init` 关闭则返回空）。报告**不自动打印**，由你决定何时输出。
+每个 tick 记录**活跃路径**（root → 当前叶子），相同路径合并计数；事后回溯"树走了哪条路、多久、为何切换"，定位卡死或异常切换。`trace_paths` 默认 `true`（在 `bt.init` 关闭则返回空）。**`debug=true` 时**每 tick 实时 `info` 打印活跃路径（`[bt tick N] a ▸ b ▸ leaf (root 状态/叶子状态)`），运行过程中就能看到路径推进/切换，不必等报告。报告本身**不自动打印**，由你决定何时输出。
 
 - **`bt.dump_paths()`** — 返回 table：`total_ticks`、`path_occurrences`、`terminal`、`has_terminal`、`terminal_note`、`tracing`、`paths[]`（`sig_ids`/`names`/`count`/`first_tick`/`last_tick`/`leaf_status`/`root_status`/`is_terminal`）、`nodes[]`、`switches[]`。
 - **`bt.path_report()`** — 三视图报告字符串：**A 路径热度**（卡在哪、多久）、**B 树形热力图**（哪个分支热）、**C 切换时间线**（何时切换）。

@@ -154,6 +154,7 @@ NodeStatus BehaviorTreeEngine::TickOnce() {
         std::vector<std::vector<Node*>> paths;
         CollectActivePaths(root_.get(), paths);
         tracer_.OnTickDone(paths, status, events.now_ms(), nullptr);
+        if (debug_) LogActivePaths(paths, status);
     }
 
     if (status != NodeStatus::kRunning) {
@@ -292,4 +293,47 @@ void BehaviorTreeEngine::CollectActivePaths(Node* node,
 
     // Leaf.
     out.push_back({node});
+}
+
+void BehaviorTreeEngine::SetDebug(bool on) {
+    debug_ = on;
+    if (on) {
+        spdlog::set_level(spdlog::level::info);
+        spdlog::flush_on(spdlog::level::info);
+    }
+}
+
+void BehaviorTreeEngine::LogActivePaths(
+    const std::vector<std::vector<Node*>>& paths, NodeStatus root_status) {
+    const char* status = root_status == NodeStatus::kSuccess   ? "success"
+                         : root_status == NodeStatus::kFailure ? "failure"
+                                                               : "running";
+    auto status_of = [](Node* n) -> const char* {
+        if (!n) return "?";
+        switch (n->last_tick_status()) {
+            case NodeStatus::kSuccess: return "success";
+            case NodeStatus::kFailure: return "failure";
+            default: return "running";
+        }
+    };
+    if (paths.empty()) {
+        spdlog::info("[bt tick {}] root {}({}) <no active path>",
+                     tracer_.tick_count(), root_->name(), status);
+        return;
+    }
+    for (const auto& path : paths) {
+        std::string s;
+        for (size_t i = 0; i < path.size(); ++i) {
+            if (!path[i]) continue;
+            if (i) s += " \xe2\x96\xb8 ";  // ▸
+            s += path[i]->name();
+            s += "(";
+            s += path[i]->type();
+            s += ")";
+        }
+        // Leaf status and root status trailing the active path.
+        const char* leaf = status_of(path.empty() ? nullptr : path.back());
+        spdlog::info("[bt tick {}] {} (root {}/{})", tracer_.tick_count(), s,
+                     status, leaf);
+    }
 }

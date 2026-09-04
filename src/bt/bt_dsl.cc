@@ -224,6 +224,27 @@ struct Value {
     static Value Bb(std::string n) { return Value{"bb", ojson(), std::move(n)}; }
 };
 
+// set 值算术表达式 AST（dsl.py _parse_set_*）：num(数字字面量) | bb(@黑板键) |
+// ref($常量) | neg(一元负号) | bin(双目)。解析器在 Cur 之后（见 ParseSet*）。
+struct Expr {
+    std::string tag;          // "num" | "bb" | "ref" | "neg" | "bin"
+    ojson num;                // tag == "num"
+    std::string name;         // tag == "bb" | "ref"
+    std::string op;           // tag == "bin"：+ - * / % ^
+    std::vector<Expr> kids;   // neg: 1 个；bin: 2 个
+
+    static Expr Num(ojson v) { Expr e; e.tag = "num"; e.num = std::move(v); return e; }
+    static Expr Bb(std::string n) { Expr e; e.tag = "bb"; e.name = std::move(n); return e; }
+    static Expr Ref(std::string n) { Expr e; e.tag = "ref"; e.name = std::move(n); return e; }
+    static Expr Neg(Expr k) {
+        Expr e; e.tag = "neg"; e.kids.push_back(std::move(k)); return e;
+    }
+    static Expr Bin(std::string op, Expr l, Expr r) {
+        Expr e; e.tag = "bin"; e.op = std::move(op);
+        e.kids.push_back(std::move(l)); e.kids.push_back(std::move(r)); return e;
+    }
+};
+
 // 有序参数表（Python dict：改写保位、新键追加）
 using ParamList = std::vector<std::pair<std::string, Value>>;
 
@@ -287,6 +308,7 @@ struct AstNode {
     // set
     std::string set_key;
     std::optional<Value> set_val;   // nullopt + set_remove -> `set 键 = nil` 删键
+    std::optional<Expr> set_expr;   // 算术表达式（`set x = @x + 1`）→ Script(bb_calc)
     bool set_remove = false;
     // use/include 共用（kind 区分：use=Subtree / include=Template）
     std::string use_target;
@@ -399,6 +421,177 @@ Value ParseRefOrString(Cur& c, int line_no, const std::string& what, bool allow_
     Fail(line_no, what + " 后应为字符串");
 }
 
+// ── set 值算术表达式（dsl.py _parse_set_*）──────────────────────────────
+
+bool IsExprOpText(const std::string& s) {
+    return s == "+" || s == "-" || s == "*" || s == "/" || s == "%" || s == "^";
+}
+
+// 运算符位探测（dsl.py _expr_op_at）：+ - * / % ^ 词法里是 name token（不是
+// 数符）；`a -1` 的 `-1` 负数字面量拆成 `-` 运算符 + 正数字面量（pending 由
+// 右操作数位吸收，token 随即消费）。
+struct ExprOp {
+    bool has = false;
+    std::string op;
+    size_t next = 0;
+    ojson pending;  // 非空 = 右操作数直接取该正数字面量
+};
+ExprOp ExprOpAt(const Cur& c) {
+    ExprOp out;
+    const Token* tk = c.At(c.pos);
+    if (tk && (tk->kind == Tk::kSym || tk->kind == Tk::kName) && IsExprOpText(tk->s)) {
+        out.has = true; out.op = tk->s; out.next = c.pos + 1;
+        return out;
+    }
+    if (tk && (tk->kind == Tk::kInt || tk->kind == Tk::kFloat) &&
+        (tk->kind == Tk::kInt ? tk->i < 0 : tk->d < 0.0)) {
+        out.has = true; out.op = "-"; out.next = c.pos + 1;
+        out.pending = tk->kind == Tk::kInt ? ojson(-tk->i) : ojson(-tk->d);
+    }
+    return out;
+}
+
+bool TokenIsNegNumber(const Token* tk) {
+    return tk && (tk->kind == Tk::kInt || tk->kind == Tk::kFloat) &&
+           (tk->kind == Tk::kInt ? tk->i < 0 : tk->d < 0.0);
+}
+ojson NegNumberAbs(const Token* tk) {
+    return tk->kind == Tk::kInt ? ojson(-tk->i) : ojson(-tk->d);
+}
+
+Expr ParseSetExpr(Cur& c, int line_no, const ojson* pending = nullptr);
+Expr ParseSetTerm(Cur& c, int line_no, const ojson* pending);
+Expr ParseSetUnary(Cur& c, int line_no, const ojson* pending);
+Expr ParseSetPower(Cur& c, int line_no, const Expr* base);
+Expr ParseSetPrimary(Cur& c, int line_no);
+
+// 加法层（左结合）：expr := term (('+'|'-') term)*
+Expr ParseSetExpr(Cur& c, int line_no, const ojson* pending) {
+    Expr node = ParseSetTerm(c, line_no, pending);
+    while (true) {
+        ExprOp got = ExprOpAt(c);
+        if (!got.has || (got.op != "+" && got.op != "-")) return node;
+        c.pos = got.next;
+        Expr rhs = ParseSetTerm(c, line_no, got.pending.is_null() ? nullptr : &got.pending);
+        node = Expr::Bin(got.op, std::move(node), std::move(rhs));
+    }
+}
+
+// 乘法层（左结合）：term := unary (('*'|'/'|'%') unary)*
+Expr ParseSetTerm(Cur& c, int line_no, const ojson* pending) {
+    Expr node = ParseSetUnary(c, line_no, pending);
+    while (true) {
+        ExprOp got = ExprOpAt(c);
+        if (!got.has || (got.op != "*" && got.op != "/" && got.op != "%")) return node;
+        c.pos = got.next;
+        Expr rhs = ParseSetUnary(c, line_no, got.pending.is_null() ? nullptr : &got.pending);
+        node = Expr::Bin(got.op, std::move(node), std::move(rhs));
+    }
+}
+
+// 一元负号层（dsl.py _parse_set_unary）：`-2^2` = `-(2^2)`（优先级同 Lua——
+// 负号并入数字 token，不拆则幂会错误地绑在 `(-2)` 整体上）。
+Expr ParseSetUnary(Cur& c, int line_no, const ojson* pending) {
+    if (pending != nullptr) return Expr::Num(*pending);  // 运算符位拆出的负数字面量
+    if (c.IsName(c.pos, "-")) {  // `- @count`（负号后有空格）
+        ++c.pos;
+        return Expr::Neg(ParseSetUnary(c, line_no, nullptr));
+    }
+    const Token* tk = c.At(c.pos);
+    if (tk && tk->kind == Tk::kName && tk->s.size() > 1 && tk->s[0] == '-' &&
+        (tk->s[1] == '@' || tk->s[1] == '$')) {
+        // `-@count`/`-$c`：词法把负号并进相邻名字——拆回 一元负号 + 操作数
+        std::vector<Token> rest{NameTok(tk->s.substr(1))};
+        Cur sub{&rest, 0};
+        Expr inner = ParseSetUnary(sub, line_no, nullptr);
+        ++c.pos;
+        return Expr::Neg(std::move(inner));
+    }
+    if (TokenIsNegNumber(tk)) {
+        // 负数字面量 = 一元负号 + 正字面量：幂层须从正字面量起算
+        Expr base = Expr::Num(NegNumberAbs(tk));
+        ++c.pos;
+        return Expr::Neg(ParseSetPower(c, line_no, &base));
+    }
+    return ParseSetPower(c, line_no, nullptr);
+}
+
+// 幂层（右结合）：power := primary ('^' unary)?；base = 已解析操作数（负数字面量
+// 拆分路径复用本层的 ^ 绑定）。
+Expr ParseSetPower(Cur& c, int line_no, const Expr* base) {
+    Expr node = base != nullptr ? *base : ParseSetPrimary(c, line_no);
+    const Token* tk = c.At(c.pos);
+    if (tk && (tk->kind == Tk::kSym || tk->kind == Tk::kName) && tk->s == "^") {
+        ++c.pos;
+        return Expr::Bin("^", std::move(node), ParseSetUnary(c, line_no, nullptr));
+    }
+    return node;
+}
+
+// 操作数：NUM | @黑板键 | $常量 | '(' expr ')'
+Expr ParseSetPrimary(Cur& c, int line_no) {
+    const Token* tk = c.At(c.pos);
+    if (tk && tk->kind == Tk::kInt) { Expr e = Expr::Num(tk->i); ++c.pos; return e; }
+    if (tk && tk->kind == Tk::kFloat) { Expr e = Expr::Num(tk->d); ++c.pos; return e; }
+    if (tk && tk->kind == Tk::kName && tk->s.size() > 1 && tk->s[0] == '@') {
+        std::string name = tk->s.substr(1);
+        if (!IsBbName(name))
+            Fail(line_no, "set 表达式黑板引用 @" + name + " 后应为标识符");
+        ++c.pos;
+        return Expr::Bb(std::move(name));
+    }
+    if (tk && tk->kind == Tk::kName && tk->s.size() > 1 && tk->s[0] == '$') {
+        std::string name = tk->s.substr(1);
+        ++c.pos;
+        return Expr::Ref(std::move(name));
+    }
+    if (c.IsSym(c.pos, "(")) {
+        ++c.pos;
+        Expr node = ParseSetExpr(c, line_no);
+        if (!c.IsSym(c.pos, ")")) Fail(line_no, "set 表达式缺少右括号");
+        ++c.pos;
+        return node;
+    }
+    Fail(line_no, "set 表达式操作数应为数字/@黑板键/$常量或括号表达式");
+}
+
+ojson NegateJson(const ojson& v) {
+    if (v.is_number_integer()) return ojson(-v.get<int64_t>());
+    return ojson(-v.get<double>());
+}
+
+// set 值（dsl.py _parse_set_value）：字符串/布尔字面量保持单值形态；数字/@/$/
+// ( / - 起步走算术表达式；裸操作数（无运算符）回退经典 Value 形态（旧金标零扰动）。
+struct SetVal {
+    bool is_expr = false;
+    Value val;  // !is_expr：经典 lit/ref/bb 单值
+    Expr expr;  // is_expr：算术表达式
+};
+SetVal ParseSetValue(Cur& c, int line_no) {
+    const Token* tk = c.At(c.pos);
+    if (tk && (tk->kind == Tk::kString ||
+               (tk->kind == Tk::kName && (tk->s == "true" || tk->s == "false")))) {
+        SetVal out;
+        out.val = ParseRefOrValue(c, line_no, "set 值", /*allow_bb=*/true);
+        return out;
+    }
+    Expr ast = ParseSetExpr(c, line_no);
+    SetVal out;
+    if (ast.tag == "num") {
+        out.val = Value::Lit(ast.num);
+    } else if (ast.tag == "bb") {
+        out.val = Value::Bb(ast.name);
+    } else if (ast.tag == "ref") {
+        out.val = Value::Ref(ast.name);
+    } else if (ast.tag == "neg" && ast.kids[0].tag == "num") {  // `set k = -5` 折叠
+        out.val = Value::Lit(NegateJson(ast.kids[0].num));
+    } else {
+        out.is_expr = true;
+        out.expr = std::move(ast);
+    }
+    return out;
+}
+
 int64_t ParseInt(Cur& c, int line_no, const std::string& what,
                  std::optional<int64_t> minimum = std::nullopt) {
     const Token* tk = c.At(c.pos);
@@ -435,11 +628,12 @@ ScalarOrRange ParseDuration(Cur& c, int line_no, const std::string& what) {
     return v;
 }
 
-// `[retry=.., timeout=..]` / `[step_retry=.., step_timeout=..]`（顺序可交换；timeout
-// 单位 ms——Python 在两个值后都跳 ms）。值 = `@key` 黑板引用（→ 引擎 "$key" 惰性
-// 引用，运行期黑板给 int 或 {lo,hi} 表）| NUM | [lo,hi]。step_* = 继承域缺省（仅
-// 根行/容器行——编译期级联进子树各 Pipeline 的 params）；同级 retry/step_retry
-// （或 timeout/step_timeout）互斥（dsl.py _parse_modifiers）。
+// `[retry=.., timeout=.., response=..]` / `[step_retry=.., step_timeout=..,
+// step_response=..]`（顺序可交换；timeout/response 单位 ms——Python 在两个值后
+// 都跳 ms）。值 = `@key` 黑板引用（→ 引擎 "$key" 惰性引用，运行期黑板给 int 或
+// {lo,hi} 表）| NUM | [lo,hi]。step_* = 继承域缺省（仅根行/容器行——编译期级联
+// 进子树各 Pipeline 的 params）；同级 retry/step_retry（或 timeout/step_timeout、
+// response/step_response）互斥（dsl.py _parse_modifiers）。
 ModList ParseModifiers(Cur& c, int line_no) {
     ModList mods;
     if (!c.IsSym(c.pos, "[")) return mods;
@@ -447,8 +641,10 @@ ModList ParseModifiers(Cur& c, int line_no) {
     while (true) {
         const std::string* key = c.AtNameText(c.pos);
         if (!key || (*key != "retry" && *key != "timeout" &&
-                     *key != "step_retry" && *key != "step_timeout"))
-            Fail(line_no, "修饰符应为 retry/timeout/step_retry/step_timeout");
+                     *key != "response" && *key != "step_retry" &&
+                     *key != "step_timeout" && *key != "step_response"))
+            Fail(line_no,
+                 "修饰符应为 retry/timeout/response/step_retry/step_timeout/step_response");
         std::string k = *key;
         const bool is_step = k.rfind("step_", 0) == 0;
         const std::string base = is_step ? k.substr(5) : k;
@@ -854,7 +1050,10 @@ AstNode ParseNodeBlock(const Block& blk) {
             node.set_remove = true;
             ++c.pos;
         } else {
-            node.set_val = ParseRefOrValue(c, blk.line_no, "set 值", /*allow_bb=*/true);
+            // 值:$let 常量 | @黑板键 | 字面量 | 算术表达式（dsl.py _parse_set_value）
+            SetVal v = ParseSetValue(c, blk.line_no);
+            if (v.is_expr) node.set_expr = std::move(v.expr);
+            else node.set_val = std::move(v.val);
         }
     } else if (verb && (*verb == "use" || *verb == "include")) {
         const std::string* target = c.AtNameText(c.pos + 1);
@@ -992,9 +1191,10 @@ void ValidateNode(const AstNode& node) {
     if (node.kind == "choose" && node.branches.empty())
         Fail(node.line_no, "choose 需要分支子行");
     if (node.kind != "container" &&
-        (FindMod(node.mods, "step_retry") || FindMod(node.mods, "step_timeout")))
+        (FindMod(node.mods, "step_retry") || FindMod(node.mods, "step_timeout") ||
+         FindMod(node.mods, "step_response")))
         Fail(node.line_no,
-             "step_retry/step_timeout 仅用于根行/容器行(叶子行用 retry/timeout)");
+             "step_retry/step_timeout/step_response 仅用于根行/容器行(叶子行用 retry/timeout/response)");
 }
 
 ojson TokenToLetValue(const Token& tk) {
@@ -1172,6 +1372,7 @@ private:
         Scope out = inherited;
         if (const auto* v = FindMod(mods, "step_retry")) out["retry"] = *v;
         if (const auto* v = FindMod(mods, "step_timeout")) out["timeout"] = *v;
+        if (const auto* v = FindMod(mods, "step_response")) out["response"] = *v;
         return out;
     }
     // Pipeline 缺省参数（dsl.py _pipeline_params）：本级 retry/timeout 优先，
@@ -1179,7 +1380,7 @@ private:
     static void PipelineParams(const ModList& mods, const Scope& scope, ojson& inner) {
         ojson p = ojson::object();
         bool any = false;
-        for (const char* key : {"retry", "timeout"}) {
+        for (const char* key : {"retry", "timeout", "response"}) {
             if (const auto* own = FindMod(mods, key)) {
                 p[key] = *own;
                 any = true;
@@ -1204,14 +1405,37 @@ private:
         return it->second;
     }
 
-    static bool IsPureBb(const CExpr& c) {
-        if (c.tag == "cond") return c.cond_name == "bb";
-        if (c.tag == "not") return IsPureBb(c.kids[0]);
-        for (const auto& k : c.kids)
-            if (!IsPureBb(k)) return false;
-        return true;
+    // set 表达式 AST → 全括号 Lua 算式串（dsl.py _expr_lua）；@键 去重占槽
+    // n0..（有序），$常量 编译期内联（须数字常量）。
+    std::string ExprLua(const Expr& e, int line_no,
+                        std::vector<std::pair<std::string, std::string>>* slots,
+                        std::map<std::string, std::string>* by_key) {
+        if (e.tag == "num") return e.num.dump();
+        if (e.tag == "bb") {
+            auto it = by_key->find(e.name);
+            if (it != by_key->end()) return it->second;
+            std::string slot = "n" + std::to_string(slots->size());
+            by_key->emplace(e.name, slot);
+            slots->emplace_back(slot, e.name);
+            return slot;
+        }
+        if (e.tag == "ref") {
+            auto it = prog_.lets.find(e.name);
+            if (it == prog_.lets.end())
+                Fail(line_no, "未定义的常量 $" + e.name + "(set 表达式)");
+            if (!it->second.is_number())
+                Fail(line_no, "set 表达式常量 $" + e.name + " 应为数字");
+            return it->second.dump();
+        }
+        if (e.tag == "neg")
+            return "(-" + ExprLua(e.kids[0], line_no, slots, by_key) + ")";
+        // 先左后右显式求值：槽号按首次出现编序，operator+ 操作数求值序不定
+        std::string ls = ExprLua(e.kids[0], line_no, slots, by_key);
+        std::string rs = ExprLua(e.kids[1], line_no, slots, by_key);
+        return "(" + ls + " " + e.op + " " + rs + ")";
     }
 
+    
     // 条件原子参数 → 解析后的对象（Value 走 Lit；key/op 等已是 lit）
     ojson CondParamsObject(const ParamList& params, int line_no) {
         ojson out = ojson::object();
@@ -1376,12 +1600,19 @@ private:
     void ApplyEdges(const AstNode& node, ojson& target, bool pipeline) {
         if (node.until) target["*target"] = CondJson(*node.until, node.line_no);
         if (pipeline) return;
-        for (const char* key : {"retry", "timeout"})
+        for (const char* key : {"retry", "timeout", "response"})
             if (const ScalarOrRange* v = FindMod(node.mods, key))
                 target[std::string("*") + key] = *v;
     }
 
-    // when guard：纯 bb → 引擎原生 condition；其余 → 可等待条件前缀 Sequence
+    // when 守卫：统一编入节点的 condition 槽（引擎原生谓词），不再包 Sequence
+    // 前缀。每个 tick 重新求值——不满足即该节点守卫失败（script_node 按 guard
+    // Failure 收束），配合 step 级 *retry/*timeout 形成"等待直到成立"的有界轮
+    // 询；无预算则干净失败(见 pipeline OnWaitTimeout)，绝不挂在 kWait 死等。
+    // 旧实现在设备型(非纯 bb)when 上包 Sequence[守卫, body]：兄弟守卫失败=整
+    // 步硬失败, 与 `when X do Y` 的等待语义相悖, 也是 save_local_settings 守卫
+    // 失败后卡死的直接原因。统一走 cond_source/cond_json 后与 *target、容器条
+    // 件、纯 bb once 三种形态同构。
     ojson WrapWhen(const AstNode& node, ojson inner, bool with_description, bool pipeline = false) {
         if (!node.when) {
             ApplyEdges(node, inner, pipeline);
@@ -1389,25 +1620,11 @@ private:
                 inner["description"] = node.description;
             return inner;
         }
-        if (IsPureBb(*node.when)) {
-            inner["condition"] = CondJson(*node.when, node.line_no);
-            ApplyEdges(node, inner, pipeline);
-            if (with_description && !node.description.empty())
-                inner["description"] = node.description;
-            return inner;
-        }
-        ojson guard = WaitableNode(*node.when, node.line_no, node.name + "_when");
-        ojson body = inner;
-        body["name"] = node.name + "_body";
-        body.erase("description");
-        ojson out;
-        out["type"] = "Sequence";
-        out["name"] = node.name;
-        out["children"] = ojson::array({std::move(guard), std::move(body)});
+        inner["condition"] = CondJson(*node.when, node.line_no);
+        ApplyEdges(node, inner, pipeline);
         if (with_description && !node.description.empty())
-            out["description"] = node.description;
-        ApplyEdges(node, out, /*pipeline=*/false);
-        return out;
+            inner["description"] = node.description;
+        return inner;
     }
 
     ojson CompileNode(const AstNode& node, const Scope& scope) {
@@ -1419,8 +1636,6 @@ private:
             inner["type"] = "Pipeline";
             inner["name"] = node.name;
             inner["children"] = ojson::array();
-            if (node.when && IsPureBb(*node.when))
-                inner["condition"] = CondJson(*node.when, ln);
             if (node.until) inner["*target"] = CondJson(*node.until, ln);
             PipelineParams(node.mods, inner_scope, inner);
             ojson kids = ojson::array();
@@ -1472,6 +1687,22 @@ private:
         }
 
         if (node.kind == "set") {
+            if (node.set_expr) {
+                // 算术表达式 → Script(bb_calc)：@键 占槽 "$key" 运行期解析，Lua 求值
+                // 后 bb.set 写回（缺键操作数 → 脚本错误 → 该步诚实失败）
+                ojson out;
+                out["type"] = "Script";
+                out["name"] = node.name;
+                out["source"] = "actions/bb_calc.lua";
+                ojson p = ojson::object();
+                p["key"] = node.set_key;
+                std::vector<std::pair<std::string, std::string>> slots;  // (槽名, bb键) 有序
+                std::map<std::string, std::string> by_key;
+                p["expr"] = ExprLua(*node.set_expr, ln, &slots, &by_key);
+                for (const auto& kv : slots) p[kv.first] = "$" + kv.second;
+                out["params"] = std::move(p);
+                return WrapWhen(node, std::move(out), /*with_description=*/true);
+            }
             // @src → "$src" 运行期黑板拷贝（引擎 Set 契约）；$c = let 常量编译期内联
             ojson out;
             out["type"] = "Set";

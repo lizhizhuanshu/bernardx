@@ -223,6 +223,62 @@ TEST(BtDslCompile, BbRefCompilesToInjectionContract) {
     EXPECT_EQ(res.tree["children"][1]["params"]["value"], "$src");
 }
 
+// ── set 值算术表达式（dsl.py TestSetExpr 镜像）──────────────────────────
+
+TEST(BtDslCompile, SetExprCompilesToBbCalcScript) {
+    bt_dsl::DslResult res = bt_dsl::CompileText("t:\n  inc: set count = @count + 1");
+    ASSERT_TRUE(res.error.empty()) << res.error;
+    auto node = res.tree["children"][0];
+    EXPECT_EQ(node["type"], "Script");
+    EXPECT_EQ(node["name"], "inc");
+    EXPECT_EQ(node["source"], "actions/bb_calc.lua");
+    EXPECT_EQ(node["params"]["key"], "count");
+    EXPECT_EQ(node["params"]["expr"], "(n0 + 1)");
+    EXPECT_EQ(node["params"]["n0"], "$count");
+}
+
+TEST(BtDslCompile, SetExprPrecedenceSlotsAndClassicForms) {
+    // 乘法层绑 tighter + 括号分组；@a 去重占槽；$let 编译期内联；裸操作数保持 Set
+    bt_dsl::DslResult res = bt_dsl::CompileText(
+        "t:\n"
+        "  let s = 2.5\n"
+        "  a: set x = @a + 1 * 2\n"
+        "  b: set y = (@a + @b * @a) % $s\n"
+        "  c: set n = -5\n"
+        "  d: set p = \"home\"\n");
+    ASSERT_TRUE(res.error.empty()) << res.error;
+    EXPECT_EQ(res.tree["children"][0]["params"]["expr"], "(n0 + (1 * 2))");
+    auto b = res.tree["children"][1]["params"];
+    EXPECT_EQ(b["expr"], "((n0 + (n1 * n0)) % 2.5)");
+    EXPECT_EQ(b["n0"], "$a");
+    EXPECT_EQ(b["n1"], "$b");
+    EXPECT_EQ(res.tree["children"][2]["type"], "Set");
+    EXPECT_EQ(res.tree["children"][2]["params"]["value"], -5);
+    EXPECT_EQ(res.tree["children"][3]["type"], "Set");
+    EXPECT_EQ(res.tree["children"][3]["params"]["value"], "home");
+}
+
+TEST(BtDslCompile, SetExprUnaryMinusAndPowForms) {
+    bt_dsl::DslResult res = bt_dsl::CompileText(
+        "t:\n"
+        "  a: set x = -@a + 1\n"
+        "  b: set y = - 2 ^ 2\n"
+        "  c: set z = @a -1\n");
+    ASSERT_TRUE(res.error.empty()) << res.error;
+    EXPECT_EQ(res.tree["children"][0]["params"]["expr"], "((-n0) + 1)");
+    EXPECT_EQ(res.tree["children"][1]["params"]["expr"], "(-(2 ^ 2))");
+    EXPECT_EQ(res.tree["children"][2]["params"]["expr"], "(n0 - 1)");
+}
+
+TEST(BtDslCompile, SetExprErrors) {
+    EXPECT_NE(ErrOf("t:\n  a: set x = $nope + 1").find("未定义的常量"), std::string::npos);
+    EXPECT_NE(ErrOf("t:\n  let s = \"t\"\n  a: set x = $s + 1").find("应为数字"),
+              std::string::npos);
+    EXPECT_NE(ErrOf("t:\n  a: set x = @a + \"s\"").find("操作数应为"), std::string::npos);
+    EXPECT_NE(ErrOf("t:\n  a: set x = (@a + 1").find("右括号"), std::string::npos);
+    EXPECT_NE(ErrOf("t:\n  a: set x = @a + 1 & 2").find("多余内容"), std::string::npos);
+}
+
 TEST(BtDslCompile, SeeAttrPredicateAcceptsBbRef) {
     // see/attr 谓词值位置此前只收字符串字面量 / $ref，allow_bb=true 后 @bb_key 也通过。
     // 编译产物仍是结构化下发：`value` 走 "$key" 注入约定，see 脚本按字段拿，不做字符串拼接。
@@ -287,19 +343,45 @@ TEST(BtDslCompile, ContainerModsBecomePipelineDefaults) {
     EXPECT_FALSE(pipe.contains("*timeout"));
 }
 
-TEST(BtDslCompile, NonPureWhenOnContainerPutsEdgesOnWrapper) {
+TEST(BtDslCompile, ResponseModOnLeafBecomesEdge) {
+    // 动作行 `[response=..]` / `[response=[lo,hi]ms]` → `*response` 边缘参数。
+    bt_dsl::DslResult res = bt_dsl::CompileText(
+        "t:\n  a[response=400]: wait 1ms\n  b[response=[1000,3000]ms]: wait 1ms");
+    ASSERT_TRUE(res.error.empty()) << res.error;
+    EXPECT_EQ(res.tree["children"][0]["*response"], 400);
+    EXPECT_EQ(res.tree["children"][1]["*response"].dump(), "[1000,3000]");
+}
+
+TEST(BtDslCompile, StepResponseOnContainerBecomesPipelineDefault) {
+    // 容器行 `[step_response=..]` → Pipeline 级缺省 params.response（不发 * 字段）；
+    // 叶子行用 step_response → 拒绝。
+    bt_dsl::DslResult res = bt_dsl::CompileText(
+        "t[step_response=500]:\n  g:\n    a: wait 1ms");
+    ASSERT_TRUE(res.error.empty()) << res.error;
+    auto pipe = res.tree["children"][0];
+    EXPECT_EQ(pipe["type"], "Pipeline");
+    // 根的 step_response → 根 Pipeline params；无显式 params 时才发
+    //（根行本身是 Pipeline，step_* 落地其 params）。
+    EXPECT_EQ(res.tree["params"]["response"], 500);
+
+    auto bad = bt_dsl::CompileText("t:\n  a[step_response=500]: wait 1ms");
+    EXPECT_NE(bad.error.find("仅用于根行/容器行"), std::string::npos);
+}
+
+TEST(BtDslCompile, NonPureWhenOnContainerBecomesCondition) {
+    // when（设备型）统一编入容器节点 condition 槽，不再包 Sequence 前缀；
+    // 容器行 mods 的 retry 经 pipeline 分支落到内层 Pipeline params 缺省。
     bt_dsl::DslResult res = bt_dsl::CompileText(
         "t:\n  g[retry=1]: when see \"**/X\":\n    a: wait 1ms");
     ASSERT_TRUE(res.error.empty()) << res.error;
     auto outer = res.tree["children"][0];
-    // 非纯 bb when → 外层 Sequence（<n>_when + <n>_body），*retry 落在外层
-    EXPECT_EQ(outer["type"], "Sequence");
-    EXPECT_EQ(outer["*retry"], 1);
-    EXPECT_EQ(outer["children"][0]["name"], "g_when");
-    EXPECT_EQ(outer["children"][1]["name"], "g_body");
-    EXPECT_EQ(outer["children"][1]["type"], "Pipeline");
-    // 照抄 dsl.py：容器分支先设 params 再包装 → 内层 Pipeline 仍带缺省
-    EXPECT_EQ(outer["children"][1]["params"]["retry"], 1);
+    EXPECT_EQ(outer["type"], "Pipeline");
+    ASSERT_TRUE(outer.contains("condition")) << "when 应编入 condition 槽";
+    EXPECT_EQ(outer["condition"]["type"], "Script");
+    EXPECT_EQ(outer["condition"]["source"], "conds/see.lua");
+    // 容器 step 的 retry 走 pipeline 分支 → 内层 params 缺省（无 *retry 边缘）
+    EXPECT_EQ(outer["params"]["retry"], 1);
+    EXPECT_FALSE(outer.contains("*retry"));
 }
 
 // ── use/include 跨文件引用 ───────────────────────────────────────────────
@@ -405,16 +487,17 @@ TEST(BtDslRegistry, CustomCondUntilTarget) {
 }
 
 TEST(BtDslRegistry, CustomCondWhenGuardAndRepeat) {
-    // when 守卫（非纯 bb）→ 可等待前缀（waitable_source）
+    // when 守卫 → 统一编入节点 condition 槽，布尔形态用 cond_source（不再
+    // 取 waitable_source 包 Sequence 前缀）
     bt_dsl::DslResult w =
         bt_dsl::CompileText("t:\n  a: when my_cond k=3 click \"**/A\"", &kCondReg);
     ASSERT_TRUE(w.error.empty()) << w.error;
     const auto& node = w.tree["children"][0];
-    EXPECT_EQ(node["type"], "Sequence");
-    const auto& guard = node["children"][0];
-    EXPECT_EQ(guard["type"], "Script");
-    EXPECT_EQ(guard["source"], "conds/my_wait.lua");
-    EXPECT_EQ(guard["params"]["k"], 3);
+    EXPECT_EQ(node["type"], "Script");
+    ASSERT_TRUE(node.contains("condition"));
+    EXPECT_EQ(node["condition"]["type"], "Script");
+    EXPECT_EQ(node["condition"]["source"], "conds/my.lua");
+    EXPECT_EQ(node["condition"]["params"]["k"], 3);
     // repeat until 双形态：until/waitable 位 waitable_source + *target cond_source
     bt_dsl::DslResult r = bt_dsl::CompileText(
         "t:\n  a: repeat until my_cond max 2:\n    b: wait 1ms", &kCondReg);
@@ -457,14 +540,19 @@ TEST(BtDslRegistry, CustomRegistryReplacesDefaultConds) {
 }
 
 TEST(BtDslRegistry, CondMissingForms) {
-    // 只登记 waitable_source 的条件用在 *target 位 → 无布尔形态
+    // 只登记 waitable_source 的条件用在 *target / when 位 → 无布尔形态
     EXPECT_NE(ErrOf("t:\n  a: until wait_only click \"**/A\"", &kCondReg)
                   .find("无布尔形态"),
               std::string::npos);
-    // 只登记 cond_source 的条件用在 when 守卫位 → 无可等待形态
-    EXPECT_NE(ErrOf("t:\n  a: when bool_only click \"**/A\"", &kCondReg)
-                  .find("无可等待形态"),
+    EXPECT_NE(ErrOf("t:\n  a: when wait_only click \"**/A\"", &kCondReg)
+                  .find("无布尔形态"),
               std::string::npos);
+    // 只登记 cond_source 的条件用在 when 守卫位 → 编译进 condition 槽（无条件时序要求 waitable_source）
+    bt_dsl::DslResult ok =
+        bt_dsl::CompileText("t:\n  a: when bool_only click \"**/A\"", &kCondReg);
+    ASSERT_TRUE(ok.error.empty()) << ok.error;
+    ASSERT_TRUE(ok.tree["children"][0].contains("condition"));
+    EXPECT_EQ(ok.tree["children"][0]["condition"]["source"], "conds/bo.lua");
 }
 
 // ── 路径判定 ─────────────────────────────────────────────────────────────
@@ -636,4 +724,25 @@ TEST_F(BtDslE2eTest, BtInitDotBtDslErrorReachesLua) {
     )");
     EXPECT_NE(out.find("failed to compile root bt dsl"), std::string::npos);
     EXPECT_NE(out.find("第 2 行"), std::string::npos);
+}
+
+// `set count = @count + 1` 端到端：DSL 编译 → Script(actions/bb_calc.lua) →
+// ScriptNode Enter 解析 $count 参数 → Lua 求值 → bb.set 写回。bb_calc.lua 测试
+// 副本在 tests/actions/（与 prototype/libs/actions/bb_calc.lua 同源，契约变更须同步）。
+TEST_F(BtDslE2eTest, SetExprIncrementsBlackboardEndToEnd) {
+    resource_provider_->Put("bt/calc.bt",
+                            "calc: # e2e set expr\n"
+                            "  s1: set count = 5\n"
+                            "  s2: set count = @count + 1\n"
+                            "  s3: set x = @count * 2\n");
+    auto out = RunLua(R"(
+        local bt = require('bt')
+        local bb = require('blackboard')
+        local st, err = bt.init({root = "res://bt/calc.bt"})
+        if not st then return 'init-fail: ' .. tostring(err) end
+        local st2, err2 = bt.exec({interval = 10})
+        return tostring(st2) .. ':' .. tostring(err2) .. ':'
+            .. tostring(bb.get('count')) .. ',' .. tostring(bb.get('x'))
+    )");
+    EXPECT_EQ(out, "success::6,12");
 }
