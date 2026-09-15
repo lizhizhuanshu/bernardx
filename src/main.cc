@@ -11,15 +11,12 @@
 #include <thread>
 
 #include "async_io_library.h"
-#include "bt_library.h"
 #include "http_library.h"
 #include "json_library.h"
 #include "fs_library.h"
-#include "blackboard_library.h"
 #include "file_system_code_provider.h"
 #include "file_system_resource_provider.h"
 #include "lua_runtime.h"
-#include "blackboard.h"
 
 DEFINE_string(dir, ".", "Working directory containing src/ and libs/");
 DEFINE_string(entry, "", "Entry Lua file relative to --dir (default: src/main.lua)");
@@ -40,9 +37,6 @@ int main(int argc, char* argv[]) {
 
     auto code_provider = std::make_shared<FileSystemCodeProvider>(dir);
     auto resource_provider = std::make_shared<FileSystemResourceProvider>(dir + "/res");
-    auto blackboard = std::make_shared<Blackboard>();
-    auto bb_lib = std::make_shared<BlackboardLibrary>(blackboard);
-    auto bt_lib = std::make_shared<BehaviorTreeLibrary>(blackboard);
     auto http_lib = std::make_shared<HttpLibrary>(*http_exec);
     auto json_lib = std::make_shared<JsonLibrary>();
     auto fs_lib = std::make_shared<FileSystemLibrary>();
@@ -53,8 +47,6 @@ int main(int argc, char* argv[]) {
                   .WithCodeProvider(code_provider)
                   .WithResourceProvider(resource_provider)
                   .WithExecutor(executor)
-                  .RegisterLibrary(bb_lib)
-                  .RegisterLibrary(bt_lib)
                   .RegisterLibrary(http_lib)
                   .RegisterLibrary(json_lib)
                   .RegisterLibrary(fs_lib)
@@ -73,10 +65,6 @@ int main(int argc, char* argv[]) {
     if (result.status != 0) {
         std::cerr << entry << " failed: " << result.error << std::endl;
         return 1;
-    }
-
-    if (bt_lib->engine() && bt_lib->engine()->IsLoaded()) {
-        bt_lib->engine()->Stop();
     }
 
     ioc_work.reset();
