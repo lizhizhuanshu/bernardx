@@ -19,16 +19,19 @@ lua_State* CoroutinePool::Acquire() {
 }
 
 void CoroutinePool::Release(lua_State* co) {
+    auto it = active_co_refs_.find(co);
+    if (it == active_co_refs_.end()) {
+        // Not pool-owned (script-created coroutine, or already released):
+        // reset/pooling it would clobber state the script may still inspect.
+        return;
+    }
     // Reset a finished (or yielded-then-cancelled) coroutine back to a reusable
     // state. lua_settop only clears the stack; a coroutine that has returned
     // (status LUA_OK but not at base level) is "dead" and lua_resume on it
     // fails. lua_closethread unwinds the CallInfo and resets status to LUA_OK.
     lua_closethread(co, nullptr);
-    auto it = active_co_refs_.find(co);
-    if (it != active_co_refs_.end()) {
-        co_pool_.push_back({co, it->second});
-        active_co_refs_.erase(it);
-    }
+    co_pool_.push_back({co, it->second});
+    active_co_refs_.erase(it);
 }
 
 void CoroutinePool::Shutdown(lua_State* main_L) {

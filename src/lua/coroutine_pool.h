@@ -18,6 +18,12 @@ public:
     lua_State* Acquire();
     void Release(lua_State* co);
 
+    // True while co is checked out from this pool (between Acquire and
+    // Release). Script-created coroutines are never pool-owned.
+    [[nodiscard]] bool Owns(lua_State* co) const {
+        return active_co_refs_.find(co) != active_co_refs_.end();
+    }
+
     void Shutdown(lua_State* main_L);
 
 private:

@@ -14,6 +14,7 @@ extern "C" {
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -126,9 +127,25 @@ public:
     // --- Coroutine pool ---
 
     [[nodiscard]] lua_State* AcquireCoroutine() { return co_pool_->Acquire(); }
-    void ReleaseCoroutine(lua_State* co) { co_pool_->Release(co); }
+    // Recycle a coroutine to the pool. Coroutine-owned states only: a
+    // script-created coroutine (coroutine.create) that used an engine async op
+    // also reaches this path — it is left untouched, never reset/pooled.
+    void ReleaseCoroutine(lua_State* co);
     void SetCoCompleteCallback(lua_State* co, std::function<void(ScriptResult)> cb);
     void RemoveCoCompleteCallback(lua_State* co);
+
+    // --- Unhandled coroutine errors ---
+    //
+    // The engine resumes coroutines nobody is awaiting: setTimeout callbacks,
+    // script coroutines parked on engine async ops, late completions for
+    // coroutines that already died ("cannot resume dead coroutine"). When such
+    // a coroutine errors there is no completion handler, so the error used to
+    // be dropped on the floor and the run falsely reported success.
+    // RecordUnhandledError (executor thread) parks the first such error;
+    // TakeUnhandledError (any thread) atomically reads and clears it so the
+    // host can fail the run.
+    void RecordUnhandledError(ScriptErrorDetail detail);
+    [[nodiscard]] std::optional<ScriptErrorDetail> TakeUnhandledError();
     std::shared_ptr<CodeProvider> shared_code_provider() const { return code_provider_; }
     void set_shared_code_provider(std::shared_ptr<CodeProvider> provider) { code_provider_ = std::move(provider); }
 
@@ -233,6 +250,20 @@ private:
 
     void MaybeRecycleCo(lua_State* co, int status, int nresults);
 
+    // Drop pending_ entries (and their timers) still pointing at a coroutine
+    // that just reached a terminal state. Their async completions can never
+    // resume it again — leaving them would make a late completion resume a
+    // dead or pool-recycled coroutine under the same pointer.
+    void CleanupStalePendings(lua_State* co);
+
+    // Before resuming a parked coroutine: it must still be suspended
+    // (LUA_YIELD). If it finished, errored, or the script resumed/closed it
+    // while the async op was in flight, records the condition as an unhandled
+    // error (a bare lua_resume would only report "cannot resume dead
+    // coroutine" — or corrupt a pool-recycled coroutine reused by another
+    // task under the same pointer) and returns false.
+    bool CheckResumable(lua_State* co, AsyncHandle handle);
+
     // --- Members ---
 
     std::unique_ptr<sol::state> lua_;
@@ -256,4 +287,9 @@ private:
     std::unique_ptr<CoroutinePool> co_pool_;
 
     std::unordered_map<lua_State*, CompletionHandler> completions_;
+
+    // See RecordUnhandledError / TakeUnhandledError. Guarded by the mutex
+    // because Take runs on the host thread while Record runs on the executor.
+    std::mutex unhandled_error_mutex_;
+    std::optional<ScriptErrorDetail> unhandled_error_;
 };
