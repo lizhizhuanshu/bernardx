@@ -70,8 +70,13 @@ void CacheModuleValues(lua_State* L, const char* name, std::vector<LuaValue>& va
 std::string CollectStackTrace(lua_State* L) {
     std::string trace;
     lua_Debug debug;
+    // ⚠ 不要用 "Slt":getinfo 的 't'(尾调用信息)只在尾调用帧压一个串,
+    // 原实现却每帧无条件 pop(非尾帧误弹栈上别的值)、continue 时又漏弹
+    // —— 一次报错会在协程栈上留下残串(如 " (local 'x')"),复用该协程的
+    // 下一次 eval 会把它当返回值带出去。这里只需要 source/line,用 "Sl"
+    // 零压栈零弹栈。
     for (int level = 0; lua_getstack(L, level, &debug); ++level) {
-        lua_getinfo(L, "Slt", &debug);
+        lua_getinfo(L, "Sl", &debug);
         const char* source = debug.source ? debug.source : "?";
         // Skip internal C frames and error message frames
         if (source[0] == '=' && debug.currentline < 0) continue;
@@ -80,7 +85,6 @@ std::string CollectStackTrace(lua_State* L) {
         } else {
             trace += " -> " + std::string(source) + ":" + std::to_string(debug.currentline);
         }
-        lua_pop(L, 1);
     }
     return trace;
 }

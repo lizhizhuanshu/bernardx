@@ -20,10 +20,13 @@ lua_State* CoroutinePool::Acquire() {
 
 void CoroutinePool::Release(lua_State* co) {
     // Reset a finished (or yielded-then-cancelled) coroutine back to a reusable
-    // state. lua_settop only clears the stack; a coroutine that has returned
-    // (status LUA_OK but not at base level) is "dead" and lua_resume on it
-    // fails. lua_closethread unwinds the CallInfo and resets status to LUA_OK.
+    // state. lua_closethread unwinds the CallInfo and resets status to LUA_OK
+    // but does NOT clear the stack — any residue (error objects, helper
+    // chunks, misbalanced pushes) would ride into the next user of this
+    // coroutine (seen live: a stale tail-call marker string surfacing as a
+    // bogus extra return value in the NEXT eval). Clear it explicitly.
     lua_closethread(co, nullptr);
+    lua_settop(co, 0);
     auto it = active_co_refs_.find(co);
     if (it != active_co_refs_.end()) {
         co_pool_.push_back({co, it->second});
