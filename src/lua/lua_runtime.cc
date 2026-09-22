@@ -360,7 +360,12 @@ int builtin_await_reject(lua_State* L) {
 enum { UV_AWAIT_FN = 1, UV_AWAIT_RESOLVE = 2, UV_AWAIT_REJECT = 3 };
 
 int finish_await_body(lua_State* L, int status, lua_KContext ctx) {
-    if (status != LUA_OK) {
+    // LUA_YIELD is NOT an error here: Lua 5.4 (ldo.c finishCcall) invokes this
+    // continuation with LUA_YIELD when the body yielded across the pcallk
+    // protection (sleep / ws:send / nested await) and was resumed normally.
+    // Treating it as an error used to fire a spurious reject("error object
+    // (...)") that raced ahead of the body's own async resolve/reject.
+    if (status != LUA_OK && status != LUA_YIELD) {
         // Error object on top (may be non-string — builtin_await_reject only
         // forwards strings, so name the type for those).
         size_t len = 0;
