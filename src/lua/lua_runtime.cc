@@ -351,6 +351,39 @@ int builtin_await_reject(lua_State* L) {
     return 0;
 }
 
+// await body trampoline: calls fn(resolve, reject) protected, so a body that
+// raises without rejecting synthesizes reject(err) instead of dying silently.
+// Previously the body task carried an empty promise: its error vanished AND
+// the awaiter stayed parked forever (the run hung until interrupted).
+// pcallk (not pcall) so a body that yields across the protection (sleep,
+// await, ...) stays resumable.
+enum { UV_AWAIT_FN = 1, UV_AWAIT_RESOLVE = 2, UV_AWAIT_REJECT = 3 };
+
+int finish_await_body(lua_State* L, int status, lua_KContext ctx) {
+    if (status != LUA_OK) {
+        // Error object on top (may be non-string — builtin_await_reject only
+        // forwards strings, so name the type for those).
+        size_t len = 0;
+        const char* msg = lua_tolstring(L, -1, &len);
+        std::string text = msg ? std::string(msg, len)
+                               : std::string("error object (") +
+                                     lua_typename(L, lua_type(L, -1)) + ")";
+        lua_pop(L, 1);
+        lua_pushvalue(L, lua_upvalueindex(UV_AWAIT_REJECT));
+        lua_pushlstring(L, text.data(), text.size());
+        lua_call(L, 1, 0);  // reject is guarded by the done table (no-op if resolved)
+    }
+    return 0;
+}
+
+int await_body_trampoline(lua_State* L) {
+    lua_pushvalue(L, lua_upvalueindex(UV_AWAIT_FN));
+    lua_pushvalue(L, lua_upvalueindex(UV_AWAIT_RESOLVE));
+    lua_pushvalue(L, lua_upvalueindex(UV_AWAIT_REJECT));
+    int status = lua_pcallk(L, 2, 0, 0, 0, finish_await_body);
+    return finish_await_body(L, status, 0);
+}
+
 int builtin_await(lua_State* L) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
     auto rt = LuaRuntime::FromLuaState(L);
@@ -369,19 +402,17 @@ int builtin_await(lua_State* L) {
     lua_pushvalue(L, 2);
     lua_pushcclosure(L, builtin_await_reject, 3);
 
+    // Trampoline keeps fn/resolve/reject alive as upvalues; no registry refs
+    // (or LuaRef args) needed. The task promise stays empty — completion is
+    // always driven by resolve/reject.
     lua_pushvalue(L, 1);
-    int fn_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-
     lua_pushvalue(L, 3);
-    int resolve_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-
     lua_pushvalue(L, 4);
-    int reject_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_pushcclosure(L, await_body_trampoline, 3);
+    int tramp_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
     async_simple::Promise<ScriptResult> promise;
-    rt->PushTask({CallRef{fn_ref,
-        {rt->CreateRef(resolve_ref, LUA_TFUNCTION), rt->CreateRef(reject_ref, LUA_TFUNCTION)},
-        true}, std::move(promise)});
+    rt->PushTask({CallRef{tramp_ref, {}, true}, std::move(promise)});
 
     return LuaRuntime::Yield(L);
 }
@@ -546,6 +577,7 @@ void LuaRuntime::PushResumeDirect(AsyncHandle handle, std::function<int(lua_Stat
         if (it == self->pending_.end()) return;
         auto* co = it->second.co;
         self->pending_.erase(it);
+        if (!self->CheckResumable(co, handle)) return;
         int nresults = fn(co);
         int actual_nresults = 0;
         int status = lua_resume(co, self->main_L_, nresults, &actual_nresults);
@@ -834,6 +866,7 @@ bool LuaRuntime::CallWithCallback(lua_State* co, int nargs, std::function<void(S
     }
 
     // Synchronous completion (OK or error)
+    CleanupStalePendings(co);
     ScriptResult result;
     result.status = status;
     if (status != LUA_OK) {
@@ -872,6 +905,57 @@ void LuaRuntime::CancelCall(lua_State* co) {
     ReleaseCoroutine(co);
 }
 
+// --- Unhandled coroutine errors / stale pending cleanup ---
+
+void LuaRuntime::ReleaseCoroutine(lua_State* co) {
+    // Pool guards ownership: script-created coroutines pass through untouched.
+    co_pool_->Release(co);
+}
+
+void LuaRuntime::RecordUnhandledError(ScriptErrorDetail detail) {
+    spdlog::error("LuaRuntime: unhandled coroutine error: {} (at {}:{})",
+                  detail.message, detail.source, detail.line);
+    std::lock_guard lock(unhandled_error_mutex_);
+    if (!unhandled_error_.has_value()) {
+        unhandled_error_ = std::move(detail);
+    }
+}
+
+std::optional<ScriptErrorDetail> LuaRuntime::TakeUnhandledError() {
+    std::lock_guard lock(unhandled_error_mutex_);
+    auto detail = std::move(unhandled_error_);
+    unhandled_error_.reset();
+    return detail;
+}
+
+void LuaRuntime::CleanupStalePendings(lua_State* co) {
+    for (auto it = pending_.begin(); it != pending_.end();) {
+        if (it->second.co == co) {
+            timer_mgr_->CancelTimer(it->first);
+            it = pending_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool LuaRuntime::CheckResumable(lua_State* co, AsyncHandle handle) {
+    int co_status = lua_status(co);
+    if (co_status == LUA_YIELD) return true;
+
+    ScriptErrorDetail detail;
+    detail.message =
+        "async completion for handle " + std::to_string(handle) +
+        " found its coroutine no longer suspended (status " +
+        std::to_string(co_status) +
+        "); the coroutine finished, errored, or was resumed/closed by the "
+        "script while the operation was pending";
+    RecordUnhandledError(std::move(detail));
+    CleanupStalePendings(co);
+    ReleaseCoroutine(co);
+    return false;
+}
+
 // --- Coroutine completion callback ---
 
 void LuaRuntime::SetCoCompleteCallback(lua_State* co, std::function<void(ScriptResult)> cb) {
@@ -888,13 +972,17 @@ void LuaRuntime::MaybeRecycleCo(lua_State* co, int status, int nresults) {
         spdlog::error("LuaRuntime: {}", detail.message);
         lua_pop(co, 1);
 
-        ScriptResult result;
-        result.status = status;
-        result.error_detail = std::move(detail);
-        result.error = result.error_detail.message;
+        // Terminal state: no async completion can ever resume this coroutine
+        // again. Purge leftover pending_ entries so a late completion does not
+        // resume a dead (or pool-recycled) coroutine under the same pointer.
+        CleanupStalePendings(co);
 
         auto it = completions_.find(co);
         if (it != completions_.end()) {
+            ScriptResult result;
+            result.status = status;
+            result.error_detail = detail;
+            result.error = detail.message;
             auto handler = std::move(it->second);
             completions_.erase(it);
             ReleaseCoroutine(co);
@@ -903,11 +991,17 @@ void LuaRuntime::MaybeRecycleCo(lua_State* co, int status, int nresults) {
                 [&](std::function<void(ScriptResult)>& cb) { cb(std::move(result)); }
             }, handler);
         } else {
+            // Nobody awaits this coroutine (setTimeout callback body, a script
+            // coroutine parked on an engine async op, ...). Surface the error
+            // instead of dropping it — the run must not report success.
             ReleaseCoroutine(co);
+            RecordUnhandledError(std::move(detail));
         }
         return;
     }
     if (status != LUA_YIELD) {
+        CleanupStalePendings(co);
+
         ScriptResult result;
         result.status = status;
         if (status == LUA_OK) {
@@ -938,6 +1032,10 @@ LuaRuntime::ResumeResult LuaRuntime::DoResume(AsyncHandle handle, std::vector<Lu
     }
     co = it->second.co;
     pending_.erase(it);
+
+    if (!CheckResumable(co, handle)) {
+        return {co, LUA_ERRRUN};
+    }
 
     PushValues(co, args);
     int nresults = 0;
@@ -974,6 +1072,7 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::CallFunction(int fn_ref, std:
 
 async_simple::coro::Lazy<ScriptResult> LuaRuntime::AwaitCoroutine(lua_State* co, int status, int nresults) {
     if (status == LUA_OK) {
+        CleanupStalePendings(co);
         auto values = PeekValues(co, nresults);
         ReleaseCoroutine(co);
         co_return ScriptResult{LUA_OK, std::move(values)};
@@ -991,6 +1090,7 @@ async_simple::coro::Lazy<ScriptResult> LuaRuntime::AwaitCoroutine(lua_State* co,
     }
 
     // Error
+    CleanupStalePendings(co);
     auto detail = CaptureErrorDetail(co);
     spdlog::error("LuaRuntime: {}", detail.message);
     lua_pop(co, 1);

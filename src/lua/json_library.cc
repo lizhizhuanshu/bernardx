@@ -58,7 +58,7 @@ static void push_json_value(lua_State* L, const json& val) {
 }
 
 // --- Convert a Lua value at given index to JSON ---
-// Implemented in json_lua.h (shared with bt.init params reading).
+// Implemented in json_lua.h.
 // json.decode(str) -> table/value
 static int json_decode(lua_State* L) {
     size_t len;

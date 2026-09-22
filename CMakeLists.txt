@@ -100,36 +100,11 @@ add_library(bernardx_lib STATIC
     src/lua/http_library.cc
     src/lua/json_library.cc
     src/lua/fs_library.cc
-    src/lua/blackboard_library.cc
-    src/lua/bt_library.cc
     src/lua/resource_library.cc
     src/lua/async_io_library.cc
     src/lua/file_system_resource_provider.cc
-    src/bt/behavior_tree_engine.cc
-    src/bt/path_tracer.cc
-    src/bt/bt_dsl.cc
-    src/bt/tree_parser.cc
-    src/bt/single_child_node.cc
-    src/bt/lua_script_host.cc
-    src/bt/script_node.cc
-    src/bt/script_condition.cc
-    src/bt/blackboard_condition.cc
-    src/bt/condition_composite.cc
-    src/bt/node.cc
-    src/bt/composite.cc
-    src/bt/selector.cc
-    src/bt/sequence.cc
-    src/bt/pipeline.cc
-    src/bt/parallel.cc
-    src/bt/inverter.cc
-    src/bt/repeat.cc
-    src/bt/retry.cc
-    src/bt/random_selector.cc
-    src/bt/random_sequence.cc
-    src/bt/set_node.cc
-    src/bt/wait_node.cc
 )
-target_include_directories(bernardx_lib PUBLIC src/lua src/bt)
+target_include_directories(bernardx_lib PUBLIC src/lua)
 cinatra_use_third_party_headers(bernardx_lib)
 target_include_directories(bernardx_lib SYSTEM PRIVATE ${CINATRA_DIR}/include)
 if(OpenSSL_FOUND)
@@ -172,7 +147,7 @@ add_subdirectory(${GFLAGS_DIR})
 
 add_executable(bernardx src/main.cc)
 target_link_libraries(bernardx PRIVATE bernardx_lib gflags)
-target_include_directories(bernardx PRIVATE ${CMAKE_SOURCE_DIR}/src/lua ${CMAKE_SOURCE_DIR}/src/bt)
+target_include_directories(bernardx PRIVATE ${CMAKE_SOURCE_DIR}/src/lua)
 target_include_directories(bernardx SYSTEM PRIVATE ${CINATRA_DIR}/include)
 cinatra_use_third_party_headers(bernardx)
 
@@ -187,7 +162,7 @@ if(BERNARDX_BUILD_TESTS)
     target_compile_definitions(bernardx_test PRIVATE
         BERNARDX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
     target_link_libraries(bernardx_test PRIVATE bernardx_lib GTest::gtest_main)
-    target_include_directories(bernardx_test PRIVATE ${CMAKE_SOURCE_DIR}/src/lua ${CMAKE_SOURCE_DIR}/src/bt)
+    target_include_directories(bernardx_test PRIVATE ${CMAKE_SOURCE_DIR}/src/lua)
     target_include_directories(bernardx_test SYSTEM PRIVATE ${CINATRA_DIR}/include)
     cinatra_use_third_party_headers(bernardx_test)
 

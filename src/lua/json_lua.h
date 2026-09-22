@@ -13,10 +13,9 @@ extern "C" {
 #include "lua_runtime.h"
 #include "lua_types.h"
 
-// Bridge nlohmann::json values to Lua. Used at Node::Init time (when a live
-// lua_State is available) to turn Script `params` — which may be
-// objects or arrays — into real Lua tables (LuaRef). Scalars map the same way
-// the old ParseLuaValue did.
+// Bridge nlohmann::json values to Lua. Used by json.decode to turn objects
+// and arrays into real Lua tables. Scalars map the same way the old
+// ParseLuaValue did.
 
 // Push any json value onto `L` without creating a registry ref. Scalars map
 // directly; objects/arrays become nested tables (objects use string field
@@ -99,8 +98,8 @@ inline LuaValue JsonToLuaValue(lua_State* L, LuaRuntime* rt, const nlohmann::jso
 
 // Convert a Lua value at index `idx` to json. Scalars map directly; tables
 // become objects, except a table whose keys are all positive integers 1..N
-// (contiguous from 1) becomes a json array (1-based → 0-based). Used to read
-// `params` tables passed to bt.init, and by json.encode.
+// (contiguous from 1) becomes a json array (1-based → 0-based). Used by
+// json.encode.
 //
 // For tables: copies the table to the top of the stack first, so recursive
 // calls with lua_pushnil/lua_next don't invalidate the index.
