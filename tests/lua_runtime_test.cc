@@ -344,6 +344,39 @@ TEST_F(LuaRuntimeTest, ClearTimeoutOnFiredTimerIsHarmless) {
     )")).status, LUA_OK);
 }
 
+// --- Interrupt ---
+
+TEST_F(LuaRuntimeTest, InterruptReportsSuspensionLocation) {
+    // An async op that parks forever: the run can only end via Interrupt.
+    rt->lua().set_function("park_forever", [](lua_State* L) -> int {
+        auto ctx = LuaRuntime::FromLuaState(L);
+        (void)ctx->PreYield(L);  // no PushResume will ever come
+        return ctx->Yield(L);
+    });
+    std::thread interrupter([this]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        rt->Interrupt();
+    });
+    auto r = AWAIT(rt->RunScript(
+        "local a = 1\n"
+        "park_forever()\n"
+        "local b = 2"));
+    interrupter.join();
+    EXPECT_EQ(r.status, LUA_ERRRUN);
+    EXPECT_EQ(r.error, "interrupted");
+    // The location must be the parked async call line, not empty.
+    EXPECT_EQ(r.error_detail.source, "=script");
+    EXPECT_EQ(r.error_detail.line, 2);
+    EXPECT_NE(r.error_detail.stack_trace.find("=script:2"), std::string::npos);
+}
+
+TEST_F(LuaRuntimeTest, InterruptedRuntimeRejectsNewTasks) {
+    rt->Interrupt();
+    auto r = AWAIT(rt->RunScript("return 1"));
+    EXPECT_NE(r.status, LUA_OK);
+    EXPECT_FALSE(r.error.empty());
+}
+
 // --- await() tests ---
 
 TEST_F(LuaRuntimeTest, AwaitResolveWithValue) {

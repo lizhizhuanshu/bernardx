@@ -89,6 +89,30 @@ std::string CollectStackTrace(lua_State* L) {
     return trace;
 }
 
+// Fill source/line/raised_in_c/stack_trace by walking frames outward from
+// level 0. Works both for an errored coroutine (level 0 = the raise site)
+// and for a suspended one (level 0 = the C function parked at its yield):
+// every engine async op (sleep/http/ws/require/await) yields from a C
+// function, whose frame is useless to users; the first Lua frame is the
+// actionable line (the call site). Skip C frames by 'what == "C"', NOT by
+// source[0] == '=' — a chunk named "=script" also starts with '=' and must
+// not be skipped.
+void CaptureLuaLocation(lua_State* L, ScriptErrorDetail& detail) {
+    lua_Debug debug;
+    for (int level = 0; lua_getstack(L, level, &debug); ++level) {
+        lua_getinfo(L, "Sl", &debug);
+        if (level == 0) {
+            detail.raised_in_c = strcmp(debug.what, "C") == 0;
+        }
+        if (strcmp(debug.what, "C") != 0) {
+            detail.source = debug.source ? debug.source : "";
+            detail.line = debug.currentline;
+            break;
+        }
+    }
+    detail.stack_trace = CollectStackTrace(L);
+}
+
 ScriptErrorDetail CaptureErrorDetail(lua_State* L) {
     ScriptErrorDetail detail;
     const char* err = lua_tostring(L, -1);
@@ -101,25 +125,18 @@ ScriptErrorDetail CaptureErrorDetail(lua_State* L) {
                          lua_typename(L, lua_type(L, -1)) + ")";
     }
 
-    // Location: walk outward from the error frame and report the nearest
-    // LUA frame. An error raised inside a C function leaves "=[C]" at
-    // level 0 — useless to users; the Lua line that CALLED the failing C
-    // function is the actionable location.
-    lua_Debug debug;
-    for (int level = 0; lua_getstack(L, level, &debug); ++level) {
-        lua_getinfo(L, "Sl", &debug);
-        const char* src = debug.source ? debug.source : "";
-        if (level == 0) {
-            detail.raised_in_c = src[0] == '=';
-        }
-        if (src[0] != '=') {
-            detail.source = src;
-            detail.line = debug.currentline;
-            break;
-        }
-    }
+    CaptureLuaLocation(L, detail);
+    return detail;
+}
 
-    detail.stack_trace = CollectStackTrace(L);
+// Where a coroutine was parked when the runtime settled it without a Lua
+// error (interrupt / shutdown). The caller must only pass a SUSPENDED
+// coroutine; walking the stack of a running one from another thread would
+// race. "Sl" pushes nothing, so the suspended stack is left untouched.
+ScriptErrorDetail CaptureSuspensionDetail(lua_State* co, std::string message) {
+    ScriptErrorDetail detail;
+    detail.message = std::move(message);
+    CaptureLuaLocation(co, detail);
     return detail;
 }
 
@@ -814,7 +831,12 @@ void LuaRuntime::Interrupt() {
 
         for (auto& [co, handler] : saved) {
             if (auto* p = std::get_if<async_simple::Promise<ScriptResult>>(&handler)) {
-                p->setValue(ScriptResult{LUA_ERRRUN, {}, "interrupted"});
+                // The executor is single-threaded, so every co in
+                // completions_ is suspended at a yield here — report the
+                // sleep/async call line it was interrupted on.
+                ScriptResult result{LUA_ERRRUN, {}, "interrupted"};
+                result.error_detail = CaptureSuspensionDetail(co, result.error);
+                p->setValue(std::move(result));
             }
         }
     });
@@ -846,7 +868,9 @@ void LuaRuntime::Shutdown() {
 
     for (auto& [co, handler] : saved) {
         if (auto* p = std::get_if<async_simple::Promise<ScriptResult>>(&handler)) {
-            p->setValue(ScriptResult{LUA_ERRRUN, {}, "runtime shutdown"});
+            ScriptResult result{LUA_ERRRUN, {}, "runtime shutdown"};
+            result.error_detail = CaptureSuspensionDetail(co, result.error);
+            p->setValue(std::move(result));
         }
     }
 
