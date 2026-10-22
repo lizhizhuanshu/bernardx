@@ -149,13 +149,16 @@ static int lfs_rmtree(lua_State* L) {
     return 1;
 }
 
-// lfs.dir(path) — returns iterator function (next, state, nil)
+// lfs.dir(path) — returns iterator over directory entries.
+// On failure returns an exhausted iterator plus an error message instead of
+// raising, so `for name in lfs.dir(path)` simply loops zero times.
 static int lfs_dir(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
     std::error_code ec;
     fs::directory_iterator it(path, fs::directory_options::skip_permission_denied, ec);
     if (ec) {
-        return luaL_error(L, "cannot open directory '%s': %s", path, ec.message().c_str());
+        // The standard leaves a failed iterator at end(); make that explicit.
+        it = fs::directory_iterator{};
     }
 
     // Store the iterator as a full userdata
@@ -189,10 +192,14 @@ static int lfs_dir(lua_State* L) {
         return 1;
     }, 1);
 
-    // Also return the state (userdata) as second return, matching lfs convention
-    // Actually, lfs.dir returns (next, state, nil) — but for simplicity with generic for:
-    // We use closure-captured iterator, so just return next function.
-    // Users call: for name in lfs.dir(path) do ... end
+    // The closure captures the iterator, so a single next function suffices:
+    // users call `for name in lfs.dir(path) do ... end`. On open failure the
+    // error rides along as a second return value (nil is not returned on
+    // success) for callers that want to distinguish empty from failed.
+    if (ec) {
+        lua_pushfstring(L, "cannot open directory '%s': %s", path, ec.message().c_str());
+        return 2;
+    }
     return 1;
 }
 
