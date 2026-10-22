@@ -134,6 +134,21 @@ static int lfs_rmdir(lua_State* L) {
     return 1;
 }
 
+// lfs.rmtree(path) — recursively delete path and all contents (rm -rf semantics;
+// symlinks are removed, not followed; missing path succeeds)
+static int lfs_rmtree(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    std::error_code ec;
+    fs::remove_all(path, ec);
+    if (ec) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, ec.message().c_str());
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 // lfs.dir(path) — returns iterator function (next, state, nil)
 static int lfs_dir(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
@@ -242,6 +257,7 @@ static const luaL_Reg lfs_funcs[] = {
     {"chdir", lfs_chdir},
     {"mkdir", lfs_mkdir},
     {"rmdir", lfs_rmdir},
+    {"rmtree", lfs_rmtree},
     {"dir", lfs_dir},
     {"touch", lfs_touch},
     {nullptr, nullptr}
