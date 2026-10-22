@@ -121,18 +121,29 @@ local s, b, e = http.request({
 ```lua
 local ws = http.ws_create("ws://localhost:8080/ws")
 local ws = http.ws_create("ws://localhost:8080/ws", {proxy = "http://127.0.0.1:7890"})
+local ws = http.ws_create("ws://localhost:8080/ws", {connect_timeout = 5000, idle_timeout = 30000})
 ```
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | url | string | 是 | WebSocket URL（`ws://` 或 `wss://`） |
-| options | table | 否 | `{proxy = "http://[user:pass@]host[:port]"}` — 经 HTTP 代理建立 WebSocket 连接（格式同 `http.request` 的 `proxy` 字段；`wss://` 目标走 CONNECT 隧道） |
+| options | table | 否 | 见下表 |
+
+**options 字段：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| proxy | string | `"http://[user:pass@]host[:port]"` — 经 HTTP 代理建立 WebSocket 连接（格式同 `http.request` 的 `proxy` 字段；`wss://` 目标走 CONNECT 隧道） |
+| connect_timeout | integer | 建连+握手超时（毫秒）。超时后 `ws:connect()` 返回 `false, "connect timeout"`；不传或 `<= 0` 用默认 30s |
+| idle_timeout | integer | 读空闲超时（毫秒）：连接建立后连续这么长时间未收到任何消息，连接将被断开并触发 `onerror`（未设置则触发 `onclose`）。需要长时间静默的连接请调大该值；不传或 `<= 0` 用默认 60s |
+
+超时参数只在 `ws_create` 时设置，对整个连接生效；`send`/`close` 目前没有超时。
 
 **返回：** WebSocket 对象
 
 ### ws:connect()
 
-连接到 WebSocket 服务器。协程异步，连接完成后恢复。
+连接到 WebSocket 服务器。协程异步，连接完成后恢复。建连+握手阶段受创建时 `options.connect_timeout` 约束，超时返回 `false, "connect timeout"`。
 
 ```lua
 local ok, err = ws:connect()
@@ -191,7 +202,7 @@ end
 |------|------|------|
 | `onmessage` | function(msg: string) | 收到消息时触发 |
 | `onclose` | function() | 连接关闭时触发 |
-| `onerror` | function(err: string) | 发生错误时触发 |
+| `onerror` | function(err: string) | 发生错误时触发（含 `idle_timeout` 空闲超时断开） |
 
 **完整 WebSocket 示例：**
 

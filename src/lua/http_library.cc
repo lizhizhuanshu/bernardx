@@ -12,15 +12,16 @@ extern "C" {
 #include <cinatra/coro_http_client.hpp>
 
 #include <async_simple/coro/Lazy.h>
+#include <spdlog/spdlog.h>
 
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstring>
-#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 
 // --- Helpers ---
@@ -165,42 +166,50 @@ static int http_request(lua_State* L);
 
 // --- Core HTTP request helper ---
 
+// Runs the request Lazy built by `make_lazy` and resumes the yielded Lua
+// coroutine with (status, body, err). The frame holds `state`, keeping the
+// executor valid for the whole request.
+template <typename F>
+static async_simple::coro::Lazy<void> HttpRequestFlow(
+    std::shared_ptr<HttpLibraryState> state, LuaRuntime::Ptr rt, AsyncHandle handle,
+    F make_lazy) {
+    auto client = std::make_shared<cinatra::coro_http_client>(state->exec);
+
+    auto result = co_await make_lazy(*client).coAwaitTry();
+    if (result.hasError()) {
+        rt->PushResume(handle, {
+            LuaValue{(int64_t)0},
+            LuaValue{nullptr},
+            LuaValue{std::string("internal error")}
+        });
+        co_return;
+    }
+    auto& resp = result.value();
+    std::vector<LuaValue> values;
+    values.emplace_back(static_cast<int64_t>(resp.status));
+    if (resp.net_err) {
+        values.emplace_back(nullptr);
+        values.emplace_back(std::string(resp.net_err.message()));
+    } else {
+        values.emplace_back(std::string(resp.resp_body));
+        values.emplace_back(nullptr);
+    }
+    rt->PushResume(handle, std::move(values));
+}
+
 template <typename F>
 static int do_request(lua_State* L, F&& make_lazy) {
     auto state = g_http_state.Get(L);
     if (!state || state->shutting_down.load() || !state->exec) {
         return luaL_error(L, "http library is shutting down");
     }
-    auto* exec = state->exec;
     auto rt = LuaRuntime::FromLuaState(L);
     auto handle = rt->PreYield(L);
+    auto* exec = state->exec;
 
-    asio::post(exec->context(), [state, exec, rt, handle, lazy_factory = std::forward<F>(make_lazy)]() mutable {
-        auto client = std::make_shared<cinatra::coro_http_client>(exec);
-
-        auto lazy = lazy_factory(*client);
-        std::move(lazy).via(exec).start([state, rt, handle, client](async_simple::Try<cinatra::resp_data>&& result) {
-            if (result.hasError()) {
-                rt->PushResume(handle, {
-                    LuaValue{(int64_t)0},
-                    LuaValue{nullptr},
-                    LuaValue{std::string("internal error")}
-                });
-                return;
-            }
-            auto& resp = result.value();
-            std::vector<LuaValue> values;
-            values.emplace_back(static_cast<int64_t>(resp.status));
-            if (resp.net_err) {
-                values.emplace_back(nullptr);
-                values.emplace_back(std::string(resp.net_err.message()));
-            } else {
-                values.emplace_back(std::string(resp.resp_body));
-                values.emplace_back(nullptr);
-            }
-            rt->PushResume(handle, std::move(values));
-        });
-    });
+    HttpRequestFlow(std::move(state), rt, handle, std::forward<F>(make_lazy))
+        .via(exec)
+        .detach();
 
     return rt->Yield(L);
 }
@@ -289,8 +298,9 @@ static int http_request(lua_State* L) {
 // --- WebSocket ---
 //
 // WsConn is shared_ptr-managed so its lifetime extends beyond Lua userdata GC.
-// The Lua userdata holds a shared_ptr via uservalue; all async callbacks capture
-// the shared_ptr, ensuring the WsConn outlives any pending I/O.
+// The Lua userdata holds a shared_ptr via uservalue; the coroutine flows below
+// capture the shared_ptr in their frames, ensuring the WsConn outlives any
+// pending I/O.
 
 static const char* kWsMetatable = "http__ws";
 
@@ -301,6 +311,11 @@ struct WsConn {
     std::string url;
     ProxyConfig proxy;
     std::atomic<bool> closed{false};
+
+    // Timeout knobs (parsed on the Lua thread in ws_create, read on the io
+    // thread). 0 keeps the engine default (30s handshake, 60s idle read).
+    std::chrono::milliseconds connect_timeout{0};
+    std::chrono::milliseconds idle_timeout{0};
 
     // Lua callback registry refs (accessed from Lua thread only)
     int on_message_ref = LUA_NOREF;
@@ -327,6 +342,41 @@ static WsConn* ws_check(lua_State* L, int idx) {
     return conn.get();
 }
 
+// Defers dropping a coro_http_client reference: cinatra coroutine frames keep
+// touching the client while they unwind after the completion callback returns
+// (timer_guard destructors call timer_.cancel()), and coroutines aborted by
+// close() resume on later io iterations. Releasing the last reference on the
+// current stack corrupts the heap; posting the release lets every frame finish
+// first.
+static void defer_client_release(coro_io::ExecutorWrapper<>& exec,
+                                 std::shared_ptr<cinatra::coro_http_client> client) {
+    asio::post(exec.context(), [client = std::move(client)]() {});
+}
+
+// --- Coroutine flows ---
+//
+// Every ws Lua method yields, then drives a Lazy<void> flow on the io
+// executor (`.via(exec).detach()`); the flow co_awaits cinatra client
+// coroutines and resumes the Lua coroutine exactly once via PushResume.
+
+// Resumes a yielded Lua coroutine with (ok, err); an empty err pushes nil.
+static void WsResume(LuaRuntime::Ptr rt, AsyncHandle handle, bool ok,
+                     std::string err = {}) {
+    if (err.empty()) {
+        rt->PushResume(handle, {LuaValue{ok}, LuaValue{nullptr}});
+    } else {
+        rt->PushResume(handle, {LuaValue{ok}, LuaValue{std::move(err)}});
+    }
+}
+
+// Best-effort close-frame write (gc path). The frame holds the last client
+// reference for the duration of the write — the write coroutine keeps only a
+// raw `this` into the client.
+static async_simple::coro::Lazy<void> WsCloseFrameFlow(
+    std::shared_ptr<cinatra::coro_http_client> client, std::string reason) {
+    co_await client->write_websocket_close(std::move(reason)).coAwaitTry();
+}
+
 // Unref callbacks on a specific lua_State.
 // Called from the Lua event loop thread when the shared_ptr ref count drops.
 static int ws_gc(lua_State* L) {
@@ -338,10 +388,7 @@ static int ws_gc(lua_State* L) {
         if (client && !conn->closed.exchange(true)) {
             auto state = conn->state;
             if (state && !state->shutting_down.load() && state->exec) {
-                auto* exec = state->exec;
-                asio::post(exec->context(), [state, client, exec] {
-                    client->write_websocket_close("gc").via(exec).start([](auto&&) {});
-                });
+                WsCloseFrameFlow(std::move(client), "gc").via(state->exec).detach();
             }
         }
         slot->reset();  // release shared_ptr (WsConn lives on if async callbacks still hold refs)
@@ -349,11 +396,24 @@ static int ws_gc(lua_State* L) {
     return 0;
 }
 
+// Optional integer field (table at `tbl`) in milliseconds; absent, non-number
+// or <= 0 → 0, meaning "keep the engine default".
+static std::chrono::milliseconds opt_timeout_ms(lua_State* L, int tbl, const char* field) {
+    lua_getfield(L, tbl, field);
+    lua_Integer v = (lua_type(L, -1) == LUA_TNUMBER) ? lua_tointeger(L, -1) : 0;
+    lua_pop(L, 1);
+    return std::chrono::milliseconds(v > 0 ? v : 0);
+}
+
 // http.ws_create(url [, options]) -> ws
 // options.proxy: "http://[user:pass@]host[:port]" — route the websocket through a proxy.
+// options.connect_timeout: handshake timeout in ms (0/absent → engine default 30s).
+// options.idle_timeout: max silent time between inbound messages in ms (0/absent → default 60s).
 static int ws_create(lua_State* L) {
     const char* url = luaL_checkstring(L, 1);
     ProxyConfig proxy;
+    std::chrono::milliseconds connect_timeout{0};
+    std::chrono::milliseconds idle_timeout{0};
     if (!lua_isnoneornil(L, 2)) {
         luaL_checktype(L, 2, LUA_TTABLE);
         lua_getfield(L, 2, "proxy");
@@ -361,6 +421,8 @@ static int ws_create(lua_State* L) {
             proxy = parse_proxy(L, proxy_str);
         }
         lua_pop(L, 1);
+        connect_timeout = opt_timeout_ms(L, 2, "connect_timeout");
+        idle_timeout = opt_timeout_ms(L, 2, "idle_timeout");
     }
     auto state = g_http_state.Get(L);
     if (!state || state->shutting_down.load() || !state->exec) {
@@ -374,6 +436,8 @@ static int ws_create(lua_State* L) {
     conn->rt = rt;
     conn->url = url;
     conn->proxy = std::move(proxy);
+    conn->connect_timeout = connect_timeout;
+    conn->idle_timeout = idle_timeout;
     new (slot) std::shared_ptr<WsConn>(std::move(conn));
     luaL_setmetatable(L, kWsMetatable);
 
@@ -424,6 +488,163 @@ static int ws_index(lua_State* L) {
     return 1;
 }
 
+// --- ws flows ---
+
+// Background read pump. Dispatches onmessage/onclose/onerror until the
+// connection drops or Lua closes it. The frame holds `conn`, which keeps the
+// client alive for exactly as long as a read is pending.
+static async_simple::coro::Lazy<void> WsReadLoop(std::shared_ptr<WsConn> conn) {
+    auto* exec = conn->state->exec;
+    auto& rt = conn->rt;
+    spdlog::debug("http.ws read loop started: url={}", conn->url);
+    while (!conn->closed.load()) {
+        auto result = co_await conn->client->read_websocket().coAwaitTry();
+
+        if (conn->closed.load()) {
+            // Dropped by ws:close()/gc; the closer owns the client's teardown.
+            // Hand off a reference (not the member) — a close flow racing us
+            // still needs conn->client for its close-frame write.
+            spdlog::debug("http.ws read loop stopped: closed by ws:close()/gc, url={}", conn->url);
+            defer_client_release(*exec, conn->client);
+            break;
+        }
+
+        auto& resp = result.value();
+        if (result.hasError() || resp.net_err || resp.eof || resp.status != 200) {
+            conn->closed.store(true);
+            defer_client_release(*exec, std::move(conn->client));
+            std::string err_msg = "connection closed";
+            if (result.hasError()) {
+                err_msg = "read failed";
+            } else if (resp.net_err) {
+                err_msg = std::string(resp.net_err.message());
+            }
+            spdlog::warn("http.ws read loop ended: url={} reason={} eof={} status={}",
+                         conn->url, err_msg, resp.eof, resp.status);
+            if (conn->on_error_ref != LUA_NOREF) {
+                rt->CallLuaFunction(conn->on_error_ref, {std::move(err_msg)});
+            } else if (conn->on_close_ref != LUA_NOREF) {
+                rt->CallLuaFunction(conn->on_close_ref, {});
+            }
+            break;
+        }
+
+        // debug: carries a payload preview — debug builds only (release keeps
+        // info-level lifecycle logs without message contents).
+        spdlog::debug("http.ws recv: url={} bytes={} body={:.64}{}", conn->url,
+                      resp.resp_body.size(), resp.resp_body,
+                      conn->on_message_ref == LUA_NOREF ? " (no onmessage handler, dropped)" : "");
+        if (conn->on_message_ref != LUA_NOREF) {
+            rt->CallLuaFunction(conn->on_message_ref, {std::string(resp.resp_body)});
+        }
+    }
+}
+
+// ws:connect flow — performs the handshake, then spawns the read pump.
+static async_simple::coro::Lazy<void> WsConnectFlow(std::shared_ptr<WsConn> conn,
+                                                    LuaRuntime::Ptr rt, AsyncHandle handle) {
+    auto* exec = conn->state->exec;
+    auto client = std::make_shared<cinatra::coro_http_client>(exec);
+    conn->client = client;
+    apply_proxy(*client, conn->proxy);
+    spdlog::debug("http.ws connect: url={} proxy={} connect_timeout={}ms idle_timeout={}ms",
+                  conn->url, conn->proxy.host, conn->connect_timeout.count(),
+                  conn->idle_timeout.count());
+
+    // cinatra serializes every timer_guard onto the client's single timer, so
+    // the handshake's inner "request timer" (60s default) silently overrides
+    // the outer connect timer. Pin both to connect_timeout to bound the whole
+    // handshake (TCP connect + upgrade); 0 keeps the engine defaults (30s/60s).
+    if (conn->connect_timeout > std::chrono::milliseconds::zero()) {
+        client->set_conn_timeout(conn->connect_timeout);
+        client->set_req_timeout(conn->connect_timeout);
+    }
+
+    auto result = co_await client->connect(conn->url).coAwaitTry();
+
+    if (conn->closed.load()) {
+        // Aborted by ws:close()/gc while the handshake was in flight; the
+        // closer already resumed Lua. Hand off a reference — a racing close
+        // flow still needs conn->client.
+        spdlog::debug("http.ws connect aborted by close during handshake: url={}", conn->url);
+        defer_client_release(*exec, conn->client);
+        co_return;
+    }
+    if (result.hasError() || result.value().net_err) {
+        conn->closed.store(true);
+        defer_client_release(*exec, std::move(conn->client));
+        // Normalize the timeout error: errc::timed_out's message ("Connection
+        // timed out") doesn't contain "timeout", which scripts match on.
+        std::string msg = "connect failed";
+        if (!result.hasError() && result.value().net_err == std::errc::timed_out) {
+            msg = "connect timeout";
+        } else if (!result.hasError()) {
+            msg = std::string(result.value().net_err.message());
+        }
+        spdlog::warn("http.ws connect failed: url={} err={}", conn->url, msg);
+        if (conn->on_error_ref != LUA_NOREF) {
+            rt->CallLuaFunction(conn->on_error_ref, {msg});
+        }
+        WsResume(rt, handle, false, std::move(msg));
+        co_return;
+    }
+    spdlog::info("http.ws connected: url={}", conn->url);
+
+    // Re-pin the read pump's idle bound after the handshake (cinatra re-arms
+    // the same timer per read_websocket call). Restore the 60s engine default
+    // when the handshake shortened req_timeout and no idle_timeout was given.
+    if (conn->idle_timeout > std::chrono::milliseconds::zero()) {
+        client->set_req_timeout(conn->idle_timeout);
+    } else if (conn->connect_timeout > std::chrono::milliseconds::zero()) {
+        client->set_req_timeout(std::chrono::seconds(60));
+    }
+
+    WsReadLoop(conn).via(exec).detach();
+
+    WsResume(rt, handle, true);
+}
+
+// ws:send flow.
+static async_simple::coro::Lazy<void> WsSendFlow(std::shared_ptr<WsConn> conn, LuaRuntime::Ptr rt,
+                                                 AsyncHandle handle, std::string msg,
+                                                 cinatra::opcode op) {
+    if (!conn->client || conn->closed.load()) {
+        auto reason = conn->client ? "closed" : "not connected";
+        spdlog::debug("http.ws send rejected: url={} bytes={} reason={}",
+                      conn->url, msg.size(), reason);
+        WsResume(rt, handle, false, reason);
+        co_return;
+    }
+    // The frame holds a client reference for the duration of the write.
+    auto client = conn->client;
+    auto result = co_await client->write_websocket(msg, op).coAwaitTry();
+    bool ok = !result.hasError() && !result.value().net_err;
+    if (!ok) {
+        spdlog::warn("http.ws send failed: url={} bytes={} err={}", conn->url, msg.size(),
+                     result.hasError() ? "write coroutine failed"
+                                       : result.value().net_err.message());
+    }
+    WsResume(rt, handle, ok, ok ? std::string{} : std::string{"send failed"});
+}
+
+// ws:close flow — writes the close frame, then resumes.
+static async_simple::coro::Lazy<void> WsCloseFlow(std::shared_ptr<WsConn> conn, LuaRuntime::Ptr rt,
+                                                  AsyncHandle handle) {
+    if (conn->client) {
+        // The frame holds `conn`, keeping the client alive for the write.
+        spdlog::debug("http.ws close: url={}", conn->url);
+        auto result = co_await conn->client->write_websocket_close("bye").coAwaitTry();
+        if (result.hasError() || result.value().net_err) {
+            spdlog::warn("http.ws close frame write failed: url={} err={}", conn->url,
+                         result.hasError() ? "write coroutine failed"
+                                           : result.value().net_err.message());
+        }
+    }
+    WsResume(rt, handle, true);
+}
+
+// --- ws Lua entry points ---
+
 // ws:connect() -> ok, err  (yields until handshake done)
 static int ws_connect_method(lua_State* L) {
     auto* conn = ws_check(L, 1);
@@ -440,58 +661,7 @@ static int ws_connect_method(lua_State* L) {
 
     auto rt = LuaRuntime::FromLuaState(L);
     auto handle = rt->PreYield(L);
-    auto* exec = conn->state->exec;
-    // Capture shared_ptr to keep WsConn alive for the duration of async ops
-    auto shared_conn = ws_get_conn(L, 1);
-
-    asio::post(exec->context(), [exec, rt, handle, shared_conn]() mutable {
-        auto client = std::make_shared<cinatra::coro_http_client>(exec);
-        shared_conn->client = client;
-        apply_proxy(*client, shared_conn->proxy);
-
-        client->connect(shared_conn->url).via(exec).start([rt, handle, shared_conn, exec](async_simple::Try<cinatra::resp_data>&& result) {
-            if (shared_conn->closed.load()) return;
-            if (result.hasError() || result.value().net_err) {
-                shared_conn->closed.store(true);
-                shared_conn->client.reset();
-                auto msg = result.hasError()
-                    ? std::string("connect failed")
-                    : std::string(result.value().net_err.message());
-                if (shared_conn->on_error_ref != LUA_NOREF)
-                    rt->CallLuaFunction(shared_conn->on_error_ref, {std::move(msg)});
-                rt->PushResume(handle, {LuaValue{false}, LuaValue{nullptr}});
-                return;
-            }
-
-            // Start background read loop (captures shared_conn by value)
-            auto do_read = std::make_shared<std::function<void()>>();
-            *do_read = [exec, shared_conn, do_read]() {
-                shared_conn->client->read_websocket().via(exec).start([exec, shared_conn, do_read](async_simple::Try<cinatra::resp_data>&& result) {
-                    if (shared_conn->closed.load()) return;
-                    if (result.hasError() || result.value().net_err || result.value().eof || result.value().status != 200) {
-                        shared_conn->closed.store(true);
-                        shared_conn->client.reset();
-                        auto err_msg = result.hasError() ? std::string("read failed")
-                            : result.value().net_err ? std::string(result.value().net_err.message())
-                            : std::string("connection closed");
-                        if (shared_conn->on_error_ref != LUA_NOREF)
-                            shared_conn->rt->CallLuaFunction(shared_conn->on_error_ref, {std::move(err_msg)});
-                        else if (shared_conn->on_close_ref != LUA_NOREF)
-                            shared_conn->rt->CallLuaFunction(shared_conn->on_close_ref, {});
-                        return;
-                    }
-                    if (shared_conn->on_message_ref != LUA_NOREF) {
-                        shared_conn->rt->CallLuaFunction(shared_conn->on_message_ref, {std::string(result.value().resp_body)});
-                    }
-                    // Schedule next read
-                    asio::post(exec->context(), *do_read);
-                });
-            };
-            (*do_read)();
-
-            rt->PushResume(handle, {LuaValue{true}, LuaValue{nullptr}});
-        });
-    });
+    WsConnectFlow(ws_get_conn(L, 1), rt, handle).via(conn->state->exec).detach();
 
     return rt->Yield(L);
 }
@@ -516,24 +686,9 @@ static int ws_send(lua_State* L) {
 
     auto rt = LuaRuntime::FromLuaState(L);
     auto handle = rt->PreYield(L);
-    auto* exec = conn->state->exec;
-    auto client = conn->client;
-    auto shared_conn = ws_get_conn(L, 1);
-
-    asio::post(exec->context(), [exec, rt, handle, client, shared_conn, msg = std::string(msg, len), op]() mutable {
-        if (shared_conn->closed.load()) {
-            rt->PushResume(handle, {LuaValue{false}, LuaValue{std::string("closed")}});
-            return;
-        }
-        client->write_websocket(msg, op).via(exec).start(
-            [state = shared_conn->state, rt, handle](async_simple::Try<cinatra::resp_data>&& result) {
-            if (result.hasError() || result.value().net_err) {
-                rt->PushResume(handle, {LuaValue{false}, LuaValue{std::string("send failed")}});
-            } else {
-                rt->PushResume(handle, {LuaValue{true}, LuaValue{nullptr}});
-            }
-        });
-    });
+    WsSendFlow(ws_get_conn(L, 1), rt, handle, std::string(msg, len), op)
+        .via(conn->state->exec)
+        .detach();
 
     return rt->Yield(L);
 }
@@ -552,15 +707,7 @@ static int ws_close(lua_State* L) {
 
     auto rt = LuaRuntime::FromLuaState(L);
     auto handle = rt->PreYield(L);
-    auto* exec = conn->state->exec;
-    auto client = conn->client;
-    auto state = conn->state;
-
-    asio::post(exec->context(), [state, exec, rt, handle, client]() mutable {
-        client->write_websocket_close("bye").via(exec).start([state, rt, handle](async_simple::Try<cinatra::resp_data>&&) {
-            rt->PushResume(handle, {LuaValue{true}, LuaValue{nullptr}});
-        });
-    });
+    WsCloseFlow(ws_get_conn(L, 1), rt, handle).via(conn->state->exec).detach();
 
     return rt->Yield(L);
 }

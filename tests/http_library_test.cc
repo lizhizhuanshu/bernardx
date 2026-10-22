@@ -320,6 +320,120 @@ TEST_F(HttpLibraryTest, WsConnectToInvalidEndpoint) {
     EXPECT_EQ(r.status, LUA_OK);
 }
 
+TEST_F(HttpLibraryTest, WsConnectFailureReturnsErrorMessage) {
+    auto r = AWAIT(rt->RunScript(R"(
+        local http = require("http")
+        local ws = http.ws_create("ws://127.0.0.1:1")
+        ws.onerror = function() end
+        local ok, err = ws:connect()
+        assert(ok == false, "expected connect to fail")
+        assert(err ~= nil, "expected an error message, got nil")
+    )"));
+    EXPECT_EQ(r.status, LUA_OK);
+}
+
+TEST_F(HttpLibraryTest, WsConnectHonorsConnectTimeout) {
+    // Blackhole server: accepts the TCP connection but never answers the
+    // websocket upgrade, so only our connect_timeout can finish the wait.
+    asio::ip::tcp::acceptor acceptor(
+            ioc, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 0));
+    const auto port = acceptor.local_endpoint().port();
+    asio::ip::tcp::socket sink(ioc);
+    acceptor.async_accept(sink, [](const std::error_code&) {});
+
+    std::string script = R"(
+        local http = require("http")
+        local ws = http.ws_create("ws://127.0.0.1:__PORT__/", {connect_timeout = 200})
+        ws.onerror = function() end
+        local ok, err = ws:connect()
+        assert(ok == false, "expected connect to time out")
+        assert(tostring(err):find("timeout", 1, true) ~= nil,
+               "expected timeout error, got " .. tostring(err))
+
+        -- junk / negative timeout values fall back to the default without error
+        local ws2 = http.ws_create("ws://127.0.0.1:1", {connect_timeout = "abc"})
+        assert(select(1, ws2:connect()) == false)
+        local ws3 = http.ws_create("ws://127.0.0.1:1", {connect_timeout = -1, idle_timeout = -5})
+        assert(select(1, ws3:connect()) == false)
+    )";
+    script.replace(script.find("__PORT__"), 8, std::to_string(port));
+
+    const auto start = std::chrono::steady_clock::now();
+    auto r = AWAIT(rt->RunScript(script));
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+
+    EXPECT_EQ(r.status, LUA_OK) << (r.status == LUA_OK ? "" : r.error);
+    // Resolved by our 200ms timer, not cinatra's 30s connect default.
+    EXPECT_LT(elapsed_ms, 5000);
+}
+
+TEST_F(HttpLibraryTest, WsIdleTimeoutDropsQuietConnection) {
+    // Answers the websocket upgrade, then holds the connection open without
+    // ever sending: the only thing that can drop it is idle_timeout.
+    // (A pending async_read_some keeps the accepted socket alive — without a
+    // pending handler the socket's last shared_ptr dies and the client sees
+    // an instant EOF instead of a timeout.)
+    static const std::string kHandshake101 =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+        "\r\n";
+    asio::ip::tcp::acceptor acceptor(
+            ioc, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 0));
+    const auto port = acceptor.local_endpoint().port();
+    auto conn = std::make_shared<asio::ip::tcp::socket>(ioc);
+    acceptor.async_accept(*conn, [conn](const std::error_code& ec) {
+        if (ec) return;
+        auto buf = std::make_shared<asio::streambuf>();
+        asio::async_read_until(*conn, *buf, "\r\n\r\n",
+            [conn, buf](const std::error_code& ec, size_t) {
+                if (ec) return;
+                asio::async_write(*conn, asio::buffer(kHandshake101.data(), kHandshake101.size()),
+                    [conn, buf](const std::error_code& ec, size_t) {
+                        if (ec) return;
+                        // Pending read keeps the accepted socket (and buf) alive;
+                        // without a pending handler the client sees an instant EOF
+                        // instead of the idle timeout.
+                        auto sink = std::make_shared<std::vector<char>>(64);
+                        conn->async_read_some(asio::buffer(*sink),
+                            [conn, sink](const std::error_code&, size_t) {});
+                    });
+            });
+    });
+
+    std::string script = R"(
+        local http = require("http")
+        local ws = http.ws_create("ws://127.0.0.1:__PORT__/echo", {idle_timeout = 200})
+        local done = false
+        ws.onmessage = function() end
+        ws.onerror = function(err) done = true end
+        ws.onclose = function() done = true end
+        local ok = select(1, ws:connect())
+        assert(ok == true, "expected connect to succeed")
+        local waited = 0
+        while not done and waited < 5000 do
+            sleep(50)
+            waited = waited + 50
+        end
+        assert(done, "idle timeout did not drop the connection within 5s")
+    )";
+    script.replace(script.find("__PORT__"), 8, std::to_string(port));
+
+    const auto start = std::chrono::steady_clock::now();
+    auto r = AWAIT(rt->RunScript(script));
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+
+    EXPECT_EQ(r.status, LUA_OK) << (r.status == LUA_OK ? "" : r.error);
+    // Dropped by our 200ms idle timer (not an instant EOF, not a hang).
+    EXPECT_GE(elapsed_ms, 150);
+    EXPECT_LT(elapsed_ms, 5000);
+}
+
 #ifdef __linux__
 TEST(HttpLibraryStressTest, RecreateRuntimeWithHttpLibrary100TimesWithTimeoutGuard) {
     constexpr int kIterations = 100;
