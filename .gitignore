@@ -7,3 +7,4 @@ build
 build_test/
 
 # local test build
+build_asan/

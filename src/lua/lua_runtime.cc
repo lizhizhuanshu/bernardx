@@ -581,20 +581,29 @@ void LuaRuntime::PushTask(TaskRequest task) {
     });
 }
 
+// Resumes (PushResume/PushResumeDirect) are NOT gated on interrupted_:
+// the Interrupt() completion pass clears pending_ and cancels timers, so a
+// stale completion for a pre-interrupt op already fails the pending_ lookup
+// in DoResume. Gating here would instead strand any coroutine that parks
+// AFTER the pass — e.g. post-run cleanup coroutines (engine addCleanup)
+// whose async op (input/node query/http) completes on another thread —
+// their resume would be dropped silently and the awaiting host would hang.
+// New TASKS stay rejected until ClearInterrupt()/recycle; only already
+// started work is allowed to finish its async ops.
 void LuaRuntime::PushResume(AsyncHandle handle, std::vector<LuaValue> args) {
-    if (shutting_down_.load(std::memory_order_acquire) || interrupted_.load(std::memory_order_acquire)) return;
+    if (shutting_down_.load(std::memory_order_acquire)) return;
     auto* self = this;
     executor_->schedule([self, handle, args = std::move(args)]() mutable {
-        if (self->shutting_down_.load(std::memory_order_acquire) || self->interrupted_.load(std::memory_order_acquire)) return;
+        if (self->shutting_down_.load(std::memory_order_acquire)) return;
         self->DoResume(handle, std::move(args));
     });
 }
 
 void LuaRuntime::PushResumeDirect(AsyncHandle handle, std::function<int(lua_State*)> fn) {
-    if (shutting_down_.load(std::memory_order_acquire) || interrupted_.load(std::memory_order_acquire)) return;
+    if (shutting_down_.load(std::memory_order_acquire)) return;
     auto* self = this;
     executor_->schedule([self, handle, fn = std::move(fn)]() mutable {
-        if (self->shutting_down_.load(std::memory_order_acquire) || self->interrupted_.load(std::memory_order_acquire)) return;
+        if (self->shutting_down_.load(std::memory_order_acquire)) return;
         auto it = self->pending_.find(handle);
         if (it == self->pending_.end()) return;
         auto* co = it->second.co;
@@ -830,20 +839,33 @@ void LuaRuntime::Interrupt() {
         self->timer_mgr_->CancelAll(self->main_L_);
 
         for (auto& [co, handler] : saved) {
-            if (auto* p = std::get_if<async_simple::Promise<ScriptResult>>(&handler)) {
-                // The executor is single-threaded, so every co in
-                // completions_ is suspended at a yield here — report the
-                // sleep/async call line it was interrupted on.
-                ScriptResult result{LUA_ERRRUN, {}, "interrupted"};
-                result.error_detail = CaptureSuspensionDetail(co, result.error);
-                p->setValue(std::move(result));
-            }
+            // The executor is single-threaded, so every co in completions_ is
+            // suspended at a yield here — report the sleep/async call line it
+            // was interrupted on.
+            ScriptResult result{LUA_ERRRUN, {}, "interrupted"};
+            result.error_detail = CaptureSuspensionDetail(co, result.error);
+            // Complete BOTH handler kinds: a dropped std::function handler
+            // (CallAsync/CallWithCallback completions) destroys an unfulfilled
+            // Promise captured inside it, whose destructor throws — on this
+            // executor thread that terminated the process.
+            std::visit(overloaded{
+                [&](async_simple::Promise<ScriptResult>& p) { p.setValue(std::move(result)); },
+                [&](std::function<void(ScriptResult)>& cb) { cb(std::move(result)); }
+            }, handler);
         }
     });
 }
 
 void LuaRuntime::Pause() {
     paused_.store(true, std::memory_order_release);
+}
+
+async_simple::coro::Lazy<void> LuaRuntime::ClearInterrupt() {
+    // Runs via the runtime executor (see header): executor serialization
+    // orders this after any in-flight Interrupt() completion pass, so the
+    // next PushTask is not rejected by a stale flag.
+    interrupted_.store(false, std::memory_order_release);
+    co_return;
 }
 
 void LuaRuntime::Resume() {
@@ -867,11 +889,14 @@ void LuaRuntime::Shutdown() {
     }
 
     for (auto& [co, handler] : saved) {
-        if (auto* p = std::get_if<async_simple::Promise<ScriptResult>>(&handler)) {
-            ScriptResult result{LUA_ERRRUN, {}, "runtime shutdown"};
-            result.error_detail = CaptureSuspensionDetail(co, result.error);
-            p->setValue(std::move(result));
-        }
+        ScriptResult result{LUA_ERRRUN, {}, "runtime shutdown"};
+        result.error_detail = CaptureSuspensionDetail(co, result.error);
+        // Both handler kinds, same as Interrupt(): dropping a std::function
+        // completion would destroy an unfulfilled Promise and throw.
+        std::visit(overloaded{
+            [&](async_simple::Promise<ScriptResult>& p) { p.setValue(std::move(result)); },
+            [&](std::function<void(ScriptResult)>& cb) { cb(std::move(result)); }
+        }, handler);
     }
 
     if (timer_mgr_) {

@@ -177,6 +177,15 @@ public:
 
     void Interrupt();
 
+    // Host-driven reset of the sticky interrupt flag, for runtimes kept
+    // across runs: after an interrupted run the flag stays set and PushTask
+    // keeps rejecting new work ("runtime shutdown") forever, so a reused
+    // runtime can never run again. Must be driven via the runtime's
+    // executor — syncAwait(rt->ClearInterrupt(), rt->executor()) — so it
+    // serializes after any in-flight Interrupt() completion pass before the
+    // next PushTask checks the gate.
+    async_simple::coro::Lazy<void> ClearInterrupt();
+
     // Reversible pause: a paused runtime's sleeping coroutines re-arm instead
     // of resuming, and background work should skip until Resume(). Set by the
     // host, not by Lua scripts.
