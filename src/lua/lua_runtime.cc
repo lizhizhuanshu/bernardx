@@ -485,6 +485,19 @@ void LuaRuntime::SetExtraspace(lua_State* L, LuaRuntime* rt) {
     std::memcpy(lua_getextraspace(L), &rt, sizeof(LuaRuntime*));
 }
 
+// Count hook armed in SetupBuiltins: breaks pure-Lua loops on interrupt /
+// shutdown. Runs on the executor thread between VM instructions only, so the
+// raw extraspace read is safe (the runtime outlives every Lua thread).
+void LuaRuntime::InterruptHook(lua_State* L, lua_Debug* /*ar*/) {
+    auto** rt_ptr = reinterpret_cast<LuaRuntime**>(lua_getextraspace(L));
+    if (!rt_ptr || !*rt_ptr) return;
+    LuaRuntime* rt = *rt_ptr;
+    if (rt->shutting_down_.load(std::memory_order_relaxed) ||
+        rt->interrupted_.load(std::memory_order_relaxed)) {
+        lua_yield(L, 0);
+    }
+}
+
 LuaRuntime::Ptr LuaRuntime::FromLuaState(lua_State* L) {
     auto** rt_ptr = reinterpret_cast<LuaRuntime**>(lua_getextraspace(L));
     return rt_ptr && *rt_ptr ? (*rt_ptr)->shared_from_this() : nullptr;
@@ -530,6 +543,29 @@ void LuaRuntime::SetupBuiltins(lua_State* main_L) {
     lua_pushcfunction(main_L, await_ctx_gc);
     lua_setfield(main_L, -2, "__gc");
     lua_pop(main_L, 1);
+
+    // Interrupt hook (count). Interrupt() only schedules a completion pass on
+    // the executor, so a pure-Lua loop with no engine yield point (no sleep/
+    // await/async op) occupies the single executor thread forever and the pass
+    // never runs — interrupt becomes a no-op and the whole runtime freezes
+    // (timers, http completions, cleanup all queue behind the loop). This hook
+    // gives every Lua thread a yield point: lua_newthread copies both the hook
+    // and the extraspace (lstate.c), so the hook reaches pool AND script
+    // coroutines, and FromLuaState works inside it.
+    //
+    // Disposition is YIELD, not error: scripts pcall-wrap loops (guards,
+    // await bodies), and an error would be caught and the loop would continue.
+    // lua_yield from a hook takes Lua 5.4's dedicated hook path (lua_yieldk's
+    // isLua(ci) branch → returns to traceexec → luaD_throw(LUA_YIELD)), the
+    // resume returns LUA_YIELD, the coroutine is parked-and-abandoned — the
+    // same disposition the interrupt pass gives parked coroutines — and the
+    // executor is free to run the queued completion pass. Yields cross script
+    // pcall fine (luaB_pcall is pcallk-based in 5.4); the abandoned coroutine
+    // is never resumed, so the pcall never has to continue.
+    //
+    // 2000 instructions ≈ sub-millisecond response, one relaxed atomic load
+    // otherwise — negligible next to the VM loop itself.
+    lua_sethook(main_L, InterruptHook, LUA_MASKCOUNT, 2000);
 
     lua_pushcfunction(main_L, builtin_now);
     lua_setglobal(main_L, "now");

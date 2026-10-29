@@ -177,6 +177,14 @@ public:
 
     void Interrupt();
 
+    // Count hook armed on the main state in SetupBuiltins (inherited by every
+    // Lua thread — lstate.c's lua_newthread copies hook and extraspace). When
+    // the runtime is interrupted/shutting down it yields the running coroutine
+    // out of ANY pure-Lua loop, freeing the executor so the queued Interrupt()
+    // completion pass can run. See the SetupBuiltins comment for why yield and
+    // not error (pcall-wrapped loops would swallow an error and keep looping).
+    static void InterruptHook(lua_State* L, lua_Debug* ar);
+
     // Host-driven reset of the sticky interrupt flag, for runtimes kept
     // across runs: after an interrupted run the flag stays set and PushTask
     // keeps rejecting new work ("runtime shutdown") forever, so a reused
