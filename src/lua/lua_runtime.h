@@ -177,6 +177,19 @@ public:
 
     void Interrupt();
 
+    // Thread-safe shutdown ARM: flips the rejection flag only — no Lua state,
+    // no executor hop, callable from any thread (unlike Shutdown(), which is
+    // executor-thread-only once concurrent Push* are possible; Shutdown()'s
+    // exchange makes the two idempotent together). The engine calls this
+    // BEFORE destroying the executor it injected via WithExecutor: every
+    // Push* gate checks shutting_down_ first, so a late async completion
+    // (backend finds / http / vision, arriving on an asio thread, holding
+    // this runtime alive via shared_ptr while its executor reference already
+    // dangles) rejects at the gate instead of calling executor_->schedule()
+    // on freed memory — the 2026-11-02 SpringBoard PAC crash in
+    // PushResumeDirect.
+    void BeginShutdown();
+
     // Count hook armed on the main state in SetupBuiltins (inherited by every
     // Lua thread — lstate.c's lua_newthread copies hook and extraspace). When
     // the runtime is interrupted/shutting down it yields the running coroutine

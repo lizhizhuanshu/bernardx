@@ -910,6 +910,16 @@ void LuaRuntime::Resume() {
 
 // --- Shutdown ---
 
+void LuaRuntime::BeginShutdown() {
+    // Flag-only twin of Shutdown(): arms every Push* gate (they all lead with
+    // a shutting_down_ load) without touching the Lua state, so it is safe to
+    // call from the actor thread while the executor is still live. Shutdown()
+    // later finds the flag already set and early-returns — its completion
+    // drain is unnecessary here because the caller (BernardXEngine::Release)
+    // runs Interrupt() first, whose pass already resolved completions_.
+    shutting_down_.store(true, std::memory_order_release);
+}
+
 void LuaRuntime::Shutdown() {
     if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
 
