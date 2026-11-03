@@ -874,20 +874,46 @@ void LuaRuntime::Interrupt() {
 
         self->timer_mgr_->CancelAll(self->main_L_);
 
+        // Capture every suspension point BEFORE releasing or settling: the
+        // executor is single-threaded, so every co in completions_ is
+        // suspended at a yield here — report the sleep/async call line it was
+        // interrupted on. Releasing below recycles coroutines into the pool,
+        // and a settle handler that resumes host code inline may acquire a
+        // recycled coroutine under the same pointer — the detail walk must
+        // happen while the abandoned stacks are still intact.
+        std::vector<ScriptResult> results;
+        results.reserve(saved.size());
         for (auto& [co, handler] : saved) {
-            // The executor is single-threaded, so every co in completions_ is
-            // suspended at a yield here — report the sleep/async call line it
-            // was interrupted on.
             ScriptResult result{LUA_ERRRUN, {}, "interrupted"};
             result.error_detail = CaptureSuspensionDetail(co, result.error);
-            // Complete BOTH handler kinds: a dropped std::function handler
-            // (CallAsync/CallWithCallback completions) destroys an unfulfilled
-            // Promise captured inside it, whose destructor throws — on this
-            // executor thread that terminated the process.
+            results.push_back(std::move(result));
+        }
+
+        // Every pool coroutine checked out at this instant is abandoned: the
+        // ones in `saved`, hook-yielded ones, and pool coroutines nobody
+        // tracks (a setTimeout callback body parked on sleep, a require
+        // continuation, ...). Release them all back to the pool — until now
+        // they stayed checked out forever with their registry refs (and with
+        // each ref the coroutine's whole stack: locals, upvalues, error
+        // objects) pinned until Shutdown(), so every park->interrupt->
+        // ClearInterrupt cycle on a reused runtime (engine kAutoRecycle off)
+        // grew the Lua heap monotonically. The executor is single-threaded,
+        // so nothing pool-owned is running or mid-acquire here; coroutines
+        // that park only AFTER this pass (post-ClearInterrupt cleanups) are
+        // untouched and keep their pending_ resumes.
+        self->co_pool_->ReleaseAll();
+
+        // Complete BOTH handler kinds: a dropped std::function handler
+        // (CallAsync/CallWithCallback completions) destroys an unfulfilled
+        // Promise captured inside it, whose destructor throws — on this
+        // executor thread that terminated the process.
+        size_t i = 0;
+        for (auto& [co, handler] : saved) {
             std::visit(overloaded{
-                [&](async_simple::Promise<ScriptResult>& p) { p.setValue(std::move(result)); },
-                [&](std::function<void(ScriptResult)>& cb) { cb(std::move(result)); }
+                [&](async_simple::Promise<ScriptResult>& p) { p.setValue(std::move(results[i])); },
+                [&](std::function<void(ScriptResult)>& cb) { cb(std::move(results[i])); }
             }, handler);
+            ++i;
         }
     });
 }

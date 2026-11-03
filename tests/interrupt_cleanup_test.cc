@@ -90,6 +90,16 @@ protected:
         return luaL_ref(L, LUA_REGISTRYINDEX);
     }
 
+    // Lua heap size in KB, after a full GC. The +0.5/-0.5 round trip keeps
+    // the value non-integral on the Lua side so it marshals as double (Lua
+    // 5.4 marshals exact-integral floats as int64 into LuaValue).
+    double HeapKb() {
+        auto r = AWAIT(rt->RunScript(
+            "collectgarbage('collect') collectgarbage('collect') "
+            "return collectgarbage('count') + 0.5"));
+        return std::get<double>(r.values[0]) - 0.5;
+    }
+
     // Interrupt a run parked on park_forever and await its "interrupted"
     // result. Returns false on an unexpected status.
     bool InterruptParkedRun() {
@@ -178,6 +188,76 @@ TEST_F(InterruptCleanupTest, ClearInterruptReenablesTaskSubmission) {
     EXPECT_EQ(ok.status, LUA_OK);
     ASSERT_EQ(ok.values.size(), 1u);
     EXPECT_EQ(std::get<int64_t>(ok.values[0]), 7);
+}
+
+// Reused-runtime leak regression: an interrupted run's parked coroutines used
+// to stay checked out of the pool forever (registry ref + the whole stack —
+// locals, upvalues — pinned until Shutdown()), so every park->interrupt->
+// ClearInterrupt cycle on a kept runtime grew the Lua heap monotonically by
+// whatever the coroutine had live at its park point. Pin ~2MB per parked run
+// and require full reclamation after each cycle.
+TEST_F(InterruptCleanupTest, InterruptReleasesAbandonedCoroutines) {
+    ArmHangWatchdog();
+    const double baseline = HeapKb();
+
+    const char* parked_with_locals =
+        "local sink = {} "
+        "for i = 1, 2000 do sink[i] = string.rep('x', 1024) end "
+        "park_forever()";
+
+    for (int i = 0; i < 3; ++i) {
+        std::thread interrupter([this]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            rt->Interrupt();
+        });
+        auto r = AWAIT(rt->RunScript(parked_with_locals));
+        interrupter.join();
+        ASSERT_EQ(r.status, LUA_ERRRUN);
+        ASSERT_EQ(r.error, "interrupted");
+        async_simple::coro::syncAwait(rt->ClearInterrupt(), rt->executor());
+
+        // A leaked cycle pins ~2MB of locals; allow slack for allocator noise.
+        EXPECT_LT(HeapKb() - baseline, 512.0)
+            << "cycle " << i << ": abandoned coroutine not reclaimed";
+    }
+
+    // The swept coroutines must be reusable, not just unreferenced.
+    auto ok = AWAIT(rt->RunScript("return 7"));
+    EXPECT_EQ(ok.status, LUA_OK);
+    ASSERT_EQ(ok.values.size(), 1u);
+    EXPECT_EQ(std::get<int64_t>(ok.values[0]), 7);
+}
+
+// Same leak, different tracking: a setTimeout callback body parked on sleep
+// has a pending_ entry but NO completions_ handler — the old Interrupt pass
+// never saw it, and the coroutine stayed checked out forever.
+TEST_F(InterruptCleanupTest, InterruptReleasesUntrackedTimedCallbacks) {
+    ArmHangWatchdog();
+    const double baseline = HeapKb();
+
+    for (int i = 0; i < 3; ++i) {
+        std::thread interrupter([this]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            rt->Interrupt();
+        });
+        // The timer fires at ~1ms; by the 100ms interrupt its body has
+        // allocated ~2MB and parked on sleep(9000) (pending_ only), while the
+        // main script is parked on sleep(150)/park_forever (completions_
+        // tracked). Both must be swept by the pass.
+        auto r = AWAIT(rt->RunScript(
+            "setTimeout(1, function() "
+            "local sink = {} "
+            "for i = 1, 2000 do sink[i] = string.rep('y', 1024) end "
+            "sleep(9000) end) "
+            "sleep(150) park_forever()"));
+        interrupter.join();
+        ASSERT_EQ(r.status, LUA_ERRRUN);
+        ASSERT_EQ(r.error, "interrupted");
+        async_simple::coro::syncAwait(rt->ClearInterrupt(), rt->executor());
+
+        EXPECT_LT(HeapKb() - baseline, 512.0)
+            << "cycle " << i << ": timed-callback coroutine not reclaimed";
+    }
 }
 
 }  // namespace

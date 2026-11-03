@@ -37,6 +37,17 @@ void CoroutinePool::Release(lua_State* co) {
     active_co_refs_.erase(it);
 }
 
+void CoroutinePool::ReleaseAll() {
+    for (auto& [co, ref] : active_co_refs_) {
+        // Same reset as Release(): abandoned coroutines are suspended (parked
+        // or hook-yielded), and closethread handles both dispositions.
+        lua_closethread(co, nullptr);
+        lua_settop(co, 0);
+        co_pool_.push_back({co, ref});
+    }
+    active_co_refs_.clear();
+}
+
 void CoroutinePool::Shutdown(lua_State* main_L) {
     for (auto& [co, ref] : active_co_refs_) {
         luaL_unref(main_L, LUA_REGISTRYINDEX, ref);
