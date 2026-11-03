@@ -280,6 +280,20 @@ private:
 
     void MaybeRecycleCo(lua_State* co, int status, int nresults);
 
+    // pending_ pins its parked coroutine by BARE lua_State*, invisible to the
+    // GC. A SCRIPT-created coroutine (coroutine.create / coroutine.wrap,
+    // fire-and-forget) parked on an engine async op is unreachable from Lua
+    // once the script drops its last reference, and Lua 5.4 collects
+    // suspended-but-unreachable threads (luaE_freethread) — the late
+    // completion then dereferences the freed lua_State (UAF). Pin/Unpin keep
+    // the thread reachable via a dedicated registry table keyed by handle
+    // (one fixed registry slot, so pinning never disturbs the registry free
+    // list that user code observes through luaL_ref slot reuse). Pool
+    // coroutines are already pinned by CoroutinePool's own ref; the extra
+    // entry is harmless. Every path that erases from pending_ must Unpin.
+    void PinPendingCo(AsyncHandle handle, lua_State* co);
+    void UnpinPendingCo(AsyncHandle handle);
+
     // Drop pending_ entries (and their timers) still pointing at a coroutine
     // that just reached a terminal state. Their async completions can never
     // resume it again — leaving them would make a late completion resume a
@@ -312,6 +326,8 @@ private:
     std::atomic<bool> interrupted_{false};
     std::atomic<bool> paused_{false};
     std::unordered_map<AsyncHandle, PendingEntry> pending_;
+    // Registry slot of the pin table used by PinPendingCo/UnpinPendingCo.
+    int pending_co_table_ref_ = LUA_NOREF;
 
     std::unique_ptr<TimerManager> timer_mgr_;
     std::unique_ptr<CoroutinePool> co_pool_;

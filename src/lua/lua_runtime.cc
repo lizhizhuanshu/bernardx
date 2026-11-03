@@ -518,6 +518,13 @@ std::shared_ptr<LuaLibrary> LuaRuntime::find_library(const std::string& name) co
 // --- Setup ---
 
 void LuaRuntime::Setup(lua_State* main_L) {
+    // Pin table for parked pending_ coroutines (see PinPendingCo). One
+    // registry slot, allocated before any script runs, so pinning never
+    // disturbs the registry free list that user code observes through
+    // luaL_ref slot reuse (see ReleaseRefsBatch).
+    lua_newtable(main_L);
+    pending_co_table_ref_ = luaL_ref(main_L, LUA_REGISTRYINDEX);
+
     SetupBuiltins(main_L);
 
     for (size_t i = 0; i < extensions_.size(); ++i) {
@@ -643,6 +650,7 @@ void LuaRuntime::PushResumeDirect(AsyncHandle handle, std::function<int(lua_Stat
         auto it = self->pending_.find(handle);
         if (it == self->pending_.end()) return;
         auto* co = it->second.co;
+        self->UnpinPendingCo(handle);
         self->pending_.erase(it);
         if (!self->CheckResumable(co, handle)) return;
         int nresults = fn(co);
@@ -817,8 +825,26 @@ void LuaRuntime::ProcessLoadFileRun(std::string source, std::string filename, As
 
 AsyncHandle LuaRuntime::PreYield(lua_State* co) {
     auto handle = timer_mgr_->NextHandle();
+    PinPendingCo(handle, co);
     pending_[handle] = {co};
     return handle;
+}
+
+void LuaRuntime::PinPendingCo(AsyncHandle handle, lua_State* co) {
+    // Runs on the coroutine's own stack, before the yield: lua_yieldk keeps
+    // whatever is below, and the pushes here are balanced, so the suspended
+    // stack is unchanged.
+    lua_rawgeti(co, LUA_REGISTRYINDEX, pending_co_table_ref_);
+    lua_pushthread(co);
+    lua_rawseti(co, -2, static_cast<lua_Integer>(handle));
+    lua_pop(co, 1);
+}
+
+void LuaRuntime::UnpinPendingCo(AsyncHandle handle) {
+    lua_rawgeti(main_L_, LUA_REGISTRYINDEX, pending_co_table_ref_);
+    lua_pushnil(main_L_);
+    lua_rawseti(main_L_, -2, static_cast<lua_Integer>(handle));
+    lua_pop(main_L_, 1);
 }
 
 int LuaRuntime::Yield(lua_State* L) {
@@ -870,6 +896,9 @@ void LuaRuntime::Interrupt() {
 
         decltype(self->completions_) saved;
         std::swap(self->completions_, saved);
+        for (auto& [handle, entry] : self->pending_) {
+            self->UnpinPendingCo(handle);
+        }
         self->pending_.clear();
 
         self->timer_mgr_->CancelAll(self->main_L_);
@@ -951,7 +980,14 @@ void LuaRuntime::Shutdown() {
 
     decltype(completions_) saved;
     std::swap(completions_, saved);
+    for (auto& [handle, entry] : pending_) {
+        UnpinPendingCo(handle);
+    }
     pending_.clear();
+    if (pending_co_table_ref_ != LUA_NOREF) {
+        luaL_unref(main_L_, LUA_REGISTRYINDEX, pending_co_table_ref_);
+        pending_co_table_ref_ = LUA_NOREF;
+    }
 
     for (auto& ext : extensions_) {
         ext->OnShutdown(main_L_);
@@ -1023,6 +1059,7 @@ void LuaRuntime::CancelCall(lua_State* co) {
             // otherwise the stale timer fires later, misses in pending_,
             // and logs a misleading "invalid handle" error.
             timer_mgr_->CancelTimer(it->first);
+            UnpinPendingCo(it->first);
             it = pending_.erase(it);
         } else {
             ++it;
@@ -1058,6 +1095,7 @@ void LuaRuntime::CleanupStalePendings(lua_State* co) {
     for (auto it = pending_.begin(); it != pending_.end();) {
         if (it->second.co == co) {
             timer_mgr_->CancelTimer(it->first);
+            UnpinPendingCo(it->first);
             it = pending_.erase(it);
         } else {
             ++it;
@@ -1157,6 +1195,7 @@ LuaRuntime::ResumeResult LuaRuntime::DoResume(AsyncHandle handle, std::vector<Lu
         return {nullptr, LUA_ERRRUN};
     }
     co = it->second.co;
+    UnpinPendingCo(handle);
     pending_.erase(it);
 
     if (!CheckResumable(co, handle)) {

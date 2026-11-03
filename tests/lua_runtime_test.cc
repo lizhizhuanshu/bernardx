@@ -277,6 +277,34 @@ TEST_F(LuaRuntimeTest, SleepBlocksForDuration) {
     )")).status, LUA_OK);
 }
 
+// pending_ used to pin the parked coroutine by bare lua_State* only. A
+// SCRIPT-created coroutine (coroutine.create, fire-and-forget) parked on an
+// engine async op is unreachable from Lua once the script drops its last
+// reference — Lua 5.4 collects suspended-but-unreachable threads, so the
+// sleep completion later resumed freed memory (UAF). The registry pin
+// (PendingEntry::co_ref) must keep the thread alive until the async op
+// completes; a weak-value table observes collection without holding a ref.
+TEST_F(LuaRuntimeTest, FireAndForgetCoroutineSurvivesGCWhileSuspended) {
+    auto r = AWAIT(rt->RunScript(R"(
+        local weak = setmetatable({}, {__mode = "v"})
+        local finished = false
+        local co = coroutine.create(function()
+            sleep(100)
+            finished = true
+        end)
+        weak[1] = co
+        coroutine.resume(co)          -- parks on sleep(100)
+        co = nil                       -- drop the last strong reference
+        collectgarbage("collect")
+        collectgarbage("collect")
+        assert(weak[1] ~= nil, "suspended coroutine was GC-collected mid-flight")
+        sleep(250)
+        assert(finished, "coroutine never ran to completion")
+        assert(weak[1] ~= nil, "coroutine collected while its completion ran")
+    )"));
+    EXPECT_EQ(r.status, LUA_OK) << r.error;
+}
+
 TEST_F(LuaRuntimeTest, SetTimeoutCallsCallback) {
     EXPECT_EQ(AWAIT(rt->RunScript(R"(
         local done = false
