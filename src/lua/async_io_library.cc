@@ -344,6 +344,10 @@ static int file_read(lua_State* L) {
         }
     }
 
+    // Strand discipline: this C frame is abandoned by the yield without
+    // running destructors; the completions above hold their own shared_h
+    // (and buf) copies, so drop ours now. See tools/yield_lint.py.
+    shared_h = nullptr;
     return rt->Yield(L);
 }
 
@@ -376,6 +380,11 @@ static int file_write(lua_State* L) {
             }
         });
 
+    // Strand discipline (see file_read): drop the C-frame references — the
+    // completion holds its own copies, and buf's write payload would
+    // otherwise be retained per call in the abandoned frame.
+    shared_h = nullptr;
+    buf = nullptr;
     return rt->Yield(L);
 }
 
@@ -507,6 +516,10 @@ static int process_read(lua_State* L) {
         }
     }
 
+    // Strand discipline: this C frame is abandoned by the yield without
+    // running destructors; the completions above hold their own shared_h
+    // (and buf) copies, so drop ours now. See tools/yield_lint.py.
+    shared_h = nullptr;
     return rt->Yield(L);
 }
 
@@ -542,6 +555,11 @@ static int process_write(lua_State* L) {
             }
         });
 
+    // Strand discipline (see file_read): drop the C-frame references — the
+    // completion holds its own copies, and buf's write payload would
+    // otherwise be retained per call in the abandoned frame.
+    shared_h = nullptr;
+    buf = nullptr;
     return rt->Yield(L);
 }
 

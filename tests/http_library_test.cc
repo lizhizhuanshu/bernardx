@@ -9,7 +9,10 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <csignal>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -80,6 +83,76 @@ private:
     std::string request_head_;
 };
 
+// HTTP echo server: per connection, reads one full request (head + exactly
+// Content-Length body bytes) and echoes the raw body bytes back, so Lua can
+// assert byte-exact round-trips. Catches silent truncation at the first
+// embedded NUL — the wire length would shrink and the echo would mismatch.
+class EchoServer {
+public:
+    explicit EchoServer(asio::io_context& ioc)
+        : acceptor_(ioc, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 0)) {}
+
+    uint16_t port() const { return acceptor_.local_endpoint().port(); }
+
+    void start() { accept_one(); }
+
+private:
+    // Multi-shot: each http.request uses a fresh client/connection, so the
+    // acceptor re-arms after every hit for the duration of the test.
+    void accept_one() {
+        auto socket = std::make_shared<asio::ip::tcp::socket>(acceptor_.get_executor());
+        acceptor_.async_accept(*socket, [this, socket](std::error_code ec) mutable {
+            if (ec) return;
+            accept_one();
+            read_head(socket);
+        });
+    }
+
+    static void read_head(const std::shared_ptr<asio::ip::tcp::socket>& socket) {
+        auto buf = std::make_shared<asio::streambuf>();
+        asio::async_read_until(*socket, *buf, "\r\n\r\n",
+            [socket, buf](std::error_code ec, size_t) mutable {
+                if (ec) return;
+                // read_until may overshoot into the body; consume only the
+                // head, leave the buffered body prefix in the streambuf.
+                std::string all(asio::buffers_begin(buf->data()), asio::buffers_end(buf->data()));
+                size_t head_len = all.find("\r\n\r\n") + 4;
+                buf->consume(head_len);
+
+                // Content-Length is case-insensitive in principle; lower a copy
+                // and reuse the index into the original head.
+                std::string head = all.substr(0, head_len);
+                std::string lower;
+                lower.reserve(head.size());
+                for (char c : head) {
+                    lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+                }
+                size_t content_len = 0;
+                if (auto pos = lower.find("content-length:"); pos != std::string::npos) {
+                    content_len = std::strtoull(head.c_str() + pos + strlen("content-length:"),
+                                                nullptr, 10);
+                }
+
+                // transfer_exactly counts only bytes moved by THIS read; ask
+                // for what is still missing on top of the buffered prefix.
+                size_t buffered = buf->size();
+                asio::async_read(*socket, *buf,
+                    asio::transfer_exactly(content_len > buffered ? content_len - buffered : 0),
+                    [socket, buf, content_len](std::error_code ec, size_t) mutable {
+                        if (ec) return;
+                        auto begin = asio::buffers_begin(buf->data());
+                        std::string body(begin, begin + static_cast<std::ptrdiff_t>(content_len));
+                        std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " +
+                                               std::to_string(body.size()) + "\r\n\r\n" + body;
+                        asio::async_write(*socket, asio::buffer(response),
+                            [socket](std::error_code, size_t) {});
+                    });
+            });
+    }
+
+    asio::ip::tcp::acceptor acceptor_;
+};
+
 TEST_F(HttpLibraryTest, RequireReturnsTable) {
     EXPECT_EQ(AWAIT(rt->RunScript(R"(
         local http = require("http")
@@ -116,6 +189,35 @@ TEST_F(HttpLibraryTest, RequestDispatchesAllMethods) {
             assert(err ~= nil, "expected error for method " .. m)
         end
     )")).status, LUA_OK);
+}
+
+TEST_F(HttpLibraryTest, RequestBodySurvivesEmbeddedNuls) {
+    EchoServer server(ioc);
+    server.start();
+
+    // Leading NUL (pre-fix truncation cut there), embedded NULs, high bytes,
+    // and a >4KB tail so the payload crosses cinatra's buffer boundaries.
+    std::string script = R"(
+        local http = require("http")
+        local payload = "\0ab\0cd\0\0z" .. string.rep("\1\2\255\0", 1024)
+        assert(#payload == 9 + 4 * 1024, "payload length")
+        for _, m in ipairs({"POST", "PUT"}) do
+            local status, body, err = http.request({
+                url = "http://127.0.0.1:__PORT__/upload",
+                method = m,
+                body = payload,
+                content_type = "octet",
+            })
+            assert(err == nil, m .. " unexpected error: " .. tostring(err))
+            assert(status == 200, m .. " expected 200, got " .. tostring(status))
+            assert(body == payload,
+                   m .. " body round-trip mismatch: got " .. #body .. " bytes, want " .. #payload)
+        end
+    )";
+    script.replace(script.find("__PORT__"), 8, std::to_string(server.port()));
+
+    auto r = AWAIT(rt->RunScript(script));
+    EXPECT_EQ(r.status, LUA_OK) << (r.status == LUA_OK ? "" : r.error);
 }
 
 TEST_F(HttpLibraryTest, WsCreateReturnsUserdata) {
