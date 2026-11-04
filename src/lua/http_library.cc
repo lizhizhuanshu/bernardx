@@ -245,7 +245,13 @@ static int http_request(lua_State* L) {
     lua_pop(L, 1);
 
     lua_getfield(L, 1, "body");
-    std::string body = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+    // Binary-safe: Lua strings may contain embedded NULs (file uploads —
+    // MinIO/S3 PUT bodies, screenshots); constructing from lua_tostring's
+    // const char* alone would truncate at the first one. Same pattern as
+    // ws_send's luaL_checklstring + std::string(ptr, len).
+    size_t body_len = 0;
+    const char* body_ptr = lua_isstring(L, -1) ? lua_tolstring(L, -1, &body_len) : nullptr;
+    std::string body = body_ptr ? std::string(body_ptr, body_len) : "";
     lua_pop(L, 1);
 
     lua_getfield(L, 1, "content_type");
