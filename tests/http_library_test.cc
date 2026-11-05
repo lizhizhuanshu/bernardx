@@ -372,6 +372,91 @@ TEST_F(HttpLibraryTest, ProxyInvalidInputRaisesLuaError) {
     )")).status, LUA_OK);
 }
 
+TEST_F(HttpLibraryTest, RequestAutoEncodesUrl) {
+    MiniProxy proxy(ioc);
+    proxy.start([](const std::string&) {
+        return std::string("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    });
+
+    // Space in path and query, plus UTF-8 in a value: all rejected by
+    // cinatra's URI whitelist pre-normalization.
+    std::string script = R"(
+        local http = require("http")
+        local status, body, err = http.request({
+            url = "http://nonexistent.invalid/pro xy/?country=US&city=LAS VEGAS&user=\xe5\xbc\xa0\xe4\xb8\x89",
+            proxy = "http://127.0.0.1:__PORT__",
+        })
+        assert(err == nil, "unexpected error: " .. tostring(err))
+        assert(status == 200, "expected 200, got " .. tostring(status))
+        assert(body == "ok", "unexpected body: " .. tostring(body))
+    )";
+    script.replace(script.find("__PORT__"), 8, std::to_string(proxy.port()));
+
+    EXPECT_EQ(AWAIT(rt->RunScript(script)).status, LUA_OK);
+
+    const std::string& head = proxy.request_head();
+    // cinatra's proxy absolute-form pins the default port (:80).
+    EXPECT_NE(head.find("GET http://nonexistent.invalid:80/pro%20xy/"), std::string::npos)
+        << "path not encoded, head: " << head;
+    EXPECT_NE(head.find("city=LAS%20VEGAS"), std::string::npos) << "head: " << head;
+    EXPECT_NE(head.find("user=%E5%BC%A0%E4%B8%89"), std::string::npos) << "head: " << head;
+}
+
+TEST_F(HttpLibraryTest, RequestDoesNotDoubleEncodeUrl) {
+    MiniProxy proxy(ioc);
+    proxy.start([](const std::string&) {
+        return std::string("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    });
+
+    std::string script = R"(
+        local http = require("http")
+        local status, body, err = http.request({
+            url = "http://nonexistent.invalid/proxy/?city=LAS%20VEGAS",
+            proxy = "http://127.0.0.1:__PORT__",
+        })
+        assert(err == nil, "unexpected error: " .. tostring(err))
+        assert(status == 200, "expected 200, got " .. tostring(status))
+    )";
+    script.replace(script.find("__PORT__"), 8, std::to_string(proxy.port()));
+
+    EXPECT_EQ(AWAIT(rt->RunScript(script)).status, LUA_OK);
+
+    // Valid %XX escapes pass through verbatim — no %2520-style double encoding.
+    const std::string& head = proxy.request_head();
+    EXPECT_NE(head.find("city=LAS%20VEGAS"), std::string::npos) << "head: " << head;
+    EXPECT_EQ(head.find("%25"), std::string::npos) << "double-encoded escape in head: " << head;
+}
+
+TEST_F(HttpLibraryTest, WsConnectAutoEncodesUrl) {
+    MiniProxy proxy(ioc);
+    proxy.start([](const std::string&) {
+        return std::string("HTTP/1.1 101 Switching Protocols\r\n"
+                           "Upgrade: websocket\r\n"
+                           "Connection: Upgrade\r\n"
+                           "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+                           "\r\n");
+    });
+
+    std::string script = R"(
+        local http = require("http")
+        local ws = http.ws_create("ws://nonexistent.invalid/room name?user=\xe5\xbc\xa0\xe4\xb8\x89", {
+            proxy = "http://127.0.0.1:__PORT__",
+        })
+        ws.onclose = function() end
+        ws.onerror = function() end
+        local ok = select(1, ws:connect())
+        assert(ok == true, "expected ws connect to succeed")
+    )";
+    script.replace(script.find("__PORT__"), 8, std::to_string(proxy.port()));
+
+    EXPECT_EQ(AWAIT(rt->RunScript(script)).status, LUA_OK);
+
+    const std::string& head = proxy.request_head();
+    EXPECT_NE(head.find("GET http://nonexistent.invalid:80/room%20name?user=%E5%BC%A0%E4%B8%89"),
+              std::string::npos)
+        << "ws url not encoded, head: " << head;
+}
+
 TEST_F(HttpLibraryTest, WsConnectThroughProxy) {
     MiniProxy proxy(ioc);
     proxy.start([](const std::string&) {

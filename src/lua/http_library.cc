@@ -160,6 +160,84 @@ static ProxyConfig parse_proxy(lua_State* L, const char* s) {
     return proxy;
 }
 
+// --- URL normalization ---
+//
+// cinatra's uri_t::parse_from validates path/query against the RFC 3986
+// whitelist and rejects the whole URL on any illegal byte (space, non-ASCII,
+// a bare '%' …): "?city=LAS VEGAS" fails locally with a synthetic 404 +
+// protocol_error, nothing leaves the machine. Scripts assemble query strings
+// from device data (city names, app labels …), so URLs are normalized before
+// being handed to cinatra: illegal bytes in the path/query get
+// percent-encoded, while structure delimiters and valid %XX escapes are kept
+// intact (no double encoding). The authority (host:port, userinfo) and the
+// fragment are passed through verbatim — '#' splits off the fragment, which
+// never goes on the wire anyway.
+
+static bool is_hex_digit(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+// Path-legal: unreserved | sub-delims | ':' '@' '/'; the query additionally
+// allows '?'. Everything else (space, non-ASCII, control, '"<>\[]^`{}|' …)
+// gets percent-encoded.
+static bool is_url_component_char_legal(unsigned char c, bool in_query) {
+    if (c == 0) return false;  // strchr would match the terminator otherwise
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return true;
+    if (c == '-' || c == '.' || c == '_' || c == '~') return true;
+    if (strchr("!$&'()*+,;=", c) != nullptr) return true;  // sub-delims
+    if (c == ':' || c == '@' || c == '/') return true;
+    return in_query && c == '?';
+}
+
+static void append_url_component(std::string& out, const std::string& url,
+                                 size_t begin, size_t end, bool in_query) {
+    static const char kHex[] = "0123456789ABCDEF";
+    for (size_t i = begin; i < end; ++i) {
+        unsigned char c = static_cast<unsigned char>(url[i]);
+        if (c == '%') {
+            if (i + 2 < end && is_hex_digit(url[i + 1]) && is_hex_digit(url[i + 2])) {
+                out.append(url, i, 3);  // valid escape: pass through verbatim
+                i += 2;
+            } else {
+                out += "%25";  // bare '%': encode it
+            }
+        } else if (is_url_component_char_legal(c, in_query)) {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0xf];
+        }
+    }
+}
+
+static std::string normalize_url(const std::string& url) {
+    // scheme://authority[path][?query][#fragment]; only path/query encode.
+    size_t auth = url.find("://");
+    auth = (auth == std::string::npos) ? 0 : auth + 3;
+    size_t comp = url.find_first_of("/?#", auth);
+    if (comp == std::string::npos) return url;  // authority only — cinatra's job
+
+    size_t frag = url.find('#', comp);
+    size_t end = (frag == std::string::npos) ? url.size() : frag;
+    size_t qmark = url.find('?', comp);
+    if (qmark > end) qmark = std::string::npos;  // '?' only inside the fragment
+
+    std::string out;
+    out.reserve(url.size() + 16);
+    out.append(url, 0, comp);  // scheme + authority, verbatim
+    append_url_component(out, url, comp, qmark == std::string::npos ? end : qmark,
+                         /*in_query=*/false);
+    if (qmark != std::string::npos) {
+        out += '?';
+        append_url_component(out, url, qmark + 1, end, /*in_query=*/true);
+    }
+    if (frag != std::string::npos) {
+        out.append(url, frag, url.size() - frag);  // fragment verbatim
+    }
+    return out;
+}
+
 // --- HTTP Lua C function ---
 
 static int http_request(lua_State* L);
@@ -232,11 +310,12 @@ static int http_request(lua_State* L) {
     luaL_checktype(L, 1, LUA_TTABLE);
 
     lua_getfield(L, 1, "url");
-    const char* url = lua_tostring(L, -1);
-    if (!url) {
+    size_t url_len = 0;
+    const char* url_ptr = lua_isstring(L, -1) ? lua_tolstring(L, -1, &url_len) : nullptr;
+    if (!url_ptr) {
         return luaL_error(L, "http.request requires a string 'url'");
     }
-    std::string url_str = url;
+    std::string url_str = normalize_url(std::string(url_ptr, url_len));
     lua_pop(L, 1);
 
     lua_getfield(L, 1, "method");
@@ -416,7 +495,8 @@ static std::chrono::milliseconds opt_timeout_ms(lua_State* L, int tbl, const cha
 // options.connect_timeout: handshake timeout in ms (0/absent → engine default 30s).
 // options.idle_timeout: max silent time between inbound messages in ms (0/absent → default 60s).
 static int ws_create(lua_State* L) {
-    const char* url = luaL_checkstring(L, 1);
+    size_t url_len = 0;
+    const char* url = luaL_checklstring(L, 1, &url_len);
     ProxyConfig proxy;
     std::chrono::milliseconds connect_timeout{0};
     std::chrono::milliseconds idle_timeout{0};
@@ -440,7 +520,7 @@ static int ws_create(lua_State* L) {
     auto conn = std::make_shared<WsConn>();
     conn->state = std::move(state);
     conn->rt = rt;
-    conn->url = url;
+    conn->url = normalize_url(std::string(url, url_len));
     conn->proxy = std::move(proxy);
     conn->connect_timeout = connect_timeout;
     conn->idle_timeout = idle_timeout;
