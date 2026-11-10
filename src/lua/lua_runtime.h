@@ -190,6 +190,26 @@ public:
     // PushResumeDirect.
     void BeginShutdown();
 
+    // Extension OnShutdown + library Close, split out of Shutdown() so the
+    // recycle path can run them: BernardXEngine::Release() arms
+    // BeginShutdown() and ~LuaRuntime's Shutdown() then early-returns, so
+    // without this call the per-run teardown side effects never happen on
+    // recycle — e.g. a run interrupted while parked on SUI.showDialog(-1)
+    // left the app-side dialog window up and the extension's single-thread
+    // executor blocked forever. Must be scheduled ON the Lua executor (the
+    // Lua C API is executor-thread-only); idempotent.
+    void RunTeardownHooks();
+
+    // RunTeardownHooks() hopped onto the Lua executor, blocking until the
+    // hooks actually ran. A fire-and-forget schedule() is not enough on the
+    // recycle path: the ThreadPool worker's stop path (pop -> _stop ->
+    // break) DROPS queued items without running them, so the caller must
+    // wait before tearing the executor down. Schedule rejected (executor
+    // already stopping) falls back to an inline run — matching the legacy
+    // destructor path, where Shutdown()'s hooks ran on the destroying
+    // thread; SUI's OnShutdown is pure JNI and thread-safe.
+    bool RunTeardownHooksSync();
+
     // Count hook armed on the main state in SetupBuiltins (inherited by every
     // Lua thread — lstate.c's lua_newthread copies hook and extraspace). When
     // the runtime is interrupted/shutting down it yields the running coroutine
@@ -323,6 +343,7 @@ private:
     std::unordered_map<std::string, std::shared_ptr<LuaLibrary>> libraries_;
 
     std::atomic<bool> shutting_down_{false};
+    std::atomic<bool> teardown_hooks_done_{false};
     std::atomic<bool> interrupted_{false};
     std::atomic<bool> paused_{false};
     std::unordered_map<AsyncHandle, PendingEntry> pending_;

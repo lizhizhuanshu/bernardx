@@ -1,5 +1,7 @@
 #include "lua_runtime.h"
 
+#include <future>
+
 #include <chrono>
 #include <cstring>
 
@@ -975,6 +977,39 @@ void LuaRuntime::BeginShutdown() {
     shutting_down_.store(true, std::memory_order_release);
 }
 
+void LuaRuntime::RunTeardownHooks() {
+    // Idempotent guard shared with Shutdown(): the recycle path schedules
+    // this while the executor lives, and the destructor's Shutdown() (if it
+    // ever runs the body) must not fire the hooks a second time.
+    bool expected = false;
+    if (!teardown_hooks_done_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+    for (auto& ext : extensions_) {
+        ext->OnShutdown(main_L_);
+    }
+    for (auto& [name, lib] : libraries_) {
+        lib->Close(main_L_);
+    }
+}
+
+bool LuaRuntime::RunTeardownHooksSync() {
+    if (teardown_hooks_done_.load(std::memory_order_acquire)) return true;
+    std::promise<void> done;
+    auto fut = done.get_future();
+    bool scheduled = executor_->schedule([this, &done]() {
+        RunTeardownHooks();
+        done.set_value();
+    });
+    if (!scheduled) {
+        RunTeardownHooks();
+        return true;
+    }
+    fut.get();
+    return true;
+}
+
 void LuaRuntime::Shutdown() {
     if (shutting_down_.exchange(true, std::memory_order_acq_rel)) return;
 
@@ -989,12 +1024,7 @@ void LuaRuntime::Shutdown() {
         pending_co_table_ref_ = LUA_NOREF;
     }
 
-    for (auto& ext : extensions_) {
-        ext->OnShutdown(main_L_);
-    }
-    for (auto& [name, lib] : libraries_) {
-        lib->Close(main_L_);
-    }
+    RunTeardownHooks();
 
     for (auto& [co, handler] : saved) {
         ScriptResult result{LUA_ERRRUN, {}, "runtime shutdown"};
