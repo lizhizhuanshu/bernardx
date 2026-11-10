@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <fstream>
 
 #include <async_simple/executors/SimpleExecutor.h>
 
@@ -39,6 +40,22 @@ async_simple::coro::Lazy<void> ResumeFileLoad(
     auto source = co_await rt->code_provider()->LoadFile(file_path);
     if (source.has_value()) {
         rt->PushLoadFileRun(handle, std::move(*source), std::move(file_path));
+    } else {
+        rt->PushResume(handle, {LuaValue{nullptr}});
+    }
+}
+
+// readfile: loadfile's text twin — same CodeProvider::LoadFile fetch (verbatim
+// path, cache + debug-bypass semantics), but the raw text is pushed instead of
+// compiled as a Lua chunk. Non-Lua project assets (DSL files, templates) in the
+// src/libs tree become readable from Lua with the same locality as require.
+async_simple::coro::Lazy<void> ResumeFileRead(
+    std::shared_ptr<LuaRuntime> rt,
+    AsyncHandle handle,
+    std::string file_path) {
+    auto source = co_await rt->code_provider()->LoadFile(file_path);
+    if (source.has_value()) {
+        rt->PushResume(handle, {LuaValue{std::move(*source)}});
     } else {
         rt->PushResume(handle, {LuaValue{nullptr}});
     }
@@ -171,6 +188,20 @@ int loadfile_continuation(lua_State* L, int status, lua_KContext ctx) {
     return 1;
 }
 
+// --- custom_readfile continuation ---
+
+int readfile_continuation(lua_State* L, int status, lua_KContext ctx) {
+    if (lua_isnil(L, 2)) {
+        const char* filename = lua_tostring(L, 1);
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushfstring(L, "cannot read file '%s' via CodeProvider", filename);
+        return 2;
+    }
+    lua_remove(L, 1);
+    return 1;
+}
+
 // --- Custom require ---
 
 int custom_require(lua_State* L) {
@@ -264,6 +295,52 @@ int custom_loadfile(lua_State* L) {
     ResumeFileLoad(rt, handle, std::string(filename)).via(exec).detach();
 
     return lua_yieldk(L, 0, 0, loadfile_continuation);
+}
+
+// --- Custom readfile: loadfile's text twin (returns the file content as a
+// string instead of a compiled chunk). Absolute paths read the local
+// filesystem (loadfile's '/' branch); relative paths go through the
+// CodeProvider like require/loadfile — on the worker that is the GetCode RPC
+// (verbatim path, any extension, cached, task_id==0 debug bypass).
+
+int custom_readfile(lua_State* L) {
+    const char* filename = luaL_checkstring(L, 1);
+    if (filename[0] == '\0') {
+        lua_pushnil(L);
+        lua_pushliteral(L, "empty filename");
+        return 2;
+    }
+
+    if (filename[0] == '/') {
+        std::ifstream ifs(filename, std::ios::in | std::ios::binary);
+        if (!ifs.is_open()) {
+            lua_pushnil(L);
+            lua_pushfstring(L, "cannot open file '%s'", filename);
+            return 2;
+        }
+        std::string content((std::istreambuf_iterator<char>(ifs)),
+                            std::istreambuf_iterator<char>());
+        lua_pushlstring(L, content.data(), content.size());
+        return 1;
+    }
+
+    auto rt = LuaRuntime::FromLuaState(L);
+    if (!rt || !rt->code_provider()) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "cannot read relative file '%s': no CodeProvider", filename);
+        return 2;
+    }
+    if (!rt->executor()) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "cannot read relative file '%s': no executor", filename);
+        return 2;
+    }
+
+    auto handle = rt->PreYield(L);
+    auto* exec = rt->executor();
+    ResumeFileRead(rt, handle, std::string(filename)).via(exec).detach();
+
+    return lua_yieldk(L, 0, 0, readfile_continuation);
 }
 
 // --- Built-in functions ---
@@ -606,6 +683,8 @@ void LuaRuntime::SetupCustomRequire(lua_State* main_L) {
     if (code_provider_) {
         lua_pushcfunction(main_L, custom_loadfile);
         lua_setglobal(main_L, "loadfile");
+        lua_pushcfunction(main_L, custom_readfile);
+        lua_setglobal(main_L, "readfile");
     }
 }
 

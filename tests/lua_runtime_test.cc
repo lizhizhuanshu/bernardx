@@ -696,6 +696,37 @@ TEST_F(LuaRuntimeWithProviderTest, LoadfileAbsolutePath) {
     )")).status, LUA_OK);
 }
 
+// --- Custom readfile (loadfile's text twin) ---
+
+TEST_F(LuaRuntimeWithProviderTest, ReadfileReturnsRawText) {
+    // Content that is NOT valid Lua — readfile must return it verbatim,
+    // no compile step (the .telos/asset-in-src-tree use case).
+    provider->set_file("telos/main.telos", "telos v1\nthis is { not lua\n");
+
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local text = readfile("telos/main.telos")
+        assert(type(text) == "string", "expected string, got " .. type(text))
+        assert(text:sub(1, 8) == "telos v1", "unexpected prefix: " .. tostring(text))
+        assert(text:find("not lua", 1, true) ~= nil)
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeWithProviderTest, ReadfileRelativeNotFound) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local text, err = readfile("missing.telos")
+        assert(text == nil, "expected nil, got " .. tostring(text))
+        assert(err ~= nil and err:find("cannot read", 1, true), "expected error message")
+    )")).status, LUA_OK);
+}
+
+TEST_F(LuaRuntimeWithProviderTest, ReadfileAbsolutePath) {
+    EXPECT_EQ(AWAIT(rt->RunScript(R"(
+        local text, err = readfile("/nonexistent/path.telos")
+        assert(text == nil, "expected nil for nonexistent file")
+        assert(err ~= nil, "expected error message")
+    )")).status, LUA_OK);
+}
+
 class LuaRuntimeRegisterTest : public ::testing::Test {
 protected:
     static int luaopen_testmath(lua_State* L) {
