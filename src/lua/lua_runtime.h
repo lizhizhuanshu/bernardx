@@ -320,6 +320,16 @@ private:
     // dead or pool-recycled coroutine under the same pointer.
     void CleanupStalePendings(lua_State* co);
 
+    // Log script-created coroutines still parked on an async op at a
+    // tear-down pass (Interrupt completion / Shutdown). Async completion
+    // resumes a parked coroutine only while the runtime is alive — a script
+    // coroutine parked past main-chunk exit dies at task recycle (same
+    // end-of-world as native Lua's main chunk return). Pool coroutines are
+    // engine business and stay silent; the script's get a WARN with their
+    // suspension point so the drop is debuggable instead of never-wakes.
+    // Executor-thread only (walks suspended stacks).
+    void LogDroppedScriptCos(const char* where);
+
     // Before resuming a parked coroutine: it must still be suspended
     // (LUA_YIELD). If it finished, errored, or the script resumed/closed it
     // while the async op was in flight, records the condition as an unhandled

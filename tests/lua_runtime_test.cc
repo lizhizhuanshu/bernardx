@@ -305,6 +305,23 @@ TEST_F(LuaRuntimeTest, FireAndForgetCoroutineSurvivesGCWhileSuspended) {
     EXPECT_EQ(r.status, LUA_OK) << r.error;
 }
 
+// Companion to the GC test above: a script coroutine STILL PARKED when the
+// runtime tears down (main chunk exited, no one waits) is dropped — no crash,
+// no resume-after-free. Native-Lua end-of-world semantics (main chunk return
+// ends the world); the drop WARN carries the suspension point so it is
+// observable instead of never-wakes.
+TEST_F(LuaRuntimeTest, ScriptCoroutineParkedAtShutdownDroppedCleanly) {
+    auto r = AWAIT(rt->RunScript(R"(
+        local co = coroutine.create(function()
+            sleep(100000)          -- parks; main exits without waiting
+        end)
+        coroutine.resume(co)
+    )"));
+    EXPECT_EQ(r.status, LUA_OK) << r.error;
+    rt->Shutdown();   // parked script co dropped here; must not crash
+    SUCCEED();
+}
+
 TEST_F(LuaRuntimeTest, SetTimeoutCallsCallback) {
     EXPECT_EQ(AWAIT(rt->RunScript(R"(
         local done = false

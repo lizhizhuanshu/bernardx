@@ -977,6 +977,7 @@ void LuaRuntime::Interrupt() {
 
         decltype(self->completions_) saved;
         std::swap(self->completions_, saved);
+        self->LogDroppedScriptCos("interrupt");
         for (auto& [handle, entry] : self->pending_) {
             self->UnpinPendingCo(handle);
         }
@@ -1094,6 +1095,10 @@ void LuaRuntime::Shutdown() {
 
     decltype(completions_) saved;
     std::swap(completions_, saved);
+    // Reached with pending_ intact only on the direct teardown path (no
+    // preceding Interrupt pass — e.g. raw runtime destruction); the task
+    // recycle path logs in Interrupt's completion pass instead.
+    LogDroppedScriptCos("shutdown");
     for (auto& [handle, entry] : pending_) {
         UnpinPendingCo(handle);
     }
@@ -1209,6 +1214,32 @@ void LuaRuntime::CleanupStalePendings(lua_State* co) {
         } else {
             ++it;
         }
+    }
+}
+
+void LuaRuntime::LogDroppedScriptCos(const char* where) {
+    size_t dropped = 0;
+    for (auto& [handle, entry] : pending_) {
+        // Same suspension-point contract as the Interrupt detail walk: the
+        // executor is single-threaded, so every parked co here is suspended
+        // at a yield and its stack is intact. Skip non-yielding entries (the
+        // script resumed/closed it out from under the pending op).
+        if (!co_pool_ || co_pool_->Owns(entry.co) ||
+            lua_status(entry.co) != LUA_YIELD) {
+            continue;
+        }
+        auto detail = CaptureSuspensionDetail(entry.co, where);
+        spdlog::warn(
+            "LuaRuntime: dropping parked script coroutine @ {}:{} "
+            "(async op pending at {}; script coroutines resume only while "
+            "the main flow keeps the runtime alive)",
+            detail.source, detail.line, where);
+        ++dropped;
+    }
+    if (dropped > 0) {
+        spdlog::warn(
+            "LuaRuntime: {} parked script coroutine(s) dropped ({})", dropped,
+            where);
     }
 }
 
