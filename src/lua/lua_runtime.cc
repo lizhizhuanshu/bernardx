@@ -132,6 +132,29 @@ void CaptureLuaLocation(lua_State* L, ScriptErrorDetail& detail) {
     detail.stack_trace = CollectStackTrace(L);
 }
 
+// Strip the "short_src:line: " head that error(msg)/VM runtime errors carry
+// (luaL_where). detail already carries source/line/stack_trace separately;
+// the prefix in the message text only duplicates them, eats truncation
+// budgets upstream (ExecuteResult.error_message caps at 64 bytes), and the
+// line number fragments server-side per-error-text tallies. Match the actual
+// raising frames like the legacy worker's msgh (error(msg,2) blames the
+// caller — Lua prepends THAT frame's position, so walk levels 0..3; frames
+// between error() and the raise site are C frames with currentline < 0).
+static void StripPositionPrefix(lua_State* L, std::string& msg) {
+    for (int level = 0; level <= 3 && !msg.empty(); ++level) {
+        lua_Debug debug;
+        if (!lua_getstack(L, level, &debug)) break;
+        lua_getinfo(L, "Sl", &debug);
+        if (debug.currentline <= 0) continue;
+        std::string prefix = std::string(debug.short_src) + ":" +
+                             std::to_string(debug.currentline) + ": ";
+        if (msg.rfind(prefix, 0) == 0) {
+            msg.erase(0, prefix.size());
+            return;
+        }
+    }
+}
+
 ScriptErrorDetail CaptureErrorDetail(lua_State* L) {
     ScriptErrorDetail detail;
     const char* err = lua_tostring(L, -1);
@@ -145,6 +168,7 @@ ScriptErrorDetail CaptureErrorDetail(lua_State* L) {
     }
 
     CaptureLuaLocation(L, detail);
+    StripPositionPrefix(L, detail.message);
     return detail;
 }
 
