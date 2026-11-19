@@ -5,6 +5,7 @@ build
 .devcontainer
 .vscode
 build_test/
+build_test_ssl/
 
 # local test build
 build_asan/

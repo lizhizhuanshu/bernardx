@@ -18,6 +18,8 @@ extern "C" {
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -378,6 +380,246 @@ static int http_request(lua_State* L) {
                 return client.async_get(url);
         }
     });
+}
+
+// --- Download ---
+//
+// cinatra's own async_download is not used: its file plumbing only engages
+// when the response carries an Accept-Ranges header or is chunked — a plain
+// Content-Length 200 buffers the body and never writes the file (empty file,
+// no error), Range responses buffer the whole body in memory anyway, it adds
+// a meaningless request "Transfer-Encoding: chunked" header, and it never
+// follows redirects (302 → CDN is the norm for downloads). Instead each hop
+// is a regular async_request with the body in memory — the same buffering
+// model as http.request — and the final 2xx body is committed to disk by
+// tmp+rename, so a partial file is never visible under the target name and
+// a failed download never disturbs a previous one there.
+
+// scheme://authority[path]... — the authority (host[:port]); "" when the URL
+// has no scheme. Redirect hops compare authorities to decide whether custom
+// headers may follow to the next hop.
+static std::string url_authority(const std::string& url) {
+    size_t auth = url.find("://");
+    if (auth == std::string::npos) return "";
+    auth += 3;
+    size_t end = url.find_first_of("/?#", auth);
+    return (end == std::string::npos) ? url.substr(auth) : url.substr(auth, end - auth);
+}
+
+// Resolves a redirect Location against the URL it came from: absolute
+// http(s) URLs pass through; "//host/path" inherits the scheme; "/path"
+// re-anchors on the current authority; anything else is resolved against
+// the current path's directory. Other schemes (ftp:// …) and unusable
+// locations resolve to "".
+static std::string resolve_location(const std::string& url, const std::string& location) {
+    if (location.empty()) return "";
+    auto scheme_end = location.find("://");
+    if (scheme_end != std::string::npos) {
+        std::string_view scheme(location.data(), scheme_end);
+        if (scheme == "http" || scheme == "https") return location;
+        return "";
+    }
+
+    size_t auth = url.find("://");
+    if (auth == std::string::npos) return "";
+    std::string scheme = url.substr(0, auth);
+    auth += 3;
+    size_t path_start = url.find_first_of("/?#", auth);
+    std::string authority = (path_start == std::string::npos)
+                                ? url.substr(auth)
+                                : url.substr(auth, path_start - auth);
+
+    if (location.starts_with("//")) return scheme + ":" + location;
+    if (location.starts_with('/')) return scheme + "://" + authority + location;
+
+    // path-relative: replace the last segment of the current path
+    std::string base = (path_start == std::string::npos) ? "/" : url.substr(path_start);
+    size_t cut = base.find_first_of("?#");
+    std::string base_path = (cut == std::string::npos) ? base : base.substr(0, cut);
+    size_t slash = base_path.rfind('/');
+    std::string dir = (slash == std::string::npos) ? "" : base_path.substr(0, slash + 1);
+    return scheme + "://" + authority + dir + location;
+}
+
+// http.download flow — walks the redirect chain (a fresh client per hop: a
+// keep-alive connection to hop N's host must not carry hop N+1's request),
+// then commits the final 2xx body to `path` via tmp+rename. Any failure
+// leaves an already-existing `path` untouched and no .tmp behind; Lua is
+// resumed exactly once with (status, path|nil, err|nil).
+static async_simple::coro::Lazy<void> HttpDownloadFlow(
+    std::shared_ptr<HttpLibraryState> state, LuaRuntime::Ptr rt, AsyncHandle handle,
+    std::string url, std::string path,
+    std::unordered_map<std::string, std::string> headers, ProxyConfig proxy,
+    std::chrono::milliseconds timeout) {
+    // (status, nil, err) — mirrors http.request's net-error shape.
+    auto fail = [&](int64_t status, std::string err) {
+        rt->PushResume(handle,
+                       {LuaValue{status}, LuaValue{nullptr}, LuaValue{std::move(err)}});
+    };
+
+    std::string authority = url_authority(url);
+    constexpr int kMaxRedirects = 5;
+    for (int hop = 0;; ++hop) {
+        auto client = std::make_shared<cinatra::coro_http_client>(state->exec);
+        client->set_req_timeout(timeout);
+        apply_proxy(*client, proxy);
+        for (auto& [k, v] : headers) {
+            client->add_header(k, v);
+        }
+
+        auto result = co_await client->async_request(url, cinatra::http_method::GET,
+                                                     cinatra::req_context<>{})
+                           .coAwaitTry();
+        if (result.hasError()) {
+            fail(0, "internal error");
+            co_return;
+        }
+        auto& resp = result.value();
+        if (resp.net_err) {
+            fail(0, std::string(resp.net_err.message()));
+            co_return;
+        }
+
+        // 3xx (except 304 Not Modified, which is not a redirect) with a
+        // usable Location → next hop. Fresh client per hop, so
+        // get_redirect_uri() can only be this response's Location.
+        int status = resp.status;
+        if (status >= 300 && status <= 399 && status != 304) {
+            std::string next =
+                normalize_url(resolve_location(url, client->get_redirect_uri()));
+            if (next.empty()) {
+                fail(status, "redirect without usable Location");
+                co_return;
+            }
+            if (hop + 1 >= kMaxRedirects) {
+                fail(status, "too many redirects");
+                co_return;
+            }
+            // Reaching another origin: drop custom headers (Authorization,
+            // Cookie …) instead of leaking them off-host; the proxy stays.
+            std::string next_authority = url_authority(next);
+            if (!next_authority.empty() && next_authority != authority) {
+                headers.clear();
+            }
+            authority = std::move(next_authority);
+            url = std::move(next);
+            continue;
+        }
+
+        if (status < 200 || status > 299) {
+            fail(status, "HTTP status " + std::to_string(status));
+            co_return;
+        }
+
+        // 2xx — commit atomically: write path.tmp, rename over path. No
+        // fsync: rename gives all-or-nothing visibility; crash durability
+        // is the same trade as the async file writes.
+        std::string tmp = path + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            f.write(resp.resp_body.data(),
+                    static_cast<std::streamsize>(resp.resp_body.size()));
+            f.flush();
+            if (!f) {
+                f.close();
+                std::error_code rm_ec;
+                std::filesystem::remove(tmp, rm_ec);
+                fail(0, "cannot write file '" + tmp + "'");
+                co_return;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            std::error_code rm_ec;
+            std::filesystem::remove(tmp, rm_ec);
+            fail(0, "cannot write file '" + path + "': " + ec.message());
+            co_return;
+        }
+        spdlog::info("http.download saved: url={} path={} bytes={}", url, path,
+                     resp.resp_body.size());
+        rt->PushResume(handle, {LuaValue{static_cast<int64_t>(status)},
+                                LuaValue{std::move(path)}, LuaValue{nullptr}});
+        co_return;
+    }
+}
+
+// http.download({url=, path=, timeout=, headers=, proxy=}) -> status, path, err
+static int http_download(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+
+    lua_getfield(L, 1, "url");
+    size_t url_len = 0;
+    const char* url_ptr = lua_isstring(L, -1) ? lua_tolstring(L, -1, &url_len) : nullptr;
+    if (!url_ptr) {
+        return luaL_error(L, "http.download requires a string 'url'");
+    }
+    std::string url_str = normalize_url(std::string(url_ptr, url_len));
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "path");
+    size_t path_len = 0;
+    const char* path_ptr = lua_isstring(L, -1) ? lua_tolstring(L, -1, &path_len) : nullptr;
+    if (!path_ptr || path_len == 0) {
+        return luaL_error(L, "http.download requires a non-empty string 'path'");
+    }
+    std::string path_str = std::string(path_ptr, path_len);
+    lua_pop(L, 1);
+
+    // timeout (optional, milliseconds; per redirect hop). A file can be tens
+    // of MB over slow wifi — default 300s per hop (Guardian.upgradeEngine's
+    // download precedent), not http.request's 60s.
+    lua_getfield(L, 1, "timeout");
+    int64_t timeout_ms = (lua_type(L, -1) == LUA_TNUMBER) ? lua_tointeger(L, -1) : 0;
+    lua_pop(L, 1);
+    std::chrono::milliseconds timeout =
+        timeout_ms > 0 ? std::chrono::milliseconds(timeout_ms)
+                       : std::chrono::milliseconds(300000);
+
+    lua_getfield(L, 1, "headers");
+    int headers_idx = lua_absindex(L, -1);
+    auto headers = parse_headers(L, headers_idx);
+    lua_pop(L, 1);
+
+    // proxy (optional, "http://[user:pass@]host[:port]"; port defaults to 8080)
+    lua_getfield(L, 1, "proxy");
+    ProxyConfig proxy;
+    if (const char* proxy_str = lua_isstring(L, -1) ? lua_tostring(L, -1) : nullptr) {
+        proxy = parse_proxy(L, proxy_str);
+    }
+    lua_pop(L, 1);
+
+    // Parent directory up front, failing fast before the yield — no pending
+    // resume handle exists yet, so the failure returns synchronously.
+    {
+        std::filesystem::path parent = std::filesystem::path(path_str).parent_path();
+        if (!parent.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                lua_pushinteger(L, 0);
+                lua_pushnil(L);
+                lua_pushfstring(L, "cannot create directory '%s': %s",
+                                parent.string().c_str(), ec.message().c_str());
+                return 3;
+            }
+        }
+    }
+
+    auto state = g_http_state.Get(L);
+    if (!state || state->shutting_down.load() || !state->exec) {
+        return luaL_error(L, "http library is shutting down");
+    }
+    auto rt = LuaRuntime::FromLuaState(L);
+    auto handle = rt->PreYield(L);
+    auto* exec = state->exec;
+
+    HttpDownloadFlow(std::move(state), rt, handle, std::move(url_str), std::move(path_str),
+                     std::move(headers), std::move(proxy), std::move(timeout))
+        .via(exec)
+        .detach();
+
+    return rt->Yield(L);
 }
 
 // --- WebSocket ---
@@ -833,6 +1075,7 @@ void HttpLibrary::Open(lua_State* L) {
     lua_newtable(L);
     luaL_Reg funcs[] = {
         {"request", http_request},
+        {"download", http_download},
         {"ws_create", ws_create},
         {nullptr, nullptr}
     };

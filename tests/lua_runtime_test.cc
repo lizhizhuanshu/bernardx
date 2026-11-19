@@ -318,7 +318,9 @@ TEST_F(LuaRuntimeTest, ScriptCoroutineParkedAtShutdownDroppedCleanly) {
         coroutine.resume(co)
     )"));
     EXPECT_EQ(r.status, LUA_OK) << r.error;
-    rt->Shutdown();   // parked script co dropped here; must not crash
+    // Shutdown() is private since 44724dd; destroying the runtime runs its
+    // full teardown (Shutdown pass) — same drop-this-point the test wants.
+    rt.reset();
     SUCCEED();
 }
 

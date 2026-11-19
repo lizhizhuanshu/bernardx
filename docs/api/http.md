@@ -112,6 +112,74 @@ local s, b, e = http.request({
 
 ---
 
+## 下载
+
+### http.download(options)
+
+下载 URL 内容并**原子写入本地文件**。协程异步——调用时 yield 挂起，下载完成后恢复。先写 `<path>.tmp` 再 rename，失败时目标路径上的既有文件不受影响，也不会残留 `.tmp`。
+
+```lua
+local status, path, err = http.download({
+    url = "https://example.com/file.bin",
+    path = "/data/downloads/file.bin",
+    timeout = 600000,           -- 可选，毫秒，每跳截止；默认 300s
+    headers = { ... },          -- 可选，同 http.request
+    proxy = "http://127.0.0.1:7890",  -- 可选，同 http.request
+})
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| url | string | 是 | 下载 URL |
+| path | string | 是 | 保存路径（父目录不存在时自动创建） |
+| timeout | integer | 否 | 每个重定向跳的截止时间（毫秒），不传或 `<= 0` 用默认 300s |
+| headers | table | 否 | 请求头 `{["Key"] = "Value"}`（见下方跨主机规则） |
+| proxy | string | 否 | HTTP 代理，格式同 `http.request` 的 `proxy` 字段 |
+
+**返回值：** `status, path, err`
+
+| 返回值 | 类型 | 说明 |
+|--------|------|------|
+| status | integer | HTTP 状态码（200, 404 等），网络失败为 0 |
+| path | string/nil | 成功时为保存路径，失败为 nil |
+| err | string/nil | 错误信息，成功时为 nil |
+
+**行为细节：**
+
+- 只有 **2xx** 算成功；非 2xx（含重定向耗尽）不产生文件，`err` 形如 `"HTTP status 404"`。需要错误响应体时请用 `http.request`
+- **自动跟随重定向**（301/302/303/307/308，最多 5 跳），`Location` 支持绝对 URL、`//host/path`、`/path` 根相对与路径相对形式
+- **跨主机跳转丢弃自定义 headers**（防 Authorization/Cookie 泄漏到其他源），同主机跳转保留；`proxy` 对每一跳都生效
+- 传 `headers = {["Range"] = "bytes=100-"}` 即可断点续传（206 属 2xx，成功落盘）
+- 响应体全量读入内存后落盘（与 `http.request` 同模型），超大文件请评估设备内存
+
+**示例：**
+
+```lua
+local http = require('http')
+
+local status, path, err = http.download({
+    url = "https://example.com/app-v1.2.3.apk",
+    path = "/data/downloads/app.apk",
+})
+if err then
+    print("download failed:", status, err)
+else
+    print("saved to", path)
+end
+
+-- 带 Range 断点续传 + 认证头
+local status, path, err = http.download({
+    url = "https://example.com/big-model.bin",
+    path = "/data/model.bin",
+    headers = {
+        ["Authorization"] = "Bearer xxx",
+        ["Range"] = "bytes=1048576-",
+    },
+})
+```
+
+---
+
 ## WebSocket
 
 ### http.ws_create(url [, options])
